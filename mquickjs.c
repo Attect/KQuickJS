@@ -10400,7 +10400,8 @@ static int js_parse_statement(JSParseState *s, int state, int dummy_param)
             js_parse_expect_semi(s);
         }
         break;
-    case TOK_VAR:
+        case TOK_VAR:
+        case TOK_LET:
         next_token(s);
         js_parse_var(s, TRUE);
         js_parse_expect_semi(s);
@@ -10519,7 +10520,7 @@ static int js_parse_statement(JSParseState *s, int state, int dummy_param)
                 
                 emit_label(s, &label_next);
                 
-                if (s->token.val == TOK_VAR) {
+                if (s->token.val == TOK_VAR || s->token.val == TOK_LET) {
                     JSVarRefKindEnum var_kind;
                     next_token(s);
                     var_idx = define_var(s, &var_kind, s->token.value);
@@ -10582,7 +10583,7 @@ static int js_parse_statement(JSParseState *s, int state, int dummy_param)
                 
                 /* initial expression */
                 if (s->token.val != ';') {
-                    if (s->token.val == TOK_VAR) {
+                    if (s->token.val == TOK_VAR || s->token.val == TOK_LET) {
                         next_token(s);
                         js_parse_var(s, FALSE);
                     } else {
