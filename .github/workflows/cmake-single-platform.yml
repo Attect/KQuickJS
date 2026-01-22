@@ -37,3 +37,12 @@ jobs:
       # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
       run: ctest -C ${{env.BUILD_TYPE}}
 
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: mquickjs-build-Linux-x64
+        path:
+          ${{github.workspace}}/build/mqjs*
+          ${{github.workspace}}/build/mquickjs.*
+          ${{github.workspace}}/build/libmquickjs.*
+          ${{github.workspace}}/build/mquickjs_static.*
