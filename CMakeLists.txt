@@ -101,9 +101,13 @@ add_custom_command(
 )
 
 # 3. 构建 mqjs_stdlib 工具
+set(MQJS_STDLIB_EXE ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib)
+if(WIN32)
+    set(MQJS_STDLIB_EXE ${MQJS_STDLIB_EXE}.exe)
+endif()
 add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.exe
-    COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -o ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.exe ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
+    OUTPUT ${MQJS_STDLIB_EXE}
+    COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -o ${MQJS_STDLIB_EXE} ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
     DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
     VERBATIM
 )
@@ -111,16 +115,16 @@ add_custom_command(
 # 4. 生成 mquickjs_atom.h
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_atom.h
-    COMMAND cmd /c "${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.exe" -a ${MQJS_BUILD_FLAGS} > "${CMAKE_CURRENT_BINARY_DIR}/mquickjs_atom.h"
-    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.exe
+    COMMAND ${MQJS_STDLIB_EXE} -a ${MQJS_BUILD_FLAGS} > "${CMAKE_CURRENT_BINARY_DIR}/mquickjs_atom.h"
+    DEPENDS ${MQJS_STDLIB_EXE}
     VERBATIM
 )
 
 # 5. 生成 mqjs_stdlib.h
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.h
-    COMMAND cmd /c "${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.exe" ${MQJS_BUILD_FLAGS} > "${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.h"
-    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.exe
+    COMMAND ${MQJS_STDLIB_EXE} ${MQJS_BUILD_FLAGS} > "${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.h"
+    DEPENDS ${MQJS_STDLIB_EXE}
     VERBATIM
 )
 
@@ -133,9 +137,13 @@ add_custom_command(
 )
 
 # 7. 构建 example_stdlib 工具
+set(EXAMPLE_STDLIB_EXE ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib)
+if(WIN32)
+    set(EXAMPLE_STDLIB_EXE ${EXAMPLE_STDLIB_EXE}.exe)
+endif()
 add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.exe
-    COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -o ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.exe ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
+    OUTPUT ${EXAMPLE_STDLIB_EXE}
+    COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -o ${EXAMPLE_STDLIB_EXE} ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
     DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
     VERBATIM
 )
@@ -143,8 +151,8 @@ add_custom_command(
 # 8. 生成 example_stdlib.h
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.h
-    COMMAND cmd /c "${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.exe" ${MQJS_BUILD_FLAGS} > "${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.h"
-    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.exe
+    COMMAND ${EXAMPLE_STDLIB_EXE} ${MQJS_BUILD_FLAGS} > "${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.h"
+    DEPENDS ${EXAMPLE_STDLIB_EXE}
     VERBATIM
 )
 
@@ -241,10 +249,16 @@ else()
 endif()
 
 # 清理
-set_directory_properties(PROPERTIES ADDITIONAL_CLEAN_FILES 
-    "${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.exe ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.exe 
-    ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_atom.h ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.h 
-    ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.h ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o 
-    ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o 
-    ${CMAKE_CURRENT_BINARY_DIR}/test_builtin.bin"
+set(CLEAN_FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_atom.h
+    ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.h
+    ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.h
+    ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
+    ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o
+    ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o
+    ${CMAKE_CURRENT_BINARY_DIR}/test_builtin.bin
+    ${MQJS_STDLIB_EXE}
+    ${EXAMPLE_STDLIB_EXE}
 )
+
+set_directory_properties(PROPERTIES ADDITIONAL_CLEAN_FILES "${CLEAN_FILES}")
