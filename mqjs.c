@@ -31,7 +31,13 @@
 #include <assert.h>
 #include <ctype.h>
 #include <time.h>
+#ifdef _WIN32
+#include <sys/types.h>
+#include <winsock2.h>
+#else
 #include <sys/time.h>
+#include <unistd.h>
+#endif
 #include <math.h>
 #include <fcntl.h>
 

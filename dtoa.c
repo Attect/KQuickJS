@@ -28,7 +28,11 @@
 #include <string.h>
 #include <assert.h>
 #include <ctype.h>
+#ifdef _WIN32
+#include <time.h>
+#else
 #include <sys/time.h>
+#endif
 #include <math.h>
 #include <setjmp.h>
 
