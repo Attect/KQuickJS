@@ -31,6 +31,7 @@
 #include <assert.h>
 #include <ctype.h>
 #include <time.h>
+#include <sys/time.h>
 #ifdef _WIN32
 #include <sys/types.h>
 #include <winsock2.h>
