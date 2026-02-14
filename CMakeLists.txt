@@ -3,7 +3,6 @@ project(mquickjs C)
 
 set(CMAKE_C_STANDARD 99)
 
-# 配置选项
 option(CONFIG_PROFILE "Enable profiling" OFF)
 option(CONFIG_X86_32 "32-bit x86 architecture" OFF)
 option(CONFIG_ARM32 "32-bit ARM architecture" OFF)
@@ -14,56 +13,58 @@ option(CONFIG_GPROF "gprof profiling" OFF)
 option(CONFIG_SMALL "Optimize for size" ON)
 option(CONFIG_WERROR "Treat warnings as errors" OFF)
 
-# 编译器设置
-set(HOST_C_FLAGS_STRING "-Wall -g -D_GNU_SOURCE -fno-math-errno -fno-trapping-math")
-
-# 初始化编译选项列表
-set(COMMON_COMPILE_OPTIONS -Wall -g -D_GNU_SOURCE -fno-math-errno -fno-trapping-math)
-
-if(CONFIG_WERROR)
-    list(APPEND COMMON_COMPILE_OPTIONS -Werror)
-    string(APPEND HOST_C_FLAGS_STRING " -Werror")
-endif()
-
-if(CONFIG_ARM32)
-    list(APPEND COMMON_COMPILE_OPTIONS -mthumb)
-    set(MQJS_BUILD_FLAGS "-m32")
-endif()
-
-if(CONFIG_SMALL)
-    list(APPEND COMMON_COMPILE_OPTIONS -Os)
+if(MSVC)
+    set(COMMON_COMPILE_OPTIONS /W3 /D_CRT_SECURE_NO_WARNINGS)
+    set(HOST_C_FLAGS_STRING "/W3 /D_CRT_SECURE_NO_WARNINGS")
+    if(CONFIG_SMALL)
+        list(APPEND COMMON_COMPILE_OPTIONS /O1)
+    else()
+        list(APPEND COMMON_COMPILE_OPTIONS /O2)
+    endif()
+    if(CONFIG_WERROR)
+        list(APPEND COMMON_COMPILE_OPTIONS /WX)
+        string(APPEND HOST_C_FLAGS_STRING " /WX")
+    endif()
 else()
-    list(APPEND COMMON_COMPILE_OPTIONS -O2)
+    set(HOST_C_FLAGS_STRING "-Wall -g -D_GNU_SOURCE -fno-math-errno -fno-trapping-math")
+    set(COMMON_COMPILE_OPTIONS -Wall -g -D_GNU_SOURCE -fno-math-errno -fno-trapping-math)
+    if(CONFIG_WERROR)
+        list(APPEND COMMON_COMPILE_OPTIONS -Werror)
+        string(APPEND HOST_C_FLAGS_STRING " -Werror")
+    endif()
+    if(CONFIG_SMALL)
+        list(APPEND COMMON_COMPILE_OPTIONS -Os)
+    else()
+        list(APPEND COMMON_COMPILE_OPTIONS -O2)
+    endif()
+    if(CONFIG_SOFTFLOAT)
+        list(APPEND COMMON_COMPILE_OPTIONS -msoft-float -DUSE_SOFTFLOAT)
+        string(APPEND HOST_C_FLAGS_STRING " -msoft-float -DUSE_SOFTFLOAT")
+    endif()
+    if(CONFIG_ASAN)
+        list(APPEND COMMON_COMPILE_OPTIONS -fsanitize=address -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=address -fno-omit-frame-pointer)
+        string(APPEND HOST_C_FLAGS_STRING " -fsanitize=address -fno-omit-frame-pointer")
+    endif()
+    if(CONFIG_GPROF OR CONFIG_PROFILE)
+        list(APPEND COMMON_COMPILE_OPTIONS -p)
+        add_link_options(-p)
+        string(APPEND HOST_C_FLAGS_STRING " -p")
+    endif()
+    if(CONFIG_X86_32)
+        list(APPEND COMMON_COMPILE_OPTIONS -m32)
+        add_link_options(-m32)
+        set(MQJS_BUILD_FLAGS "-m32")
+        string(APPEND HOST_C_FLAGS_STRING " -m32")
+    endif()
+    if(CONFIG_ARM32)
+        list(APPEND COMMON_COMPILE_OPTIONS -mthumb)
+        set(MQJS_BUILD_FLAGS "-m32")
+    endif()
 endif()
 
-if(CONFIG_SOFTFLOAT)
-    list(APPEND COMMON_COMPILE_OPTIONS -msoft-float -DUSE_SOFTFLOAT)
-    string(APPEND HOST_C_FLAGS_STRING " -msoft-float -DUSE_SOFTFLOAT")
-endif()
-
-if(CONFIG_ASAN)
-    list(APPEND COMMON_COMPILE_OPTIONS -fsanitize=address -fno-omit-frame-pointer)
-    add_link_options(-fsanitize=address -fno-omit-frame-pointer)
-    string(APPEND HOST_C_FLAGS_STRING " -fsanitize=address -fno-omit-frame-pointer")
-endif()
-
-if(CONFIG_GPROF OR CONFIG_PROFILE)
-    list(APPEND COMMON_COMPILE_OPTIONS -p)
-    add_link_options(-p)
-    string(APPEND HOST_C_FLAGS_STRING " -p")
-endif()
-
-if(CONFIG_X86_32)
-    list(APPEND COMMON_COMPILE_OPTIONS -m32)
-    add_link_options(-m32)
-    set(MQJS_BUILD_FLAGS "-m32")
-    string(APPEND HOST_C_FLAGS_STRING " -m32")
-endif()
-
-# 将 HOST_C_FLAGS_STRING 拆分为列表
 string(REPLACE " " ";" HOST_C_FLAGS_LIST "${HOST_C_FLAGS_STRING}")
 
-# 源文件
 set(COMMON_SOURCES
     mquickjs.c
     dtoa.c
@@ -81,80 +82,131 @@ set(EXAMPLE_SOURCES
     example.c
 )
 
-# 主机工具构建
 set(HOST_C_COMPILER ${CMAKE_C_COMPILER})
 
-# 1. 构建 mquickjs_build.host.o
-add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
-    COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -c -o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o ${CMAKE_CURRENT_SOURCE_DIR}/mquickjs_build.c
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/mquickjs_build.c
-    VERBATIM
-)
+if(MSVC)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
+        COMMAND ${HOST_C_COMPILER} /c ${HOST_C_FLAGS_LIST} /Fo${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o ${CMAKE_CURRENT_SOURCE_DIR}/mquickjs_build.c
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/mquickjs_build.c
+        VERBATIM
+    )
 
-# 2. 构建 mqjs_stdlib.host.o
-add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o
-    COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -c -o ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o ${CMAKE_CURRENT_SOURCE_DIR}/mqjs_stdlib.c
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/mqjs_stdlib.c
-    VERBATIM
-)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o
+        COMMAND ${HOST_C_COMPILER} /c ${HOST_C_FLAGS_LIST} /Fo${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o ${CMAKE_CURRENT_SOURCE_DIR}/mqjs_stdlib.c
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/mqjs_stdlib.c
+        VERBATIM
+    )
 
-# 3. 构建 mqjs_stdlib 工具
-set(MQJS_STDLIB_EXE ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib)
-if(WIN32)
-    set(MQJS_STDLIB_EXE ${MQJS_STDLIB_EXE}.exe)
+    set(MQJS_STDLIB_EXE ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.exe)
+    add_custom_command(
+        OUTPUT ${MQJS_STDLIB_EXE}
+        COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} /Fe${MQJS_STDLIB_EXE} ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
+        DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_atom.h
+        COMMAND ${MQJS_STDLIB_EXE} -a > "${CMAKE_CURRENT_BINARY_DIR}/mquickjs_atom.h"
+        DEPENDS ${MQJS_STDLIB_EXE}
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.h
+        COMMAND ${MQJS_STDLIB_EXE} > "${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.h"
+        DEPENDS ${MQJS_STDLIB_EXE}
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o
+        COMMAND ${HOST_C_COMPILER} /c ${HOST_C_FLAGS_LIST} /Fo${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o ${CMAKE_CURRENT_SOURCE_DIR}/example_stdlib.c
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/example_stdlib.c
+        VERBATIM
+    )
+
+    set(EXAMPLE_STDLIB_EXE ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.exe)
+    add_custom_command(
+        OUTPUT ${EXAMPLE_STDLIB_EXE}
+        COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} /Fe${EXAMPLE_STDLIB_EXE} ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
+        DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.h
+        COMMAND ${EXAMPLE_STDLIB_EXE} > "${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.h"
+        DEPENDS ${EXAMPLE_STDLIB_EXE}
+        VERBATIM
+    )
+else()
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
+        COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -c -o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o ${CMAKE_CURRENT_SOURCE_DIR}/mquickjs_build.c
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/mquickjs_build.c
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o
+        COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -c -o ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o ${CMAKE_CURRENT_SOURCE_DIR}/mqjs_stdlib.c
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/mqjs_stdlib.c
+        VERBATIM
+    )
+
+    set(MQJS_STDLIB_EXE ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib)
+    if(WIN32)
+        set(MQJS_STDLIB_EXE ${MQJS_STDLIB_EXE}.exe)
+    endif()
+    add_custom_command(
+        OUTPUT ${MQJS_STDLIB_EXE}
+        COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -o ${MQJS_STDLIB_EXE} ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
+        DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_atom.h
+        COMMAND ${MQJS_STDLIB_EXE} -a ${MQJS_BUILD_FLAGS} > "${CMAKE_CURRENT_BINARY_DIR}/mquickjs_atom.h"
+        DEPENDS ${MQJS_STDLIB_EXE}
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.h
+        COMMAND ${MQJS_STDLIB_EXE} ${MQJS_BUILD_FLAGS} > "${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.h"
+        DEPENDS ${MQJS_STDLIB_EXE}
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o
+        COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -c -o ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o ${CMAKE_CURRENT_SOURCE_DIR}/example_stdlib.c
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/example_stdlib.c
+        VERBATIM
+    )
+
+    set(EXAMPLE_STDLIB_EXE ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib)
+    if(WIN32)
+        set(EXAMPLE_STDLIB_EXE ${EXAMPLE_STDLIB_EXE}.exe)
+    endif()
+    add_custom_command(
+        OUTPUT ${EXAMPLE_STDLIB_EXE}
+        COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -o ${EXAMPLE_STDLIB_EXE} ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
+        DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.h
+        COMMAND ${EXAMPLE_STDLIB_EXE} ${MQJS_BUILD_FLAGS} > "${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.h"
+        DEPENDS ${EXAMPLE_STDLIB_EXE}
+        VERBATIM
+    )
 endif()
-add_custom_command(
-    OUTPUT ${MQJS_STDLIB_EXE}
-    COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -o ${MQJS_STDLIB_EXE} ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
-    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
-    VERBATIM
-)
-
-# 4. 生成 mquickjs_atom.h
-add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_atom.h
-    COMMAND ${MQJS_STDLIB_EXE} -a ${MQJS_BUILD_FLAGS} > "${CMAKE_CURRENT_BINARY_DIR}/mquickjs_atom.h"
-    DEPENDS ${MQJS_STDLIB_EXE}
-    VERBATIM
-)
-
-# 5. 生成 mqjs_stdlib.h
-add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.h
-    COMMAND ${MQJS_STDLIB_EXE} ${MQJS_BUILD_FLAGS} > "${CMAKE_CURRENT_BINARY_DIR}/mqjs_stdlib.h"
-    DEPENDS ${MQJS_STDLIB_EXE}
-    VERBATIM
-)
-
-# 6. 构建 example_stdlib.host.o
-add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o
-    COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -c -o ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o ${CMAKE_CURRENT_SOURCE_DIR}/example_stdlib.c
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/example_stdlib.c
-    VERBATIM
-)
-
-# 7. 构建 example_stdlib 工具
-set(EXAMPLE_STDLIB_EXE ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib)
-if(WIN32)
-    set(EXAMPLE_STDLIB_EXE ${EXAMPLE_STDLIB_EXE}.exe)
-endif()
-add_custom_command(
-    OUTPUT ${EXAMPLE_STDLIB_EXE}
-    COMMAND ${HOST_C_COMPILER} ${HOST_C_FLAGS_LIST} -o ${EXAMPLE_STDLIB_EXE} ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
-    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.host.o ${CMAKE_CURRENT_BINARY_DIR}/mquickjs_build.host.o
-    VERBATIM
-)
-
-# 8. 生成 example_stdlib.h
-add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.h
-    COMMAND ${EXAMPLE_STDLIB_EXE} ${MQJS_BUILD_FLAGS} > "${CMAKE_CURRENT_BINARY_DIR}/example_stdlib.h"
-    DEPENDS ${EXAMPLE_STDLIB_EXE}
-    VERBATIM
-)
 
 # 构建mquickjs静态库
 add_library(mquickjs_static STATIC ${COMMON_SOURCES})
