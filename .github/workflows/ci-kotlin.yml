@@ -40,13 +40,30 @@ jobs:
         with:
           cache-read-only: ${{ github.ref != 'refs/heads/kotlin-implementation' }}
 
+      - name: Grant execute permission for gradlew
+        if: runner.os != 'Windows'
+        working-directory: kotlin
+        run: chmod +x gradlew
+
       - name: Build
         working-directory: kotlin
-        run: ./gradlew jar --no-daemon
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ./gradlew.bat jar --no-daemon
+          else
+            ./gradlew jar --no-daemon
+          fi
+        shell: bash
 
       - name: Run tests
         working-directory: kotlin
-        run: ./gradlew test --no-daemon
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ./gradlew.bat test --no-daemon
+          else
+            ./gradlew test --no-daemon
+          fi
+        shell: bash
 
       - name: Upload test reports
         if: always()
@@ -158,6 +175,10 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
+
+      - name: Grant execute permission for gradlew
+        working-directory: kotlin
+        run: chmod +x gradlew
 
       - name: Check
         working-directory: kotlin
