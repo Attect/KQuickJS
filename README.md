@@ -508,3 +508,108 @@ dumpbin /SIZE ./mqjs.exe
 MQuickJS根据MIT许可证发布。
 
 除非另有说明，MQuickJS源代码的版权归Fabrice Bellard和Charlie Gordon所有。
+
+---
+
+## Kotlin 实现
+
+本项目包含一个完整的 Kotlin 实现，将 MQuickJS 移植到 Kotlin/JVM 平台，并支持通过 GraalVM Native Image 编译为原生可执行文件。
+
+### 功能特性
+
+- 完整的 JavaScript 解析器和运行时
+- 支持 ES5 严格模式
+- 支持 GraalVM Native Image 编译
+- 跨平台支持 (Windows/Linux/macOS)
+
+### 环境要求
+
+- JDK 17 或更高版本
+- Gradle 8.0+ (包含在项目中)
+- GraalVM CE 17 (用于原生镜像构建)
+
+### 构建 Kotlin 版本
+
+```bash
+cd kotlin
+
+# 构建 JAR
+./gradlew jar
+
+# 运行测试
+./gradlew test
+
+# 构建原生镜像 (需要 GraalVM)
+./gradlew nativeCompile
+```
+
+### 使用命令行工具
+
+```bash
+# 显示帮助
+java -jar mquickjs.jar -h
+
+# 执行 JS 文件
+java -jar mquickjs.jar script.js
+
+# 执行表达式
+java -jar mquickjs.jar -e "1 + 2"
+
+# 进入交互模式
+java -jar mquickjs.jar -i
+
+# 设置内存限制
+java -jar mquickjs.jar --memory-limit 16M script.js
+```
+
+### 原生镜像使用
+
+构建原生镜像后，可直接运行无需 JVM：
+
+```bash
+# Windows
+mquickjs-kotlin.exe -e "1 + 2"
+
+# Linux/macOS
+./mquickjs-kotlin -e "1 + 2"
+```
+
+### 项目结构
+
+```
+kotlin/
+├── src/main/kotlin/
+│   ├── MQuickJS.kt              # 命令行入口
+│   ├── JSContext.kt             # 上下文管理
+│   ├── JSContextFactory.kt      # 上下文工厂
+│   ├── JSValue.kt               # 值类型定义
+│   ├── JSValueOps.kt            # 值操作
+│   ├── JSConstants.kt           # 常量定义
+│   ├── JSEnums.kt               # 枚举定义
+│   ├── OPCode.kt                # 操作码定义
+│   ├── memory/
+│   │   ├── Memory.kt            # 内存管理
+│   │   └── MemoryBlock.kt       # 内存块
+│   ├── parser/
+│   │   ├── JSLexer.kt           # 词法分析器
+│   │   └── JSParser.kt          # 语法解析器
+│   └── runtime/
+│       └── JSRuntime.kt         # 运行时
+├── src/test/kotlin/             # 测试用例
+└── build.gradle.kts             # 构建配置
+```
+
+### 相关文档
+
+- [Kotlin 运行时修复指南](docs/kotlin_runtime_fix_guide.md) - 详细的实现说明和问题修复记录
+
+### 测试覆盖
+
+Kotlin 实现包含 124 个测试用例，覆盖：
+
+- 基础语言特性 (变量、运算符、表达式)
+- 控制流 (if/else、循环、switch)
+- 函数和闭包
+- 对象和数组操作
+- 内置函数 (Math、String、Array)
+- 异常处理

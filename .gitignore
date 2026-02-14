@@ -1,0 +1,38 @@
+# Build directories
+build/
+cmake-build-*/
+c_debug/
+out/
+dist/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# Kotlin/Gradle
+kotlin/.gradle/
+kotlin/build/
+*.class
+*.jar
+*.war
+*.ear
+*.log
+
+# Native Image
+*.dll
+*.so
+*.dylib
+*.exe
+!kotlin/gradlew
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+nul
+*.tmp
+*.temp
