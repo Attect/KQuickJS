@@ -137,16 +137,16 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.os }}" = "windows" ]; then
-            if [ -f "kotlin/build/native/nativeCompile/mqjs.exe" ]; then
-              ./kotlin/build/native/nativeCompile/mqjs.exe -e "console.log('Hello from native image!')"
-              ./kotlin/build/native/nativeCompile/mqjs.exe -e "1 + 2"
+            if [ -f "kotlin/build/native/nativeCompile/kquickjs.exe" ]; then
+              ./kotlin/build/native/nativeCompile/kquickjs.exe -e "console.log('Hello from native image!')"
+              ./kotlin/build/native/nativeCompile/kquickjs.exe -e "1 + 2"
             else
               echo "Native image not found, skipping test"
             fi
           else
-            if [ -f "kotlin/build/native/nativeCompile/mqjs" ]; then
-              ./kotlin/build/native/nativeCompile/mqjs -e "console.log('Hello from native image!')"
-              ./kotlin/build/native/nativeCompile/mqjs -e "1 + 2"
+            if [ -f "kotlin/build/native/nativeCompile/kquickjs" ]; then
+              ./kotlin/build/native/nativeCompile/kquickjs -e "console.log('Hello from native image!')"
+              ./kotlin/build/native/nativeCompile/kquickjs -e "1 + 2"
             else
               echo "Native image not found, skipping test"
             fi
@@ -157,15 +157,15 @@ jobs:
         run: |
           mkdir -p dist
           if [ "${{ matrix.os }}" = "windows" ]; then
-            cp kotlin/build/native/nativeCompile/mqjs.exe dist/mqjs-${{ matrix.os }}-${{ matrix.arch }}.exe
+            cp kotlin/build/native/nativeCompile/kquickjs.exe dist/kquickjs-${{ matrix.os }}-${{ matrix.arch }}.exe
           else
-            cp kotlin/build/native/nativeCompile/mqjs dist/mqjs-${{ matrix.os }}-${{ matrix.arch }}
+            cp kotlin/build/native/nativeCompile/kquickjs dist/kquickjs-${{ matrix.os }}-${{ matrix.arch }}
           fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mqjs-native-${{ matrix.os }}-${{ matrix.arch }}
+          name: kquickjs-native-${{ matrix.os }}-${{ matrix.arch }}
           path: dist/*
 
   code-quality:

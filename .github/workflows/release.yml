@@ -177,9 +177,9 @@ jobs:
         run: |
           mkdir -p dist
           if [ "${{ matrix.os }}" = "windows" ]; then
-            cp kotlin/build/native/nativeCompile/mqjs.exe dist/mqjs-native-${{ matrix.os }}-${{ matrix.arch }}.exe
+            cp kotlin/build/native/nativeCompile/kquickjs.exe dist/kquickjs-native-${{ matrix.os }}-${{ matrix.arch }}.exe
           else
-            cp kotlin/build/native/nativeCompile/mqjs dist/mqjs-native-${{ matrix.os }}-${{ matrix.arch }}
+            cp kotlin/build/native/nativeCompile/kquickjs dist/kquickjs-native-${{ matrix.os }}-${{ matrix.arch }}
           fi
 
       - name: Upload artifact
@@ -207,7 +207,7 @@ jobs:
       - name: Prepare release files
         run: |
           mkdir -p release
-          find artifacts -type f \( -name "*.exe" -o -name "mqjs-*" -o -name "*.jar" -o -name "*.dll" -o -name "*.so" -o -name "*.dylib" -o -name "*.a" -o -name "*.lib" \) -exec cp {} release/ \;
+          find artifacts -type f \( -name "*.exe" -o -name "kquickjs-*" -o -name "mqjs-*" -o -name "*.jar" -o -name "*.dll" -o -name "*.so" -o -name "*.dylib" -o -name "*.a" -o -name "*.lib" \) -exec cp {} release/ \;
           ls -la release/
 
       - name: Generate changelog
