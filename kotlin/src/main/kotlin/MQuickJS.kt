@@ -6,12 +6,14 @@ import com.mquickjs.parser.JSParseState
 import com.mquickjs.parser.JSParser
 import com.mquickjs.runtime.JSRuntime
 import java.io.File
+import java.io.FileOutputStream
 import java.util.Scanner
 
 object MQuickJS {
     
     private const val VERSION = "MicroQuickJS Kotlin"
     private const val DEFAULT_MEM_SIZE = 16 * 1024 * 1024
+    private const val JS_BYTECODE_VERSION = 0x0001 or (8 shl 12)
     
     @JvmStatic
     fun main(args: Array<String>) {
@@ -21,6 +23,9 @@ object MQuickJS {
         var memSize = DEFAULT_MEM_SIZE
         var dumpMemory = 0
         var parseFlags = 0
+        var outFilename: String? = null
+        var force32bit = false
+        var allowBytecode = false
         val includeList = mutableListOf<String>()
         
         while (optind < args.size && args[optind].startsWith("-")) {
@@ -66,6 +71,27 @@ object MQuickJS {
                         }
                         longopt = ""
                     }
+                    opt == 'o' -> {
+                        if (currentArg.isNotEmpty()) {
+                            outFilename = currentArg
+                            currentArg = ""
+                        } else if (optind < args.size) {
+                            outFilename = args[optind++]
+                        } else {
+                            System.err.println("missing filename for -o")
+                            System.exit(2)
+                        }
+                        longopt = ""
+                    }
+                    opt == 'm' && currentArg == "32" -> {
+                        force32bit = true
+                        currentArg = ""
+                        longopt = ""
+                    }
+                    opt == 'b' || longopt == "allow-bytecode" -> {
+                        allowBytecode = true
+                        longopt = ""
+                    }
                     longopt == "memory-limit" -> {
                         if (optind >= args.size) {
                             System.err.println("expecting memory limit")
@@ -107,10 +133,20 @@ object MQuickJS {
             }
         }
         
+        if (outFilename != null) {
+            if (optind >= args.size) {
+                System.err.println("expecting input filename")
+                System.exit(1)
+            }
+            val inputFilename = args[optind]
+            compileFile(inputFilename, outFilename, memSize, dumpMemory, parseFlags, force32bit)
+            return
+        }
+        
         val ctx = createContext(memSize)
         
         for (includeFile in includeList) {
-            if (!evalFile(ctx, includeFile, parseFlags)) {
+            if (!evalFile(ctx, includeFile, parseFlags, allowBytecode)) {
                 System.exit(1)
             }
         }
@@ -123,7 +159,7 @@ object MQuickJS {
             interactive = true
         } else {
             val filename = args[optind]
-            if (!evalFile(ctx, filename, parseFlags)) {
+            if (!evalFile(ctx, filename, parseFlags, allowBytecode)) {
                 System.exit(1)
             }
         }
@@ -182,6 +218,75 @@ usage: mqjs [options] [file [args]]
         return JS_NewContext(mem, memSize, stdlib)
     }
     
+    private fun compileFile(filename: String, outFilename: String, memSize: Int, dumpMemory: Int, parseFlags: Int, force32bit: Boolean) {
+        val file = File(filename)
+        if (!file.exists()) {
+            System.err.println("$filename: No such file or directory")
+            System.exit(1)
+        }
+        
+        val ctx = createContext(memSize)
+        val code = file.readText()
+        val bytes = code.toByteArray()
+        
+        val state = JSParseState(ctx, bytes, filename, parseFlags)
+        val parser = JSParser(state)
+        val result = parser.parse()
+        
+        if (JS_IsException(result)) {
+            System.err.println("Parse error: ${state.errorMsg}")
+            System.exit(1)
+        }
+        
+        if (dumpMemory > 0) {
+            dumpMemory(ctx, dumpMemory >= 2)
+        }
+        
+        writeBytecode(ctx, outFilename, result, force32bit)
+    }
+    
+    private fun writeBytecode(ctx: JSContext, filename: String, mainFunc: JSValue, force32bit: Boolean) {
+        val heapSize = ctx.heapFree - ctx.heapBase
+        
+        FileOutputStream(filename).use { fos ->
+            val header = ByteArray(24)
+            header[0] = (JS_BYTECODE_MAGIC and 0xFF).toByte()
+            header[1] = ((JS_BYTECODE_MAGIC shr 8) and 0xFF).toByte()
+            header[2] = (JS_BYTECODE_VERSION and 0xFF).toByte()
+            header[3] = ((JS_BYTECODE_VERSION shr 8) and 0xFF).toByte()
+            
+            val baseAddr = ctx.heapBase
+            header[4] = (baseAddr and 0xFF).toByte()
+            header[5] = ((baseAddr shr 8) and 0xFF).toByte()
+            header[6] = ((baseAddr shr 16) and 0xFF).toByte()
+            header[7] = ((baseAddr shr 24) and 0xFF).toByte()
+            header[8] = ((baseAddr shr 32) and 0xFF).toByte()
+            header[9] = ((baseAddr shr 40) and 0xFF).toByte()
+            header[10] = ((baseAddr shr 48) and 0xFF).toByte()
+            header[11] = ((baseAddr shr 56) and 0xFF).toByte()
+            
+            val uniqueStrings = ctx.uniqueStrings
+            header[12] = (uniqueStrings and 0xFF).toByte()
+            header[13] = ((uniqueStrings shr 8) and 0xFF).toByte()
+            header[14] = ((uniqueStrings shr 16) and 0xFF).toByte()
+            header[15] = ((uniqueStrings shr 24) and 0xFF).toByte()
+            header[16] = ((uniqueStrings shr 32) and 0xFF).toByte()
+            header[17] = ((uniqueStrings shr 40) and 0xFF).toByte()
+            header[18] = ((uniqueStrings shr 48) and 0xFF).toByte()
+            header[19] = ((uniqueStrings shr 56) and 0xFF).toByte()
+            
+            header[20] = (mainFunc and 0xFF).toByte()
+            header[21] = ((mainFunc shr 8) and 0xFF).toByte()
+            header[22] = ((mainFunc shr 16) and 0xFF).toByte()
+            header[23] = ((mainFunc shr 24) and 0xFF).toByte()
+            
+            fos.write(header)
+            
+            val heapData = ctx.memory.buffer.array()
+            fos.write(heapData, ctx.heapBase, heapSize)
+        }
+    }
+    
     private fun evalString(ctx: JSContext, code: String, filename: String, isRepl: Boolean, parseFlags: Int): Boolean {
         val bytes = code.toByteArray()
         val evalFlags = if (isRepl) parseFlags or JS_EVAL_RETVAL or JS_EVAL_REPL else parseFlags
@@ -208,15 +313,28 @@ usage: mqjs [options] [file [args]]
         return true
     }
     
-    private fun evalFile(ctx: JSContext, filename: String, parseFlags: Int): Boolean {
+    private fun evalFile(ctx: JSContext, filename: String, parseFlags: Int, allowBytecode: Boolean): Boolean {
         val file = File(filename)
         if (!file.exists()) {
             System.err.println("$filename: No such file or directory")
             return false
         }
         
-        val code = file.readText()
+        val bytes = file.readBytes()
+        
+        if (allowBytecode && isBytecode(bytes)) {
+            System.err.println("Bytecode loading not yet implemented in Kotlin version")
+            return false
+        }
+        
+        val code = bytes.toString(Charsets.UTF_8)
         return evalString(ctx, code, filename, false, parseFlags)
+    }
+    
+    private fun isBytecode(bytes: ByteArray): Boolean {
+        if (bytes.size < 4) return false
+        val magic = (bytes[0].toInt() and 0xFF) or ((bytes[1].toInt() and 0xFF) shl 8)
+        return magic == JS_BYTECODE_MAGIC
     }
     
     private fun printResult(ctx: JSContext, result: JSValue) {
