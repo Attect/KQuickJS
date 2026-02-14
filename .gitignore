@@ -17,6 +17,7 @@ kotlin/.gradle/
 kotlin/build/
 *.class
 *.jar
+!kotlin/gradle/wrapper/gradle-wrapper.jar
 *.war
 *.ear
 *.log
