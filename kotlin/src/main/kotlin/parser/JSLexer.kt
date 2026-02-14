@@ -132,6 +132,10 @@ class JSParseState(
     var errorMsg: String? = null
     var hasError = false
     
+    var sourceStr: JSValue = JS_NULL
+    var filenameStr: JSValue = JS_NULL
+    var tokenValue: JSValue = JS_NULL
+    
     val keywords = mapOf(
         "null" to JSTokenVal.TOK_NULL,
         "false" to JSTokenVal.TOK_FALSE,

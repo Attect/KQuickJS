@@ -3,6 +3,7 @@ package com.mquickjs
 import com.mquickjs.memory.Memory
 import com.mquickjs.memory.getBlockSize
 import com.mquickjs.memory.getMTag
+import com.mquickjs.parser.JSParseState
 
 class JSContext(
     val memory: Memory,
@@ -143,7 +144,7 @@ class JSContext(
     }
     
     fun gc() {
-        // TODO: Implement garbage collection
+        JSGC.gc(this, true)
     }
     
     fun throwOutOfMemory(): JSValue {
@@ -193,5 +194,3 @@ class JSGCRef(val ctx: JSContext, val offset: Int = 0) {
     var prev: Int = 0
     var value: JSValue = JS_UNDEFINED
 }
-
-class JSParseState

@@ -24,7 +24,6 @@ object MQuickJS {
         var dumpMemory = 0
         var parseFlags = 0
         var outFilename: String? = null
-        var force32bit = false
         var allowBytecode = false
         val includeList = mutableListOf<String>()
         
@@ -83,11 +82,6 @@ object MQuickJS {
                         }
                         longopt = ""
                     }
-                    opt == 'm' && currentArg == "32" -> {
-                        force32bit = true
-                        currentArg = ""
-                        longopt = ""
-                    }
                     opt == 'b' || longopt == "allow-bytecode" -> {
                         allowBytecode = true
                         longopt = ""
@@ -139,7 +133,7 @@ object MQuickJS {
                 System.exit(1)
             }
             val inputFilename = args[optind]
-            compileFile(inputFilename, outFilename, memSize, dumpMemory, parseFlags, force32bit)
+            compileFile(inputFilename, outFilename, memSize, dumpMemory, parseFlags)
             return
         }
         
@@ -185,7 +179,6 @@ usage: mqjs [options] [file [args]]
     --memory-limit n  limit the memory usage to 'n' bytes
 --no-column           no column number in debug information
 -o FILE               save the bytecode to FILE
--m32                  force 32 bit bytecode output (use with -o)
 -b  --allow-bytecode  allow bytecode in input file
         """.trimIndent())
         System.exit(1)
@@ -218,7 +211,7 @@ usage: mqjs [options] [file [args]]
         return JS_NewContext(mem, memSize, stdlib)
     }
     
-    private fun compileFile(filename: String, outFilename: String, memSize: Int, dumpMemory: Int, parseFlags: Int, force32bit: Boolean) {
+    private fun compileFile(filename: String, outFilename: String, memSize: Int, dumpMemory: Int, parseFlags: Int) {
         val file = File(filename)
         if (!file.exists()) {
             System.err.println("$filename: No such file or directory")
@@ -242,10 +235,10 @@ usage: mqjs [options] [file [args]]
             dumpMemory(ctx, dumpMemory >= 2)
         }
         
-        writeBytecode(ctx, outFilename, result, force32bit)
+        writeBytecode(ctx, outFilename, result)
     }
     
-    private fun writeBytecode(ctx: JSContext, filename: String, mainFunc: JSValue, force32bit: Boolean) {
+    private fun writeBytecode(ctx: JSContext, filename: String, mainFunc: JSValue) {
         val heapSize = ctx.heapFree - ctx.heapBase
         
         FileOutputStream(filename).use { fos ->
@@ -323,8 +316,7 @@ usage: mqjs [options] [file [args]]
         val bytes = file.readBytes()
         
         if (allowBytecode && isBytecode(bytes)) {
-            System.err.println("Bytecode loading not yet implemented in Kotlin version")
-            return false
+            return loadBytecode(ctx, bytes)
         }
         
         val code = bytes.toString(Charsets.UTF_8)
@@ -335,6 +327,58 @@ usage: mqjs [options] [file [args]]
         if (bytes.size < 4) return false
         val magic = (bytes[0].toInt() and 0xFF) or ((bytes[1].toInt() and 0xFF) shl 8)
         return magic == JS_BYTECODE_MAGIC
+    }
+    
+    private fun loadBytecode(ctx: JSContext, bytes: ByteArray): Boolean {
+        if (bytes.size < 24) {
+            System.err.println("Invalid bytecode file: too small")
+            return false
+        }
+        
+        val magic = (bytes[0].toInt() and 0xFF) or ((bytes[1].toInt() and 0xFF) shl 8)
+        if (magic != JS_BYTECODE_MAGIC) {
+            System.err.println("Invalid bytecode file: bad magic")
+            return false
+        }
+        
+        val version = (bytes[2].toInt() and 0xFF) or ((bytes[3].toInt() and 0xFF) shl 8)
+        if (version != JS_BYTECODE_VERSION) {
+            System.err.println("Bytecode version mismatch: expected $JS_BYTECODE_VERSION, got $version")
+            return false
+        }
+        
+        val baseAddr = (bytes[4].toLong() and 0xFF) or
+                      ((bytes[5].toLong() and 0xFF) shl 8) or
+                      ((bytes[6].toLong() and 0xFF) shl 16) or
+                      ((bytes[7].toLong() and 0xFF) shl 24) or
+                      ((bytes[8].toLong() and 0xFF) shl 32) or
+                      ((bytes[9].toLong() and 0xFF) shl 40) or
+                      ((bytes[10].toLong() and 0xFF) shl 48) or
+                      ((bytes[11].toLong() and 0xFF) shl 56)
+        
+        val mainFunc = (bytes[20].toLong() and 0xFF) or
+                      ((bytes[21].toLong() and 0xFF) shl 8) or
+                      ((bytes[22].toLong() and 0xFF) shl 16) or
+                      ((bytes[23].toLong() and 0xFF) shl 24)
+        
+        val heapData = bytes.copyOfRange(24, bytes.size)
+        
+        if (heapData.size > ctx.memory.size) {
+            System.err.println("Bytecode too large for memory")
+            return false
+        }
+        
+        val offset = baseAddr.toInt()
+        ctx.memory.buffer.position(offset)
+        ctx.memory.buffer.put(heapData)
+        ctx.heapFree = offset + heapData.size
+        
+        val relocatedMainFunc = mainFunc + offset
+        
+        val runtime = JSRuntime(ctx)
+        val result = runtime.callFunction(relocatedMainFunc, emptyList())
+        
+        return !JS_IsException(result)
     }
     
     private fun printResult(ctx: JSContext, result: JSValue) {
