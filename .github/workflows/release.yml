@@ -1,0 +1,265 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0)'
+        required: true
+        type: string
+
+env:
+  JAVA_VERSION: '17'
+  BUILD_TYPE: Release
+
+permissions:
+  contents: write
+
+jobs:
+  build-c:
+    name: Build C (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+            ext: ''
+            libext: '.so'
+          - os: windows
+            arch: x64
+            runner: windows-latest
+            ext: '.exe'
+            libext: '.dll'
+          - os: macos
+            arch: x64
+            runner: macos-13
+            ext: ''
+            libext: '.dylib'
+          - os: macos
+            arch: arm64
+            runner: macos-latest
+            ext: ''
+            libext: '.dylib'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        if: matrix.os == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure CMake
+        run: |
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -G "Visual Studio 17 2022" -A x64
+          else
+            cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          fi
+        shell: bash
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Prepare artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cp build/${{ env.BUILD_TYPE }}/mqjs.exe dist/mqjs-${{ matrix.os }}-${{ matrix.arch }}.exe
+            cp build/${{ env.BUILD_TYPE }}/example.exe dist/example-${{ matrix.os }}-${{ matrix.arch }}.exe
+            cp build/${{ env.BUILD_TYPE }}/mquickjs.dll dist/mquickjs-${{ matrix.os }}-${{ matrix.arch }}.dll
+            cp build/${{ env.BUILD_TYPE }}/mquickjs.lib dist/mquickjs-${{ matrix.os }}-${{ matrix.arch }}.lib
+          else
+            cp build/mqjs dist/mqjs-${{ matrix.os }}-${{ matrix.arch }}
+            cp build/example dist/example-${{ matrix.os }}-${{ matrix.arch }}
+            cp build/libmquickjs${{ matrix.libext }} dist/libmquickjs-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.libext }}
+            cp build/libmquickjs.a dist/libmquickjs-${{ matrix.os }}-${{ matrix.arch }}.a
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mquickjs-c-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+
+  build-kotlin-jar:
+    name: Build Kotlin JAR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Build JAR
+        working-directory: kotlin
+        run: ./gradlew jar --no-daemon
+
+      - name: Rename JAR
+        run: |
+          mkdir -p dist
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          cp kotlin/build/libs/*.jar dist/kquickjs-${VERSION}.jar
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kquickjs-jar
+          path: dist/*.jar
+
+  build-kotlin-native:
+    name: Build Native (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - os: windows
+            arch: x64
+            runner: windows-latest
+            ext: .exe
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+            ext: ''
+          - os: macos
+            arch: x64
+            runner: macos-13
+            ext: ''
+          - os: macos
+            arch: aarch64
+            runner: macos-latest
+            ext: ''
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup GraalVM
+        uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'graalvm-community'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          native-image-job-reports: 'true'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Build Native Image (Windows)
+        if: matrix.os == 'windows'
+        working-directory: kotlin
+        run: |
+          ./gradlew.bat jar --no-daemon
+          ./gradlew.bat nativeCompile --no-daemon
+
+      - name: Build Native Image (Unix)
+        if: matrix.os != 'windows'
+        working-directory: kotlin
+        run: |
+          chmod +x gradlew
+          ./gradlew jar --no-daemon
+          ./gradlew nativeCompile --no-daemon
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cp kotlin/build/native/nativeCompile/mqjs.exe dist/mqjs-native-${{ matrix.os }}-${{ matrix.arch }}.exe
+          else
+            cp kotlin/build/native/nativeCompile/mqjs dist/mqjs-native-${{ matrix.os }}-${{ matrix.arch }}
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kquickjs-native-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+
+  create-release:
+    name: Create Release
+    needs: [build-c, build-kotlin-jar, build-kotlin-native]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure
+        run: ls -R artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.exe" -o -name "mqjs-*" -o -name "*.jar" -o -name "*.dll" -o -name "*.so" -o -name "*.dylib" -o -name "*.a" -o -name "*.lib" \) -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.changelog.outputs.version }}
+          name: KQuickJS ${{ steps.changelog.outputs.version }}
+          body: |
+            ## KQuickJS ${{ steps.changelog.outputs.version }}
+            
+            ### Downloads
+            
+            #### C Version
+            - **Linux x64**: `mquickjs-c-linux-x64`
+            - **Windows x64**: `mquickjs-c-windows-x64`
+            - **macOS x64**: `mquickjs-c-macos-x64`
+            - **macOS ARM64**: `mquickjs-c-macos-arm64`
+            
+            #### Kotlin Version
+            - **JAR**: `kquickjs-jar` (cross-platform)
+            - **Native Linux x64**: `kquickjs-native-linux-x64`
+            - **Native Windows x64**: `kquickjs-native-windows-x64`
+            - **Native macOS x64**: `kquickjs-native-macos-x64`
+            - **Native macOS ARM64**: `kquickjs-native-macos-aarch64`
+            
+            ### Usage
+            
+            #### C Version
+            ```bash
+            ./mqjs script.js
+            ./mqjs -e "1 + 2"
+            ./mqjs -i  # interactive mode
+            ```
+            
+            #### Kotlin Version (JAR)
+            ```bash
+            java -jar kquickjs-${{ steps.changelog.outputs.version }}.jar script.js
+            java -jar kquickjs-${{ steps.changelog.outputs.version }}.jar -e "1 + 2"
+            ```
+            
+            #### Kotlin Version (Native)
+            ```bash
+            ./mqjs-native-linux-x64 script.js
+            ./mqjs-native-windows-x64.exe script.js
+            ```
+          files: release/*
+          draft: false
+          prerelease: ${{ contains(steps.changelog.outputs.version, '-') }}
+          generate_release_notes: true

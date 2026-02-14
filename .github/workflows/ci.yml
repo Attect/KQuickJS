@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [ kotlin-implementation ]
+  pull_request:
+    branches: [ kotlin-implementation ]
+  workflow_dispatch:
+
+jobs:
+  ci-c:
+    name: C/C++ CI
+    uses: ./.github/workflows/ci-c.yml
+
+  ci-kotlin:
+    name: Kotlin CI
+    uses: ./.github/workflows/ci-kotlin.yml
+
+  code-quality:
+    name: Code Quality
+    uses: ./.github/workflows/code-quality.yml

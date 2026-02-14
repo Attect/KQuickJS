@@ -1,0 +1,169 @@
+name: Kotlin CI
+
+on:
+  push:
+    branches: [ kotlin-implementation ]
+    paths:
+      - 'kotlin/**'
+      - '.github/workflows/ci-kotlin.yml'
+  pull_request:
+    branches: [ kotlin-implementation ]
+    paths:
+      - 'kotlin/**'
+      - '.github/workflows/ci-kotlin.yml'
+  workflow_dispatch:
+
+env:
+  JAVA_VERSION: '17'
+  GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true'
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest, macos-latest ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/kotlin-implementation' }}
+
+      - name: Build
+        working-directory: kotlin
+        run: ./gradlew jar --no-daemon
+
+      - name: Run tests
+        working-directory: kotlin
+        run: ./gradlew test --no-daemon
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ matrix.os }}
+          path: kotlin/build/reports/tests/
+
+      - name: Upload JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: kquickjs-jar-${{ matrix.os }}
+          path: kotlin/build/libs/*.jar
+
+  native-build:
+    name: Native Image (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows
+            arch: x64
+            runner: windows-latest
+            ext: .exe
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+            ext: ''
+          - os: macos
+            arch: x64
+            runner: macos-13
+            ext: ''
+          - os: macos
+            arch: aarch64
+            runner: macos-latest
+            ext: ''
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup GraalVM
+        uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'graalvm-community'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          native-image-job-reports: 'true'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Build Native Image (Windows)
+        if: matrix.os == 'windows'
+        working-directory: kotlin
+        run: |
+          ./gradlew.bat jar --no-daemon
+          ./gradlew.bat nativeCompile --no-daemon
+
+      - name: Build Native Image (Unix)
+        if: matrix.os != 'windows'
+        working-directory: kotlin
+        run: |
+          chmod +x gradlew
+          ./gradlew jar --no-daemon
+          ./gradlew nativeCompile --no-daemon
+
+      - name: Test Native Image
+        working-directory: kotlin/build/native/nativeCompile
+        run: |
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            ./mqjs.exe -e "console.log('Hello from native image!')"
+            ./mqjs.exe -e "1 + 2"
+          else
+            ./mqjs -e "console.log('Hello from native image!')"
+            ./mqjs -e "1 + 2"
+          fi
+        shell: bash
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cp kotlin/build/native/nativeCompile/mqjs.exe dist/mqjs-${{ matrix.os }}-${{ matrix.arch }}.exe
+          else
+            cp kotlin/build/native/nativeCompile/mqjs dist/mqjs-${{ matrix.os }}-${{ matrix.arch }}
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mqjs-native-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Check
+        working-directory: kotlin
+        run: ./gradlew check --no-daemon || true
+
+      - name: Detekt
+        if: always()
+        working-directory: kotlin
+        run: ./gradlew detekt --no-daemon || true

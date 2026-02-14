@@ -1,0 +1,230 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ kotlin-implementation ]
+    paths-ignore:
+      - 'kotlin/**'
+      - 'docs/**'
+      - '*.md'
+  pull_request:
+    branches: [ kotlin-implementation ]
+    paths-ignore:
+      - 'kotlin/**'
+      - 'docs/**'
+      - '*.md'
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-linux:
+    name: Linux (${{ matrix.compiler.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler:
+          - { cc: gcc, cxx: g++ }
+          - { cc: clang, cxx: clang++ }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_C_COMPILER=${{ matrix.compiler.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.compiler.cxx }}
+        env:
+          CC: ${{ matrix.compiler.cc }}
+          CXX: ${{ matrix.compiler.cxx }}
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Run tests
+        working-directory: build
+        run: |
+          ./mqjs ../tests/test_closure.js
+          ./mqjs ../tests/test_language.js
+          ./mqjs ../tests/test_loop.js
+          ./mqjs ../tests/test_builtin.js
+          ./mqjs -o test_builtin.bin ../tests/test_builtin.js
+          ./mqjs -b test_builtin.bin
+          ./example ../tests/test_rect.js
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mquickjs-linux-${{ matrix.compiler.cc }}
+          path: |
+            build/mqjs
+            build/example
+            build/libmquickjs.so
+            build/libmquickjs.a
+
+  build-windows:
+    name: Windows (MSVC)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Run tests
+        working-directory: build
+        shell: bash
+        run: |
+          ./mqjs.exe ../tests/test_closure.js
+          ./mqjs.exe ../tests/test_language.js
+          ./mqjs.exe ../tests/test_loop.js
+          ./mqjs.exe ../tests/test_builtin.js
+          ./mqjs.exe -o test_builtin.bin ../tests/test_builtin.js
+          ./mqjs.exe -b test_builtin.bin
+          ./example.exe ../tests/test_rect.js
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mquickjs-windows-msvc
+          path: |
+            build/${{ env.BUILD_TYPE }}/mqjs.exe
+            build/${{ env.BUILD_TYPE }}/example.exe
+            build/${{ env.BUILD_TYPE }}/mquickjs.dll
+            build/${{ env.BUILD_TYPE }}/mquickjs.lib
+
+  build-macos:
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-13
+          - arch: arm64
+            runner: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Run tests
+        working-directory: build
+        run: |
+          ./mqjs ../tests/test_closure.js
+          ./mqjs ../tests/test_language.js
+          ./mqjs ../tests/test_loop.js
+          ./mqjs ../tests/test_builtin.js
+          ./mqjs -o test_builtin.bin ../tests/test_builtin.js
+          ./mqjs -b test_builtin.bin
+          ./example ../tests/test_rect.js
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mquickjs-macos-${{ matrix.arch }}
+          path: |
+            build/mqjs
+            build/example
+            build/libmquickjs.dylib
+            build/libmquickjs.a
+
+  build-mingw:
+    name: Windows (MinGW)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MinGW
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake make
+
+      - name: Configure CMake
+        shell: msys2 {0}
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -G "MinGW Makefiles"
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Run tests
+        working-directory: build
+        shell: msys2 {0}
+        run: |
+          ./mqjs.exe ../tests/test_closure.js
+          ./mqjs.exe ../tests/test_language.js
+          ./mqjs.exe ../tests/test_loop.js
+          ./mqjs.exe ../tests/test_builtin.js
+          ./mqjs.exe -o test_builtin.bin ../tests/test_builtin.js
+          ./mqjs.exe -b test_builtin.bin
+          ./example.exe ../tests/test_rect.js
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mquickjs-windows-mingw
+          path: |
+            build/mqjs.exe
+            build/example.exe
+            build/libmquickjs.dll
+            build/libmquickjs.a
+
+  build-arm-cross:
+    name: ARM Cross-Compile
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: arm32
+            options: -DCONFIG_ARM32=ON
+          - target: x86-32
+            options: -DCONFIG_X86_32=ON
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cross-compiler
+        if: matrix.target == 'arm32'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+
+      - name: Install 32-bit libs
+        if: matrix.target == 'x86-32'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib g++-multilib
+
+      - name: Configure CMake
+        run: |
+          if [ "${{ matrix.target }}" = "arm32" ]; then
+            cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} ${{ matrix.options }} -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc
+          else
+            cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} ${{ matrix.options }}
+          fi
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mquickjs-cross-${{ matrix.target }}
+          path: |
+            build/mqjs
+            build/libmquickjs.a
