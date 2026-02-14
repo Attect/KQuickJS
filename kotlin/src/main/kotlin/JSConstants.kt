@@ -12,6 +12,21 @@ object JSMTags {
     const val JS_MTAG_COUNT: Int = 8
     
     const val JS_MTAG_BITS: Int = 4
+    
+    val MTAG_NAMES = arrayOf(
+        "free",
+        "object",
+        "float64",
+        "string",
+        "func_bytecode",
+        "value_array",
+        "byte_array",
+        "varref"
+    )
+    
+    fun getMTagName(mtag: Int): String {
+        return if (mtag in MTAG_NAMES.indices) MTAG_NAMES[mtag] else "?"
+    }
 }
 
 const val JS_STACK_SLACK: Int = 16

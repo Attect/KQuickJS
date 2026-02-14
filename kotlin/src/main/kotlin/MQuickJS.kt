@@ -1,5 +1,7 @@
 package com.mquickjs
 
+import com.mquickjs.memory.getBlockSize
+import com.mquickjs.memory.getMTag
 import com.mquickjs.parser.JSParseState
 import com.mquickjs.parser.JSParser
 import com.mquickjs.runtime.JSRuntime
@@ -251,6 +253,34 @@ usage: mqjs [options] [file [args]]
     }
     
     private fun dumpMemory(ctx: JSContext, verbose: Boolean) {
-        println("Memory dump not yet implemented in Kotlin version")
+        val mtagMemSize = IntArray(JSMTags.JS_MTAG_COUNT)
+        val mtagCount = IntArray(JSMTags.JS_MTAG_COUNT)
+        var totSize = 0
+        
+        var ptr = ctx.heapBase
+        while (ptr < ctx.heapFree) {
+            val mtag = ctx.memory.getMTag(ptr)
+            val size = ctx.memory.getBlockSize(ptr)
+            mtagMemSize[mtag] += size
+            mtagCount[mtag]++
+            totSize += size
+            ptr = ptr + size
+        }
+        
+        println("%15s %8s %8s %8s %8s".format("TAG", "COUNT", "AVG_SIZE", "SIZE", "RATIO"))
+        for (i in 0 until JSMTags.JS_MTAG_COUNT) {
+            if (mtagCount[i] != 0) {
+                val avgSize = mtagMemSize[i] / mtagCount[i]
+                val ratio = (mtagMemSize[i] * 100 / totSize)
+                println("%15s %8d %8d %8d %7d%%".format(
+                    JSMTags.getMTagName(i),
+                    mtagCount[i],
+                    avgSize,
+                    mtagMemSize[i],
+                    ratio
+                ))
+            }
+        }
+        println("heap size=${ctx.heapFree - ctx.heapBase}/${ctx.memory.size} stack_size=${ctx.memory.size - ctx.sp}")
     }
 }
