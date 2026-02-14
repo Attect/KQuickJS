@@ -143,9 +143,10 @@ usage: mqjs [options] [file [args]]
         return JS_NewContext(mem, memSize, stdlib)
     }
     
-    private fun evalString(ctx: JSContext, code: String, filename: String): Boolean {
+    private fun evalString(ctx: JSContext, code: String, filename: String, isRepl: Boolean = false): Boolean {
         val bytes = code.toByteArray()
-        val state = JSParseState(ctx, bytes, filename, JS_EVAL_RETVAL)
+        val evalFlags = if (isRepl) JS_EVAL_RETVAL or JS_EVAL_REPL else JS_EVAL_RETVAL
+        val state = JSParseState(ctx, bytes, filename, evalFlags)
         val parser = JSParser(state)
         val result = parser.parse()
         
@@ -203,7 +204,7 @@ usage: mqjs [options] [file [args]]
             if (line.isBlank()) continue
             
             try {
-                evalString(ctx, line, "<repl>")
+                evalString(ctx, line, "<repl>", isRepl = true)
             } catch (e: Exception) {
                 System.err.println("Error: ${e.message}")
             }

@@ -308,7 +308,7 @@ class JSRuntime(private val ctx: JSContext) {
                     val idx = readU16(code, pc)
                     pc += 2
                     val val1 = stack.removeLast()
-                    val obj = stack.last()
+                    val obj = stack.removeLast()
                     val cpool = ctx.memory.getJSValue(funcPtr + 24)
                     val key = if (cpool != JS_NULL) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
@@ -645,21 +645,14 @@ class JSRuntime(private val ctx: JSContext) {
         val propsPtr = JS_VALUE_TO_PTR(props)
         val hashMask = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 16))
         
-        println("getProperty: key=$key, hashMask=$hashMask")
-        
         val h = hashProp(key, hashMask)
-        println("hash=$h")
         var idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 24 + h * 8)) shr 1
-        println("initial idx=$idx")
         
         while (idx != 0) {
             val propPtr = propsPtr + 8 + idx * 8
             val propKey = ctx.memory.getJSValue(propPtr)
-            println("checking prop at idx=$idx, key=$propKey")
-            if (propKey == key) {
-                val result = ctx.memory.getJSValue(propPtr + 8)
-                println("found! result=$result")
-                return result
+            if (propKey == key || jsValueEquals(propKey, key)) {
+                return ctx.memory.getJSValue(propPtr + 8)
             }
             idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propPtr + 16)) shr 1
         }
@@ -669,8 +662,17 @@ class JSRuntime(private val ctx: JSContext) {
             return getProperty(proto, key)
         }
         
-        println("not found")
         return JS_UNDEFINED
+    }
+    
+    fun jsValueEquals(a: JSValue, b: JSValue): Boolean {
+        if (a == b) return true
+        if (JS_IsString(ctx, a) && JS_IsString(ctx, b)) {
+            val sa = jsGetString(ctx, a)
+            val sb = jsGetString(ctx, b)
+            return sa == sb
+        }
+        return false
     }
     
     fun setProperty(obj: JSValue, key: JSValue, val1: JSValue) {
@@ -689,18 +691,13 @@ class JSRuntime(private val ctx: JSContext) {
         var hashMask = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 16))
         var size = ctx.memory.getI32(propsPtr + 4)
         
-        println("setProperty: key=$key, val=$val1, propCount=$propCount, hashMask=$hashMask, size=$size")
-        
         val h = hashProp(key, hashMask)
-        println("hash=$h")
         var idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 24 + h * 8)) shr 1
-        println("initial idx=$idx")
         
         while (idx != 0) {
             val propPtr = propsPtr + 8 + idx * 8
             val propKey = ctx.memory.getJSValue(propPtr)
-            println("checking prop at idx=$idx, key=$propKey")
-            if (propKey == key) {
+            if (propKey == key || jsValueEquals(propKey, key)) {
                 ctx.memory.putJSValue(propPtr + 8, val1)
                 return
             }
@@ -709,10 +706,8 @@ class JSRuntime(private val ctx: JSContext) {
         
         var lastPropPtr = propsPtr + 8 + (size - 3) * 8
         var lastKey = ctx.memory.getJSValue(lastPropPtr)
-        println("lastKey=$lastKey, lastPropPtr offset=${(size - 3) * 8}")
         
         if (lastKey != JS_UNINITIALIZED) {
-            println("array full, extending")
             val newSize = size + 3
             val newProps = ctx.malloc(8 + newSize * 8, JSMTags.JS_MTAG_VALUE_ARRAY)
             if (newProps == 0) return
@@ -740,15 +735,12 @@ class JSRuntime(private val ctx: JSContext) {
         }
         
         val firstFree = JS_VALUE_GET_INT(ctx.memory.getJSValue(lastPropPtr + 16)) shr 1
-        println("firstFree=$firstFree")
         
         if (firstFree + 3 > size) {
-            println("firstFree + 3 > size")
             return
         }
         
         val propPtr = propsPtr + 8 + firstFree * 8
-        println("storing at propPtr offset=${firstFree * 8}, propPtr=$propPtr")
         ctx.memory.putJSValue(propPtr, key)
         ctx.memory.putJSValue(propPtr + 8, val1)
         ctx.memory.putJSValue(propPtr + 16, ctx.memory.getJSValue(propsPtr + 24 + h * 8))
@@ -763,6 +755,14 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun hashProp(prop: JSValue, hashMask: Int): Int {
+        if (JS_IsString(ctx, prop)) {
+            val str = jsGetString(ctx, prop)
+            var h = 0
+            for (c in str) {
+                h = (h * 31 + c.code) and hashMask
+            }
+            return h
+        }
         return ((prop / JSW) xor (prop % JSW)).toInt() and hashMask
     }
     
@@ -916,28 +916,29 @@ class JSRuntime(private val ctx: JSContext) {
         val firstFree = 2 + hashMask + 1
         val size = firstFree + 3 * n
         
-        println("allocProps: n=$n, hashSizeLog2=$hashSizeLog2, hashMask=$hashMask, firstFree=$firstFree, size=$size")
-        
         val ptr = ctx.malloc(8 + size * 8, JSMTags.JS_MTAG_VALUE_ARRAY)
         if (ptr == 0) return JS_NULL
         
         ctx.memory.putI32(ptr + 4, size)
-        ctx.memory.putJSValue(ptr + 8, JS_NewShortInt(0))
-        ctx.memory.putJSValue(ptr + 16, JS_NewShortInt(hashMask))
+        ctx.memory.putJSValue(ptr + 8, JS_NewShortInt(0))  // prop_count = 0
+        ctx.memory.putJSValue(ptr + 16, JS_NewShortInt(hashMask))  // hash_mask
         
+        // 初始化哈希表
         for (i in 0..hashMask) {
             ctx.memory.putJSValue(ptr + 24 + i * 8, JS_NewShortInt(0))
         }
         
+        // 初始化属性槽
         for (i in 0 until n) {
             val propOffset = ptr + 8 + (2 + hashMask + 1 + 3 * i) * 8
-            ctx.memory.putJSValue(propOffset, JS_UNINITIALIZED)
+            ctx.memory.putJSValue(propOffset, JS_UNINITIALIZED)  // key
+            ctx.memory.putJSValue(propOffset + 8, JS_UNDEFINED)  // value
+            ctx.memory.putJSValue(propOffset + 16, JS_NewShortInt(0))  // hash_next
         }
         
-        val lastPropOffset = ptr + 8 + (2 + hashMask + 1 + 3 * (n - 1) + 2) * 8
-        ctx.memory.putJSValue(lastPropOffset, JS_NewShortInt(firstFree shl 1))
-        
-        println("allocProps: ptr=$ptr, lastPropOffset=$lastPropOffset, lastPropOffset-value=${ctx.memory.getJSValue(lastPropOffset)}")
+        // 设置最后一个属性的 hash_next 为 firstFree << 1
+        val lastPropOffset = ptr + 8 + (2 + hashMask + 1 + 3 * (n - 1)) * 8
+        ctx.memory.putJSValue(lastPropOffset + 16, JS_NewShortInt(firstFree shl 1))
         
         return JS_VALUE_FROM_PTR(ptr)
     }

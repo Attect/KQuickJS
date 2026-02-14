@@ -149,15 +149,32 @@ class JSParser(private val s: JSParseState) {
             val name = s.token.value
             s.nextToken()
             
-            if (s.token.val1 == '='.code) {
-                s.nextToken()
-                if (!parseAssignExpr()) return false
+            if (s.isRepl) {
+                // REPL 模式：将变量存储到全局对象
+                // 栈顺序需要是 [obj, val]
+                emitOp(OPCodeEnum.OP_push_this)  // 先压入全局对象
+                
+                if (s.token.val1 == '='.code) {
+                    s.nextToken()
+                    if (!parseAssignExpr()) return false
+                } else {
+                    emitOp(OPCodeEnum.OP_undefined)
+                }
+                
+                val cidx = addConstPool(name)
+                emitOpWithArg(OPCodeEnum.OP_put_field, cidx)
             } else {
-                emitOp(OPCodeEnum.OP_undefined)
+                // 正常模式：将变量存储到局部变量
+                if (s.token.val1 == '='.code) {
+                    s.nextToken()
+                    if (!parseAssignExpr()) return false
+                } else {
+                    emitOp(OPCodeEnum.OP_undefined)
+                }
+                
+                val idx = addLocalVar(name)
+                emitOpWithArg(OPCodeEnum.OP_put_loc, idx)
             }
-            
-            val idx = addLocalVar(name)
-            emitOpWithArg(OPCodeEnum.OP_put_loc, idx)
             
         } while (s.token.val1 == ','.code && run { s.nextToken(); true })
         
@@ -1163,6 +1180,7 @@ class JSParser(private val s: JSParseState) {
                 if (idx >= 0) {
                     emitOpWithArg(OPCodeEnum.OP_get_loc, idx)
                 } else {
+                    emitOp(OPCodeEnum.OP_push_this)
                     val cidx = addConstPool(name)
                     emitOpWithArg(OPCodeEnum.OP_get_field, cidx)
                 }

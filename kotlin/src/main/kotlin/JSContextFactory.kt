@@ -33,6 +33,28 @@ fun JS_NewContext(mem: ByteArray, memSize: Int, stdlib: JSSTDLibraryDef): JSCont
     ctx.heapBase = 1024
     ctx.heapFree = 1024
     
+    // 初始化类原型
+    for (i in 0 until ctx.classCount) {
+        ctx.classProto[i] = JS_NULL
+        ctx.classObj[i] = JS_NULL
+    }
+    
+    // 初始化 empty_props (空属性数组)
+    val emptyPropsPtr = ctx.malloc(8 + 3 * 8, JSMTags.JS_MTAG_VALUE_ARRAY)
+    if (emptyPropsPtr != 0) {
+        ctx.memory.putI32(emptyPropsPtr + 4, 3)
+        ctx.memory.putJSValue(emptyPropsPtr + 8, JS_NewShortInt(0))  // prop_count
+        ctx.memory.putJSValue(emptyPropsPtr + 16, JS_NewShortInt(0)) // hash_mask
+        ctx.memory.putJSValue(emptyPropsPtr + 24, JS_NewShortInt(0)) // hash_table[0]
+        ctx.emptyProps = JS_VALUE_FROM_PTR(emptyPropsPtr)
+    }
+    
+    // 初始化 Object.prototype
+    ctx.classProto[JSObjectClassEnum.JS_CLASS_OBJECT.value] = JS_NewObject(ctx)
+    
+    // 初始化全局对象
+    ctx.globalObj = JS_NewObject(ctx)
+    
     return ctx
 }
 
