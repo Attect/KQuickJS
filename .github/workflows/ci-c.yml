@@ -14,6 +14,7 @@ on:
       - 'docs/**'
       - '*.md'
   workflow_dispatch:
+  workflow_call:
 
 env:
   BUILD_TYPE: Release

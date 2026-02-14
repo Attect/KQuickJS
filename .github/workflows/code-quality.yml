@@ -6,6 +6,7 @@ on:
   pull_request:
     branches: [ kotlin-implementation ]
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   c-lint:
@@ -53,6 +54,10 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
+
+      - name: Grant execute permission for gradlew
+        working-directory: kotlin
+        run: chmod +x gradlew
 
       - name: Run ktlint
         working-directory: kotlin
@@ -116,6 +121,10 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
+
+      - name: Grant execute permission for gradlew
+        working-directory: kotlin
+        run: chmod +x gradlew
 
       - name: Run tests with coverage
         working-directory: kotlin

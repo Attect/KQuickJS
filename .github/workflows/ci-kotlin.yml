@@ -12,6 +12,7 @@ on:
       - 'kotlin/**'
       - '.github/workflows/ci-kotlin.yml'
   workflow_dispatch:
+  workflow_call:
 
 env:
   JAVA_VERSION: '17'
