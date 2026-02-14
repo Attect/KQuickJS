@@ -8,7 +8,7 @@ import java.util.Scanner
 
 object MQuickJS {
     
-    private const val VERSION = "MicroQuickJS Kotlin 1.0.0"
+    private const val VERSION = "MicroQuickJS Kotlin"
     private const val DEFAULT_MEM_SIZE = 16 * 1024 * 1024
     
     @JvmStatic
@@ -17,55 +17,90 @@ object MQuickJS {
         var interactive = false
         var expr: String? = null
         var memSize = DEFAULT_MEM_SIZE
+        var dumpMemory = 0
+        var parseFlags = 0
         val includeList = mutableListOf<String>()
         
         while (optind < args.size && args[optind].startsWith("-")) {
             val arg = args[optind].substring(1)
+            var longopt = ""
             optind++
             
             if (arg.isEmpty()) break
             
-            when {
-                arg == "h" || arg == "-help" -> {
-                    printHelp()
-                    return
+            if (arg.startsWith("-")) {
+                longopt = arg.substring(1)
+                if (longopt.isEmpty()) break
+            }
+            
+            var currentArg = arg
+            if (longopt.isNotEmpty()) {
+                currentArg = ""
+            }
+            
+            while (currentArg.isNotEmpty() || longopt.isNotEmpty()) {
+                val opt = if (currentArg.isNotEmpty()) {
+                    val c = currentArg[0]
+                    currentArg = currentArg.substring(1)
+                    c
+                } else {
+                    '\u0000'
                 }
-                arg == "e" || arg == "-eval" -> {
-                    if (optind < args.size) {
-                        expr = args[optind++]
-                    } else {
-                        System.err.println("missing expression for -e")
-                        System.exit(2)
+                
+                when {
+                    opt == 'h' || opt == '?' || longopt == "help" -> {
+                        printHelp()
+                        return
                     }
-                }
-                arg == "i" || arg == "-interactive" -> {
-                    interactive = true
-                }
-                arg == "I" || arg == "-include" -> {
-                    if (optind < args.size) {
+                    opt == 'e' || longopt == "eval" -> {
+                        if (currentArg.isNotEmpty()) {
+                            expr = currentArg
+                            currentArg = ""
+                        } else if (optind < args.size) {
+                            expr = args[optind++]
+                        } else {
+                            System.err.println("missing expression for -e")
+                            System.exit(2)
+                        }
+                        longopt = ""
+                    }
+                    longopt == "memory-limit" -> {
+                        if (optind >= args.size) {
+                            System.err.println("expecting memory limit")
+                            System.exit(1)
+                        }
+                        memSize = parseMemoryLimit(args[optind++])
+                        longopt = ""
+                    }
+                    opt == 'd' || longopt == "dump" -> {
+                        dumpMemory++
+                        longopt = ""
+                    }
+                    opt == 'i' || longopt == "interactive" -> {
+                        interactive = true
+                        longopt = ""
+                    }
+                    opt == 'I' || longopt == "include" -> {
+                        if (optind >= args.size) {
+                            System.err.println("expecting filename")
+                            System.exit(1)
+                        }
                         includeList.add(args[optind++])
-                    } else {
-                        System.err.println("expecting filename")
-                        System.exit(1)
+                        longopt = ""
                     }
-                }
-                arg == "-memory-limit" -> {
-                    if (optind < args.size) {
-                        val limitStr = args[optind++]
-                        memSize = parseMemoryLimit(limitStr)
-                    } else {
-                        System.err.println("expecting memory limit")
-                        System.exit(1)
+                    longopt == "no-column" -> {
+                        parseFlags = parseFlags or JS_EVAL_STRIP_COL
+                        longopt = ""
                     }
-                }
-                arg == "v" || arg == "-version" -> {
-                    println(VERSION)
-                    return
-                }
-                else -> {
-                    System.err.println("mqjs: unknown option '-$arg'")
-                    printHelp()
-                    return
+                    else -> {
+                        if (opt != '\u0000') {
+                            System.err.println("qjs: unknown option '-$opt'")
+                        } else {
+                            System.err.println("qjs: unknown option '--$longopt'")
+                        }
+                        printHelp()
+                        return
+                    }
                 }
             }
         }
@@ -73,59 +108,61 @@ object MQuickJS {
         val ctx = createContext(memSize)
         
         for (includeFile in includeList) {
-            if (!evalFile(ctx, includeFile)) {
+            if (!evalFile(ctx, includeFile, parseFlags)) {
                 System.exit(1)
             }
         }
         
         if (expr != null) {
-            if (!evalString(ctx, expr, "<cmdline>")) {
+            if (!evalString(ctx, expr, "<cmdline>", false, parseFlags or JS_EVAL_REPL)) {
                 System.exit(1)
             }
         } else if (optind >= args.size) {
             interactive = true
         } else {
             val filename = args[optind]
-            if (!evalFile(ctx, filename)) {
+            if (!evalFile(ctx, filename, parseFlags)) {
                 System.exit(1)
             }
         }
         
         if (interactive) {
-            runREPL(ctx)
+            runREPL(ctx, parseFlags)
+        }
+        
+        if (dumpMemory > 0) {
+            dumpMemory(ctx, dumpMemory >= 2)
         }
     }
     
     private fun printHelp() {
         println("""
-MicroQuickJS Kotlin
+MicroQuickJS
 usage: mqjs [options] [file [args]]
 -h  --help            list options
 -e  --eval EXPR       evaluate EXPR
 -i  --interactive     go to interactive mode
 -I  --include file    include an additional file
+-d  --dump            dump the memory usage stats
     --memory-limit n  limit the memory usage to 'n' bytes
--v  --version         show version
+--no-column           no column number in debug information
+-o FILE               save the bytecode to FILE
+-m32                  force 32 bit bytecode output (use with -o)
+-b  --allow-bytecode  allow bytecode in input file
         """.trimIndent())
+        System.exit(1)
     }
     
     private fun parseMemoryLimit(s: String): Int {
-        val multipliers = mapOf(
-            'k' to 1024,
-            'K' to 1024,
-            'm' to 1024 * 1024,
-            'M' to 1024 * 1024,
-            'g' to 1024 * 1024 * 1024,
-            'G' to 1024 * 1024 * 1024
-        )
-        
-        val lastChar = s.last()
-        return if (lastChar in multipliers) {
-            val num = s.dropLast(1).toDouble()
-            (num * multipliers[lastChar]!!).toInt()
-        } else {
-            s.toInt()
+        val lastChar = s.last().lowercaseChar()
+        val numStr = if (lastChar == 'g' || lastChar == 'm' || lastChar == 'k') s.dropLast(1) else s
+        var count = numStr.toDouble()
+        when (lastChar) {
+            'g' -> count *= 1024 * 1024 * 1024
+            'm' -> count *= 1024 * 1024
+            'k' -> count *= 1024
         }
+        return count.toInt()
     }
     
     private fun createContext(memSize: Int): JSContext {
@@ -143,9 +180,9 @@ usage: mqjs [options] [file [args]]
         return JS_NewContext(mem, memSize, stdlib)
     }
     
-    private fun evalString(ctx: JSContext, code: String, filename: String, isRepl: Boolean = false): Boolean {
+    private fun evalString(ctx: JSContext, code: String, filename: String, isRepl: Boolean, parseFlags: Int): Boolean {
         val bytes = code.toByteArray()
-        val evalFlags = if (isRepl) JS_EVAL_RETVAL or JS_EVAL_REPL else JS_EVAL_RETVAL
+        val evalFlags = if (isRepl) parseFlags or JS_EVAL_RETVAL or JS_EVAL_REPL else parseFlags
         val state = JSParseState(ctx, bytes, filename, evalFlags)
         val parser = JSParser(state)
         val result = parser.parse()
@@ -163,19 +200,21 @@ usage: mqjs [options] [file [args]]
             return false
         }
         
-        printResult(ctx, runtimeResult)
+        if (isRepl) {
+            printResult(ctx, runtimeResult)
+        }
         return true
     }
     
-    private fun evalFile(ctx: JSContext, filename: String): Boolean {
+    private fun evalFile(ctx: JSContext, filename: String, parseFlags: Int): Boolean {
         val file = File(filename)
         if (!file.exists()) {
-            System.err.println("File not found: $filename")
+            System.err.println("$filename: No such file or directory")
             return false
         }
         
         val code = file.readText()
-        return evalString(ctx, code, filename)
+        return evalString(ctx, code, filename, false, parseFlags)
     }
     
     private fun printResult(ctx: JSContext, result: JSValue) {
@@ -190,26 +229,28 @@ usage: mqjs [options] [file [args]]
         }
     }
     
-    private fun runREPL(ctx: JSContext) {
+    private fun runREPL(ctx: JSContext, parseFlags: Int) {
         val scanner = Scanner(System.`in`)
-        println("MicroQuickJS Kotlin REPL")
-        println("Type 'exit' to quit")
-        println()
         
         while (true) {
             print("mqjs > ")
-            val line = scanner.nextLine() ?: break
+            val line = try {
+                scanner.nextLine() ?: break
+            } catch (e: Exception) {
+                break
+            }
             
-            if (line.trim() == "exit") break
             if (line.isBlank()) continue
             
             try {
-                evalString(ctx, line, "<repl>", isRepl = true)
+                evalString(ctx, line, "<cmdline>", true, parseFlags)
             } catch (e: Exception) {
                 System.err.println("Error: ${e.message}")
             }
         }
-        
-        println("Goodbye!")
+    }
+    
+    private fun dumpMemory(ctx: JSContext, verbose: Boolean) {
+        println("Memory dump not yet implemented in Kotlin version")
     }
 }
