@@ -1,6 +1,6 @@
-package com.mquickjs.parser
+package app.muka.project.kquickjs.parser
 
-import com.mquickjs.*
+import app.muka.project.kquickjs.*
 
 enum class JSTokenVal(val value: Int) {
     TOK_EOF(0),

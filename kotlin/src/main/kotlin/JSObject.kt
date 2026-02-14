@@ -1,9 +1,9 @@
-package com.mquickjs
+package app.muka.project.kquickjs
 
-import com.mquickjs.JSMTags.JS_MTAG_OBJECT
-import com.mquickjs.JSMTags.JS_MTAG_STRING
-import com.mquickjs.JSMTags.JS_MTAG_VALUE_ARRAY
-import com.mquickjs.memory.getMTag
+import app.muka.project.kquickjs.JSMTags.JS_MTAG_OBJECT
+import app.muka.project.kquickjs.JSMTags.JS_MTAG_STRING
+import app.muka.project.kquickjs.JSMTags.JS_MTAG_VALUE_ARRAY
+import app.muka.project.kquickjs.memory.getMTag
 
 fun JS_NewObjectProtoClass(ctx: JSContext, proto: JSValue, classId: Int, extraSize: Int): JSValue {
     val size = 24 + extraSize * JSW

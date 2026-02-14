@@ -1,8 +1,8 @@
-package com.mquickjs
+package app.muka.project.kquickjs
 
-import com.mquickjs.memory.getBlockSize
-import com.mquickjs.memory.getMTag
-import com.mquickjs.memory.getGCMark
+import app.muka.project.kquickjs.memory.getBlockSize
+import app.muka.project.kquickjs.memory.getMTag
+import app.muka.project.kquickjs.memory.getGCMark
 
 object JSGC {
     

@@ -1,4 +1,4 @@
-package com.mquickjs
+package app.muka.project.kquickjs
 
 enum class JSObjectClassEnum(val value: Int) {
     JS_CLASS_OBJECT(0),

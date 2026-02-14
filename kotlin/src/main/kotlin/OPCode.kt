@@ -1,4 +1,4 @@
-package com.mquickjs
+package app.muka.project.kquickjs
 
 enum class OPCodeEnum(val id: Int, val size: Int, val nPop: Int, val nPush: Int, val fmt: Int) {
     OP_invalid(0, 1, 0, 0, 0),

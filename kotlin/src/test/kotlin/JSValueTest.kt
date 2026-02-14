@@ -1,4 +1,4 @@
-package com.mquickjs
+package app.muka.project.kquickjs
 
 import kotlin.test.Test
 import kotlin.test.assertEquals

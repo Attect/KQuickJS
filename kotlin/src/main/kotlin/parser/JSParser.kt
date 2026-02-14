@@ -1,12 +1,12 @@
-package com.mquickjs.parser
+package app.muka.project.kquickjs.parser
 
-import com.mquickjs.*
-import com.mquickjs.JSMTags.JS_MTAG_BYTE_ARRAY
-import com.mquickjs.JSMTags.JS_MTAG_FUNCTION_BYTECODE
-import com.mquickjs.JSMTags.JS_MTAG_OBJECT
-import com.mquickjs.JSMTags.JS_MTAG_STRING
-import com.mquickjs.JSMTags.JS_MTAG_VALUE_ARRAY
-import com.mquickjs.memory.getMTag
+import app.muka.project.kquickjs.*
+import app.muka.project.kquickjs.JSMTags.JS_MTAG_BYTE_ARRAY
+import app.muka.project.kquickjs.JSMTags.JS_MTAG_FUNCTION_BYTECODE
+import app.muka.project.kquickjs.JSMTags.JS_MTAG_OBJECT
+import app.muka.project.kquickjs.JSMTags.JS_MTAG_STRING
+import app.muka.project.kquickjs.JSMTags.JS_MTAG_VALUE_ARRAY
+import app.muka.project.kquickjs.memory.getMTag
 
 class JSParser(private val s: JSParseState) {
     

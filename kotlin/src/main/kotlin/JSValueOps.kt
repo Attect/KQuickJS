@@ -1,8 +1,8 @@
-package com.mquickjs
+package app.muka.project.kquickjs
 
-import com.mquickjs.JSMTags.JS_MTAG_FLOAT64
-import com.mquickjs.JSMTags.JS_MTAG_STRING
-import com.mquickjs.memory.getMTag
+import app.muka.project.kquickjs.JSMTags.JS_MTAG_FLOAT64
+import app.muka.project.kquickjs.JSMTags.JS_MTAG_STRING
+import app.muka.project.kquickjs.memory.getMTag
 
 const val JS_SHORTINT_MIN = -(1 shl 30)
 const val JS_SHORTINT_MAX = (1 shl 30) - 1

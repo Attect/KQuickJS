@@ -1,8 +1,8 @@
-package com.mquickjs
+package app.muka.project.kquickjs
 
-import com.mquickjs.parser.JSParseState
-import com.mquickjs.parser.JSParser
-import com.mquickjs.runtime.JSRuntime
+import app.muka.project.kquickjs.parser.JSParseState
+import app.muka.project.kquickjs.parser.JSParser
+import app.muka.project.kquickjs.runtime.JSRuntime
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue

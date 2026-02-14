@@ -1,8 +1,8 @@
-package com.mquickjs.memory
+package app.muka.project.kquickjs.memory
 
-import com.mquickjs.JSW
-import com.mquickjs.JSMTags
-import com.mquickjs.JS_VALUE_FROM_PTR
+import app.muka.project.kquickjs.JSW
+import app.muka.project.kquickjs.JSMTags
+import app.muka.project.kquickjs.JS_VALUE_FROM_PTR
 
 class MemoryBlock(val memory: Memory, val offset: Int) {
     

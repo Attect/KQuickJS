@@ -1,4 +1,4 @@
-package com.mquickjs
+package app.muka.project.kquickjs
 
 object JSMTags {
     const val JS_MTAG_FREE: Int = 0

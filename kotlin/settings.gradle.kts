@@ -1,1 +1,1 @@
-rootProject.name = "mquickjs-kotlin"
+rootProject.name = "kquickjs"

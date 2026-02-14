@@ -1,10 +1,10 @@
-package com.mquickjs
+package app.muka.project.kquickjs
 
-import com.mquickjs.memory.Memory
-import com.mquickjs.memory.getMTag
-import com.mquickjs.parser.JSParseState
-import com.mquickjs.parser.JSParser
-import com.mquickjs.runtime.JSRuntime
+import app.muka.project.kquickjs.memory.Memory
+import app.muka.project.kquickjs.memory.getMTag
+import app.muka.project.kquickjs.parser.JSParseState
+import app.muka.project.kquickjs.parser.JSParser
+import app.muka.project.kquickjs.runtime.JSRuntime
 
 data class JSSTDLibraryDef(
     val stdlibTable: LongArray,

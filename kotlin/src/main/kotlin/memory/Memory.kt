@@ -1,6 +1,6 @@
-package com.mquickjs.memory
+package app.muka.project.kquickjs.memory
 
-import com.mquickjs.JSW
+import app.muka.project.kquickjs.JSW
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 

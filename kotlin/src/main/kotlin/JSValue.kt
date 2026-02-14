@@ -1,4 +1,4 @@
-package com.mquickjs
+package app.muka.project.kquickjs
 
 typealias JSWord = Long
 typealias JSValue = Long

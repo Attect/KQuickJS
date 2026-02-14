@@ -1,4 +1,4 @@
-package com.mquickjs
+package app.muka.project.kquickjs
 
 data class JSCFunctionDef(
     val func: ((ctx: JSContext, thisVal: JSValue, argc: Int, argv: LongArray) -> JSValue)? = null,

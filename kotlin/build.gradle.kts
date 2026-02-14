@@ -4,7 +4,7 @@ plugins {
     id("org.graalvm.buildtools.native") version "0.10.2"
 }
 
-group = "com.mquickjs"
+group = "app.muka.project"
 version = "1.0.0"
 
 repositories {
@@ -25,12 +25,12 @@ kotlin {
 }
 
 application {
-    mainClass.set("com.mquickjs.MQuickJS")
+    mainClass.set("app.muka.project.kquickjs.MQuickJS")
 }
 
 tasks.jar {
     manifest {
-        attributes["Main-Class"] = "com.mquickjs.MQuickJS"
+        attributes["Main-Class"] = "app.muka.project.kquickjs.MQuickJS"
     }
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     from(configurations.runtimeClasspath.get().map { if (it.isDirectory) it else zipTree(it) })
@@ -50,7 +50,7 @@ graalvmNative {
                 "--enable-https",
                 "-H:+ReportExceptionStackTraces",
                 "--initialize-at-build-time=kotlin",
-                "--initialize-at-run-time=com.mquickjs"
+                "--initialize-at-run-time=app.muka.project.kquickjs"
             )
             
             if (org.gradle.internal.os.OperatingSystem.current().isWindows) {

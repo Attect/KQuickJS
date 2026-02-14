@@ -1,13 +1,13 @@
 [
   {
-    "name": "com.mquickjs.MQuickJS",
+    "name": "app.muka.project.kquickjs.MQuickJS",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
     "allPublicMethods": true
   },
   {
-    "name": "com.mquickjs.JSContext",
+    "name": "app.muka.project.kquickjs.JSContext",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
@@ -16,7 +16,7 @@
     "allPublicFields": true
   },
   {
-    "name": "com.mquickjs.JSContext$JSStringPosCacheEntry",
+    "name": "app.muka.project.kquickjs.JSContext$JSStringPosCacheEntry",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
@@ -25,7 +25,7 @@
     "allPublicFields": true
   },
   {
-    "name": "com.mquickjs.JSGCRef",
+    "name": "app.muka.project.kquickjs.JSGCRef",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
@@ -34,7 +34,7 @@
     "allPublicFields": true
   },
   {
-    "name": "com.mquickjs.JSSTDLibraryDef",
+    "name": "app.muka.project.kquickjs.JSSTDLibraryDef",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
@@ -43,7 +43,7 @@
     "allPublicFields": true
   },
   {
-    "name": "com.mquickjs.JSCFunctionDef",
+    "name": "app.muka.project.kquickjs.JSCFunctionDef",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
@@ -52,49 +52,49 @@
     "allPublicFields": true
   },
   {
-    "name": "com.mquickjs.JSObjectClassEnum",
+    "name": "app.muka.project.kquickjs.JSObjectClassEnum",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
     "allPublicMethods": true
   },
   {
-    "name": "com.mquickjs.JSCFunctionEnum",
+    "name": "app.muka.project.kquickjs.JSCFunctionEnum",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
     "allPublicMethods": true
   },
   {
-    "name": "com.mquickjs.JSCFunctionDefEnum",
+    "name": "app.muka.project.kquickjs.JSCFunctionDefEnum",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
     "allPublicMethods": true
   },
   {
-    "name": "com.mquickjs.JSPropTypeEnum",
+    "name": "app.muka.project.kquickjs.JSPropTypeEnum",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
     "allPublicMethods": true
   },
   {
-    "name": "com.mquickjs.JSVarRefKindEnum",
+    "name": "app.muka.project.kquickjs.JSVarRefKindEnum",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
     "allPublicMethods": true
   },
   {
-    "name": "com.mquickjs.OPCodeEnum",
+    "name": "app.muka.project.kquickjs.OPCodeEnum",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
     "allPublicMethods": true
   },
   {
-    "name": "com.mquickjs.memory.Memory",
+    "name": "app.muka.project.kquickjs.memory.Memory",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
@@ -103,7 +103,7 @@
     "allPublicFields": true
   },
   {
-    "name": "com.mquickjs.parser.JSParseState",
+    "name": "app.muka.project.kquickjs.parser.JSParseState",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
@@ -112,28 +112,28 @@
     "allPublicFields": true
   },
   {
-    "name": "com.mquickjs.parser.JSParser",
+    "name": "app.muka.project.kquickjs.parser.JSParser",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
     "allPublicMethods": true
   },
   {
-    "name": "com.mquickjs.parser.JSLexer",
+    "name": "app.muka.project.kquickjs.parser.JSLexer",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
     "allPublicMethods": true
   },
   {
-    "name": "com.mquickjs.parser.JSTokenVal",
+    "name": "app.muka.project.kquickjs.parser.JSTokenVal",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
     "allPublicMethods": true
   },
   {
-    "name": "com.mquickjs.runtime.JSRuntime",
+    "name": "app.muka.project.kquickjs.runtime.JSRuntime",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,

@@ -1,9 +1,9 @@
-package com.mquickjs.runtime
+package app.muka.project.kquickjs.runtime
 
-import com.mquickjs.*
-import com.mquickjs.JSMTags
-import com.mquickjs.memory.getMTag
-import com.mquickjs.OPCodeEnum
+import app.muka.project.kquickjs.*
+import app.muka.project.kquickjs.JSMTags
+import app.muka.project.kquickjs.memory.getMTag
+import app.muka.project.kquickjs.OPCodeEnum
 
 class JSRuntime(private val ctx: JSContext) {
     

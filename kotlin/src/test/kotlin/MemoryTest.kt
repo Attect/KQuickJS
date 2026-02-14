@@ -1,6 +1,6 @@
-package com.mquickjs
+package app.muka.project.kquickjs
 
-import com.mquickjs.memory.Memory
+import app.muka.project.kquickjs.memory.Memory
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue

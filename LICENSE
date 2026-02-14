@@ -1,5 +1,5 @@
 Micro QuickJS Javascript Engine
- 
+
 Copyright (c) 2017-2025 Fabrice Bellard
 Copyright (c) 2017-2025 Charlie Gordon
 
@@ -20,3 +20,25 @@ THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+Additional Components
+
+The following components were developed under the direction of Attect,
+with implementation assistance from GLM5 AI:
+
+1. CMake Build System
+   - CMakeLists.txt and related build configuration files
+   - Build scripts and compilation configurations
+   - Project structure adaptations for CMake
+
+2. Kotlin Implementation
+   - Complete Kotlin/JVM port of the JavaScript engine
+   - Parser, lexer, and runtime components
+   - Memory management system
+   - GraalVM Native Image support
+   - All source files under the kotlin/ directory
+
+These additional components are also licensed under the MIT License
+as stated above.
