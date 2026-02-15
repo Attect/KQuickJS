@@ -30,16 +30,6 @@ jobs:
             runner: ubuntu-latest
             ext: ''
             libext: '.so'
-          - os: windows
-            arch: x64
-            runner: windows-latest
-            ext: '.exe'
-            libext: '.dll'
-          - os: macos
-            arch: x64
-            runner: macos-13
-            ext: ''
-            libext: '.dylib'
           - os: macos
             arch: arm64
             runner: macos-latest
@@ -49,17 +39,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup MSVC
-        if: matrix.os == 'windows'
-        uses: ilammy/msvc-dev-cmd@v1
-
       - name: Configure CMake
-        run: |
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -G "Visual Studio 17 2022" -A x64
-          else
-            cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
-          fi
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
         shell: bash
 
       - name: Build
@@ -70,17 +51,10 @@ jobs:
         run: |
           mkdir -p dist
           VERSION="${{ github.event.inputs.version || github.ref_name }}"
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            cp build/${{ env.BUILD_TYPE }}/mqjs.exe dist/mqjs-${{ matrix.os }}-${{ matrix.arch }}.exe
-            cp build/${{ env.BUILD_TYPE }}/example.exe dist/example-${{ matrix.os }}-${{ matrix.arch }}.exe
-            cp build/${{ env.BUILD_TYPE }}/mquickjs.dll dist/mquickjs-${{ matrix.os }}-${{ matrix.arch }}.dll
-            cp build/${{ env.BUILD_TYPE }}/mquickjs.lib dist/mquickjs-${{ matrix.os }}-${{ matrix.arch }}.lib
-          else
-            cp build/mqjs dist/mqjs-${{ matrix.os }}-${{ matrix.arch }}
-            cp build/example dist/example-${{ matrix.os }}-${{ matrix.arch }}
-            cp build/libmquickjs${{ matrix.libext }} dist/libmquickjs-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.libext }}
-            cp build/libmquickjs.a dist/libmquickjs-${{ matrix.os }}-${{ matrix.arch }}.a
-          fi
+          cp build/mqjs dist/mqjs-${{ matrix.os }}-${{ matrix.arch }}
+          cp build/example dist/example-${{ matrix.os }}-${{ matrix.arch }}
+          cp build/libmquickjs${{ matrix.libext }} dist/libmquickjs-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.libext }}
+          cp build/libmquickjs.a dist/libmquickjs-${{ matrix.os }}-${{ matrix.arch }}.a
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -106,7 +80,9 @@ jobs:
 
       - name: Build JAR
         working-directory: kotlin
-        run: ./gradlew jar --no-daemon
+        run: |
+          chmod +x gradlew
+          ./gradlew jar --no-daemon
 
       - name: Rename JAR
         run: |
@@ -126,17 +102,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: windows
-            arch: x64
-            runner: windows-latest
-            ext: .exe
           - os: linux
             arch: x64
             runner: ubuntu-latest
-            ext: ''
-          - os: macos
-            arch: x64
-            runner: macos-13
             ext: ''
           - os: macos
             arch: aarch64
@@ -157,15 +125,7 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Build Native Image (Windows)
-        if: matrix.os == 'windows'
-        working-directory: kotlin
-        run: |
-          ./gradlew.bat jar --no-daemon
-          ./gradlew.bat nativeCompile --no-daemon
-
-      - name: Build Native Image (Unix)
-        if: matrix.os != 'windows'
+      - name: Build Native Image
         working-directory: kotlin
         run: |
           chmod +x gradlew
@@ -176,11 +136,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            cp kotlin/build/native/nativeCompile/kquickjs.exe dist/kquickjs-native-${{ matrix.os }}-${{ matrix.arch }}.exe
-          else
-            cp kotlin/build/native/nativeCompile/kquickjs dist/kquickjs-native-${{ matrix.os }}-${{ matrix.arch }}
-          fi
+          cp kotlin/build/native/nativeCompile/kquickjs dist/kquickjs-native-${{ matrix.os }}-${{ matrix.arch }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -228,15 +184,11 @@ jobs:
             
             #### C Version
             - **Linux x64**: `mquickjs-c-linux-x64`
-            - **Windows x64**: `mquickjs-c-windows-x64`
-            - **macOS x64**: `mquickjs-c-macos-x64`
             - **macOS ARM64**: `mquickjs-c-macos-arm64`
             
             #### Kotlin Version
             - **JAR**: `kquickjs-jar` (cross-platform)
             - **Native Linux x64**: `kquickjs-native-linux-x64`
-            - **Native Windows x64**: `kquickjs-native-windows-x64`
-            - **Native macOS x64**: `kquickjs-native-macos-x64`
             - **Native macOS ARM64**: `kquickjs-native-macos-aarch64`
             
             ### Usage
@@ -256,8 +208,7 @@ jobs:
             
             #### Kotlin Version (Native)
             ```bash
-            ./mqjs-native-linux-x64 script.js
-            ./mqjs-native-windows-x64.exe script.js
+            ./kquickjs-native-linux-x64 script.js
             ```
           files: release/*
           draft: false

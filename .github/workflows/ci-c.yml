@@ -62,54 +62,9 @@ jobs:
             build/libmquickjs.so
             build/libmquickjs.a
 
-  build-windows:
-    name: Windows (MSVC)
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -G "Visual Studio 17 2022" -A x64
-
-      - name: Build
-        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
-
-      - name: Run tests
-        working-directory: build
-        shell: bash
-        run: |
-          ./mqjs.exe ../tests/test_closure.js
-          ./mqjs.exe ../tests/test_language.js
-          ./mqjs.exe ../tests/test_loop.js
-          ./mqjs.exe ../tests/test_builtin.js
-          ./mqjs.exe -o test_builtin.bin ../tests/test_builtin.js
-          ./mqjs.exe -b test_builtin.bin
-          ./example.exe ../tests/test_rect.js
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: mquickjs-windows-msvc
-          path: |
-            build/${{ env.BUILD_TYPE }}/mqjs.exe
-            build/${{ env.BUILD_TYPE }}/example.exe
-            build/${{ env.BUILD_TYPE }}/mquickjs.dll
-            build/${{ env.BUILD_TYPE }}/mquickjs.lib
-
   build-macos:
-    name: macOS (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - arch: x64
-            runner: macos-13
-          - arch: arm64
-            runner: macos-latest
+    name: macOS (arm64)
+    runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -134,7 +89,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mquickjs-macos-${{ matrix.arch }}
+          name: mquickjs-macos-arm64
           path: |
             build/mqjs
             build/example
@@ -185,39 +140,20 @@ jobs:
             build/libmquickjs.dll
             build/libmquickjs.a
 
-  build-arm-cross:
-    name: ARM Cross-Compile
+  build-x86-32:
+    name: x86-32 Cross-Compile
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - target: arm32
-            options: -DCONFIG_ARM32=ON
-          - target: x86-32
-            options: -DCONFIG_X86_32=ON
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install cross-compiler
-        if: matrix.target == 'arm32'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
-
       - name: Install 32-bit libs
-        if: matrix.target == 'x86-32'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-multilib g++-multilib
 
       - name: Configure CMake
-        run: |
-          if [ "${{ matrix.target }}" = "arm32" ]; then
-            cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} ${{ matrix.options }} -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc
-          else
-            cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} ${{ matrix.options }}
-          fi
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCONFIG_X86_32=ON
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
@@ -225,7 +161,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mquickjs-cross-${{ matrix.target }}
+          name: mquickjs-cross-x86-32
           path: |
             build/mqjs
             build/libmquickjs.a

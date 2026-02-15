@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, windows-latest, macos-latest ]
+        os: [ ubuntu-latest, macos-latest ]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,29 +42,16 @@ jobs:
           cache-read-only: ${{ github.ref != 'refs/heads/kotlin-implementation' }}
 
       - name: Grant execute permission for gradlew
-        if: runner.os != 'Windows'
         working-directory: kotlin
         run: chmod +x gradlew
 
       - name: Build
         working-directory: kotlin
-        run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            ./gradlew.bat jar --no-daemon
-          else
-            ./gradlew jar --no-daemon
-          fi
-        shell: bash
+        run: ./gradlew jar --no-daemon
 
       - name: Run tests
         working-directory: kotlin
-        run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            ./gradlew.bat test --no-daemon
-          else
-            ./gradlew test --no-daemon
-          fi
-        shell: bash
+        run: ./gradlew test --no-daemon
 
       - name: Upload test reports
         if: always()
@@ -87,17 +74,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows
-            arch: x64
-            runner: windows-latest
-            ext: .exe
           - os: linux
             arch: x64
             runner: ubuntu-latest
-            ext: ''
-          - os: macos
-            arch: x64
-            runner: macos-13
             ext: ''
           - os: macos
             arch: aarch64
@@ -118,15 +97,7 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Build Native Image (Windows)
-        if: matrix.os == 'windows'
-        working-directory: kotlin
-        run: |
-          ./gradlew.bat jar --no-daemon
-          ./gradlew.bat nativeCompile --no-daemon
-
-      - name: Build Native Image (Unix)
-        if: matrix.os != 'windows'
+      - name: Build Native Image
         working-directory: kotlin
         run: |
           chmod +x gradlew
@@ -136,31 +107,18 @@ jobs:
       - name: Test Native Image
         shell: bash
         run: |
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            if [ -f "kotlin/build/native/nativeCompile/kquickjs.exe" ]; then
-              ./kotlin/build/native/nativeCompile/kquickjs.exe -e "console.log('Hello from native image!')"
-              ./kotlin/build/native/nativeCompile/kquickjs.exe -e "1 + 2"
-            else
-              echo "Native image not found, skipping test"
-            fi
+          if [ -f "kotlin/build/native/nativeCompile/kquickjs" ]; then
+            ./kotlin/build/native/nativeCompile/kquickjs -e "console.log('Hello from native image!')"
+            ./kotlin/build/native/nativeCompile/kquickjs -e "1 + 2"
           else
-            if [ -f "kotlin/build/native/nativeCompile/kquickjs" ]; then
-              ./kotlin/build/native/nativeCompile/kquickjs -e "console.log('Hello from native image!')"
-              ./kotlin/build/native/nativeCompile/kquickjs -e "1 + 2"
-            else
-              echo "Native image not found, skipping test"
-            fi
+            echo "Native image not found, skipping test"
           fi
 
       - name: Prepare artifact
         shell: bash
         run: |
           mkdir -p dist
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            cp kotlin/build/native/nativeCompile/kquickjs.exe dist/kquickjs-${{ matrix.os }}-${{ matrix.arch }}.exe
-          else
-            cp kotlin/build/native/nativeCompile/kquickjs dist/kquickjs-${{ matrix.os }}-${{ matrix.arch }}
-          fi
+          cp kotlin/build/native/nativeCompile/kquickjs dist/kquickjs-${{ matrix.os }}-${{ matrix.arch }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
