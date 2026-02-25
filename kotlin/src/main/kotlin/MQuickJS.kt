@@ -1,6 +1,7 @@
 package app.muka.project.kquickjs
 
 import app.muka.project.kquickjs.memory.getBlockSize
+import app.muka.project.kquickjs.memory.getGCMark
 import app.muka.project.kquickjs.memory.getMTag
 import app.muka.project.kquickjs.parser.JSParseState
 import app.muka.project.kquickjs.parser.JSParser
@@ -419,13 +420,39 @@ usage: mqjs [options] [file [args]]
         val mtagCount = IntArray(JSMTags.JS_MTAG_COUNT)
         var totSize = 0
         
+        if (verbose) {
+            println("%10s %s %8s %15s %10s %10s %s".format("OFFSET", "M", "SIZE", "TAG", "PROTO", "PROPS", "EXTRA"))
+        }
+        
         var ptr = ctx.heapBase
         while (ptr < ctx.heapFree) {
             val mtag = ctx.memory.getMTag(ptr)
             val size = ctx.memory.getBlockSize(ptr)
+            val gcMark = ctx.memory.getGCMark(ptr)
             mtagMemSize[mtag] += size
             mtagCount[mtag]++
             totSize += size
+            
+            if (verbose) {
+                val markChar = if (gcMark != 0) "*" else " "
+                print("0x%08x %s %8d %15s".format(ptr - ctx.heapBase, markChar, size, JSMTags.getMTagName(mtag)))
+                if (mtag != JSMTags.JS_MTAG_FREE) {
+                    if (mtag == JSMTags.JS_MTAG_OBJECT) {
+                        val proto = ctx.memory.getJSValue(ptr + 8)
+                        val props = ctx.memory.getJSValue(ptr + 16)
+                        print(" 0x%08x 0x%08x".format(
+                            if (JS_IsPtr(proto)) JS_VALUE_TO_PTR(proto) - ctx.heapBase else proto,
+                            if (JS_IsPtr(props)) JS_VALUE_TO_PTR(props) - ctx.heapBase else props
+                        ))
+                    } else {
+                        print(" %10s %10s".format("", ""))
+                    }
+                    print(" ")
+                    printValueRaw(ctx, JS_VALUE_FROM_PTR(ptr))
+                }
+                println()
+            }
+            
             ptr = ptr + size
         }
         
@@ -444,5 +471,41 @@ usage: mqjs [options] [file [args]]
             }
         }
         println("heap size=${ctx.heapFree - ctx.heapBase}/${ctx.memory.size} stack_size=${ctx.memory.size - ctx.sp}")
+    }
+    
+    private fun printValueRaw(ctx: JSContext, val1: JSValue) {
+        when {
+            JS_IsInt(val1) -> print(JS_VALUE_GET_INT(val1))
+            JS_IsShortFloat(val1) -> print(jsGetShortFloat(val1))
+            JS_IsString(ctx, val1) -> print("\"${jsGetString(ctx, val1)}\"")
+            JS_IsUndefined(val1) -> print("undefined")
+            JS_IsNull(val1) -> print("null")
+            JS_IsBool(val1) -> print(if (val1 == JS_TRUE) "true" else "false")
+            JS_IsPtr(val1) -> {
+                val ptr = JS_VALUE_TO_PTR(val1)
+                val mtag = ctx.memory.getMTag(ptr)
+                when (mtag) {
+                    JSMTags.JS_MTAG_FLOAT64 -> print(ctx.memory.getFloat64(ptr + 8))
+                    JSMTags.JS_MTAG_STRING -> print("\"${jsGetString(ctx, val1)}\"")
+                    JSMTags.JS_MTAG_OBJECT -> {
+                        val classId = ctx.memory.getU8(ptr + 2)
+                        val className = JSObjectClassEnum.fromValue(classId)?.name ?: "UNKNOWN"
+                        print("[object $className]")
+                    }
+                    JSMTags.JS_MTAG_FUNCTION_BYTECODE -> print("[bytecode]")
+                    JSMTags.JS_MTAG_VALUE_ARRAY -> {
+                        val len = ctx.memory.getI32(ptr + 4)
+                        print("[array:$len]")
+                    }
+                    JSMTags.JS_MTAG_BYTE_ARRAY -> {
+                        val len = ctx.memory.getI32(ptr + 4)
+                        print("[bytes:$len]")
+                    }
+                    JSMTags.JS_MTAG_VARREF -> print("[varref]")
+                    else -> print("[ptr:0x${ptr.toString(16)}]")
+                }
+            }
+            else -> print(val1)
+        }
     }
 }
