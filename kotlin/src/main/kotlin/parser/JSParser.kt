@@ -1725,6 +1725,9 @@ class JSParser(private val s: JSParseState) {
             } else {
                 emitOpWithArg(OPCodeEnum.OP_get_loc, localIdx)
             }
+            if (System.getenv("MQJS_TRACE") != null) {
+                println("DBG load '$nameStr' local=$localIdx slot=$slot scopes=${compileScopes.size}")
+            }
             return true
         }
         
@@ -1732,12 +1735,18 @@ class JSParser(private val s: JSParseState) {
         val captured = tryCaptureOuterVar(nameStr)
         if (captured >= 0) {
             emitOpWithArg(OPCodeEnum.OP_get_var_ref, captured)
+            if (System.getenv("MQJS_TRACE") != null) {
+                println("DBG load '$nameStr' captured=$captured scopes=${compileScopes.size}")
+            }
             return true
         }
         
         /* 未声明的全局标识符 */
         val cidx = addConstPool(name)
         emitOpWithArg(OPCodeEnum.OP_get_global, cidx)
+        if (System.getenv("MQJS_TRACE") != null) {
+            println("DBG load '$nameStr' global=$cidx scopes=${compileScopes.size}")
+        }
         return true
     }
     
