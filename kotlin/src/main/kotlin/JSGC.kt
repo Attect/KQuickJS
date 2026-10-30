@@ -30,6 +30,11 @@ object JSGC {
         gcMark(ctx, markStack, ctx.globalObj)
         gcMark(ctx, markStack, ctx.minusZero)
         
+        /* 原生代码分配期间的临时保活值 */
+        for (v in ctx.gcKeepAlive) {
+            gcMark(ctx, markStack, v)
+        }
+        
         for (i in ctx.classProto.indices) {
             gcMark(ctx, markStack, ctx.classProto[i])
             gcMark(ctx, markStack, ctx.classObj[i])
@@ -177,6 +182,11 @@ object JSGC {
                         val tab = ctx.memory.getJSValue(ptr + 24)
                         gcMark(ctx, markStack, tab)
                     }
+                    JSObjectClassEnum.JS_CLASS_ERROR.value -> {
+                        /* 错误对象：mark message（槽 0）与 stack（槽 1），对照 C p->u.error */
+                        gcMark(ctx, markStack, ctx.memory.getJSValue(ptr + 24))
+                        gcMark(ctx, markStack, ctx.memory.getJSValue(ptr + 32))
+                    }
                     else -> {
                         /* 用户对象：标记 opaque 占位槽之后的私有 JSValue（同步上游 #80） */
                         if (classId >= JSObjectClassEnum.JS_CLASS_USER.value) {
@@ -317,6 +327,11 @@ object JSGC {
                     JSObjectClassEnum.JS_CLASS_ARRAY.value -> {
                         remap(ptr + 24)
                     }
+                    JSObjectClassEnum.JS_CLASS_ERROR.value -> {
+                        /* 错误对象：更新 message（槽 0）与 stack（槽 1）指针，对照 C p->u.error */
+                        remap(ptr + 24)
+                        remap(ptr + 32)
+                    }
                     else -> {
                         /* 用户对象：更新 opaque 占位槽之后的私有 JSValue（同步上游 #80） */
                         if (classId >= JSObjectClassEnum.JS_CLASS_USER.value) {
@@ -364,6 +379,11 @@ object JSGC {
         ctx.emptyProps = remapValue(ctx.emptyProps)
         ctx.globalObj = remapValue(ctx.globalObj)
         ctx.minusZero = remapValue(ctx.minusZero)
+        
+        /* 临时保活列表中的值随块搬移更新 */
+        for (i in ctx.gcKeepAlive.indices) {
+            ctx.gcKeepAlive[i] = remapValue(ctx.gcKeepAlive[i])
+        }
         
         for (i in ctx.classProto.indices) {
             ctx.classProto[i] = remapValue(ctx.classProto[i])

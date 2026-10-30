@@ -126,6 +126,11 @@ class JSParseState(
     var evalRetIdx = -1
     var topBreak: JSValue = JS_NULL
     
+    /* break/continue 跳转目标占位栈：最内层循环的占位列表在栈顶。
+     * 循环编译结束时统一 patch 定址（break → 循环出口，continue → 条件/update） */
+    val breakLabelStack: ArrayDeque<MutableList<Int>> = ArrayDeque()
+    val continueLabelStack: ArrayDeque<MutableList<Int>> = ArrayDeque()
+    
     var lineNum = 1
     var colNum = 1
     

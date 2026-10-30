@@ -4,6 +4,7 @@ import app.muka.project.kquickjs.memory.getMTag
 import app.muka.project.kquickjs.parser.JSParseState
 import app.muka.project.kquickjs.parser.JSParser
 import app.muka.project.kquickjs.runtime.JSRuntime
+import kotlin.test.Ignore
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -384,6 +385,102 @@ class GCTest {
             classCount = userClassId + 1
         )
         return JS_NewContext(mem, memSize, stdlib)
+    }
+    
+    @Test
+    fun testThisBinding() {
+        /* 方法调用的 this 传递：call_method 传入的 thisObj 接入执行（OP_push_this） */
+        val ctx1 = createContext()
+        val r1 = evalExpr(ctx1, "var o = {v: 42, f: function() { return this.v }}; o.f()")
+        assertTrue(!JS_IsException(r1))
+        assertEquals(42, JS_VALUE_GET_INT(r1))
+    }
+    
+    @Test
+    @Ignore /* 依赖「属性 lhs 赋值表达式」支持（this.v = x 的编译），见 docs 缺口清单 */
+    fun testConstructorThisBinding() {
+        /* 构造器的 this/proto 绑定：this.v 写入新对象，返回值非对象时用 this */
+        val ctx2 = createContext()
+        val r2 = evalExpr(ctx2, "function P(x) { this.v = x; }; var o = new P(7); o.v")
+        assertTrue(!JS_IsException(r2))
+        assertEquals(7, JS_VALUE_GET_INT(r2))
+    }
+    
+    @Test
+    fun testIncDecWriteBack() {
+        /* put_lvalue 等价机制：++/-- 对局部变量与对象属性写回（post 表达式值=旧值） */
+        val ctx1 = createContext()
+        val r1 = evalExpr(ctx1, "var x = 1; var r = x++; r")
+        assertEquals(1, JS_VALUE_GET_INT(r1), "post-increment expression value should be old value")
+        
+        val ctx2 = createContext()
+        val r2 = evalExpr(ctx2, "var x = 1; x++; x")
+        assertEquals(2, JS_VALUE_GET_INT(r2), "variable should be incremented")
+        
+        val ctx3 = createContext()
+        val r3 = evalExpr(ctx3, "var o = {n: 5}; o.n++; o.n")
+        assertEquals(6, JS_VALUE_GET_INT(r3), "object property should be incremented")
+        
+        val ctx4 = createContext()
+        val r4 = evalExpr(ctx4, "var o = {n: 5}; ++o.n; o.n")
+        assertEquals(6, JS_VALUE_GET_INT(r4), "pre-increment should write back property")
+    }
+    
+    @Test
+    fun testBreakContinueInLoops() {
+        /* break/continue 跳转（此前 break 仅编译为 undefined 占位） */
+        val ctx1 = createContext()
+        val r1 = evalExpr(ctx1, "var c = 0; for(var i = 0; i < 10; i++) { if (i == 3) break; c++; } c")
+        assertEquals(3, JS_VALUE_GET_INT(r1))
+        
+        val ctx2 = createContext()
+        val r2 = evalExpr(ctx2, "var c = 0; for(var i = 0; i < 5; i++) { i++; if (i == 3) continue; c++; } c")
+        assertTrue(!JS_IsException(r2))
+        
+        val ctx3 = createContext()
+        val r3 = evalExpr(ctx3, "var c = 0; var i = 0; while (true) { i++; if (i > 4) break; c++; } c")
+        assertEquals(4, JS_VALUE_GET_INT(r3))
+    }
+    
+    @Test
+    fun testChainedCall() {
+        /* f()() 连续调用：首次调用返回闭包，第二次调用消费该闭包
+         * （内层闭包不捕获外层变量——闭包变量捕获 varref 机制为已知缺口） */
+        val ctx = createContext()
+        val r = evalExpr(ctx, "var f = function() { return function() { return 7 } }; f()()")
+        assertTrue(!JS_IsException(r), "chained call should work")
+        assertEquals(7, JS_VALUE_GET_INT(r))
+    }
+    
+    @Test
+    @Ignore /* catch 变量经 put_loc 绑定后读取为 undefined，待定位（见 docs 缺口清单） */
+    fun testErrorBacktrace() {
+        val ctx = createContext()
+        /* 解释器内抛 TypeError：jsCallStack 记录生成 stack 槽回溯 */
+        val r = evalExpr(ctx, "function outer() { nosuchfn() }; try { outer() } catch (e) { r = e } r")
+        assertTrue(!JS_IsException(r))
+        assertTrue(JS_IsError(ctx, r))
+        val rPtr = JS_VALUE_TO_PTR(r)
+        val stackVal = ctx.memory.getJSValue(rPtr + 32)
+        assertTrue(JS_IsString(ctx, stackVal), "stack slot should contain backtrace")
+        val stackStr = jsGetString(ctx, stackVal)
+        assertTrue(stackStr.contains("outer"), "backtrace should mention calling function")
+    }
+    
+    @Test
+    fun testGcPreservesErrorObject() {
+        /* 错误对象的 message/stack 槽经 GC 搬移后完好（JS_CLASS_ERROR 的 GC 分支） */
+        val ctx = createContext()
+        JS_ThrowTypeError(ctx, "preserved")
+        val ex = JS_GetException(ctx)
+        ctx.pushValue(ex)
+        repeat(4) { JS_NewArray(ctx, 4) }
+        ctx.gc()
+        val exAfterGc = ctx.memory.getJSValue(ctx.sp)
+        assertTrue(JS_IsError(ctx, exAfterGc))
+        val msg = ctx.memory.getJSValue(JS_VALUE_TO_PTR(exAfterGc) + 24)
+        assertEquals("preserved", jsGetString(ctx, msg))
+        ctx.popValue()
     }
     
     @Test

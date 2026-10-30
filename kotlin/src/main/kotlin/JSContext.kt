@@ -43,6 +43,13 @@ class JSContext(
     /* 用户对象的宿主 opaque 引用表：key 为对象块地址，GC 搬移时随块更新
      * （对照 C 版 p->u.user.opaque 的 per-object 语义，修复原先错存 ctx.opaque 的问题） */
     val userOpaqueTable: HashMap<Int, Any?> = HashMap()
+    /* JS 调用栈记录（最内层在末尾）：Kotlin 无 C 的 fp 帧链，
+     * 由 JSRuntime.run 进入/退出时维护，用于生成错误对象的 stack 回溯 */
+    val jsCallStack: ArrayDeque<String> = ArrayDeque()
+    /* 原生代码分配期间的临时 GC 保活列表：JSGC 的 mark 与压缩根更新会遍历它。
+     * 注意不要用 pushValue/popValue（ctx.sp）保活——解释器运行中 ctx.sp 与
+     * 局部缓存的 sp 不同步，会破坏执行栈 */
+    val gcKeepAlive: MutableList<JSValue> = mutableListOf()
     var randomState: Long = 1
     
     var parseState: JSParseState? = null
@@ -165,20 +172,36 @@ class JSContext(
     
     /* 抛出错误对象（对照 C JS_ThrowError）：
      * 创建 class_id = JS_CLASS_ERROR 的对象，proto 取具体错误类的 class_proto，
-     * extra 槽 0 = message 字符串、槽 1 = stack。
-     * build_backtrace 机制尚未实现，stack 槽恒为 JS_NULL */
+     * extra 槽 0 = message 字符串、槽 1 = stack 回溯（build_backtrace 的 Kotlin 等价物，
+     * 基于 jsCallStack 维护的调用栈记录；栈为空时 stack = JS_NULL） */
     fun throwError(errorClass: JSObjectClassEnum, message: String): JSValue {
         val msg = JS_NewString(this, message)
         if (JS_IsException(msg)) return JS_EXCEPTION
-        pushValue(msg)
+        
+        /* 分配期间的值保活走 gcKeepAlive（不碰 ctx.sp，避免与解释器栈冲突） */
+        gcKeepAlive.add(msg)
         val errorObj = JS_NewObjectProtoClass(this, classProto[errorClass.value],
                                               JSObjectClassEnum.JS_CLASS_ERROR.value, 2)
-        val msgKept = popValue()
-        if (JS_IsException(errorObj)) return JS_EXCEPTION
-        val ptr = JS_VALUE_TO_PTR(errorObj)
-        memory.putJSValue(ptr + 24, msgKept)      /* 槽 0: message */
-        memory.putJSValue(ptr + 32, JS_NULL)      /* 槽 1: stack */
-        return JS_Throw(this, errorObj)
+        if (JS_IsException(errorObj)) {
+            gcKeepAlive.removeAt(gcKeepAlive.size - 1)
+            return JS_EXCEPTION
+        }
+        gcKeepAlive.add(errorObj)
+        
+        /* 生成 stack 回溯字符串（build_backtrace 的 Kotlin 等价物，基于 jsCallStack） */
+        val stackStr = jsCallStack.joinToString("\n") { "    at $it" }
+        val stackVal = if (stackStr.isEmpty()) JS_NULL else {
+            val sv = JS_NewString(this, stackStr)
+            if (JS_IsException(sv)) JS_NULL else sv
+        }
+        
+        /* LIFO 取回最新地址（分配期间 GC 搬移后列表中的值已被 remap 更新） */
+        val errorObjKept = gcKeepAlive.removeAt(gcKeepAlive.size - 1)
+        val msgFinal = gcKeepAlive.removeAt(gcKeepAlive.size - 1)
+        val ptr = JS_VALUE_TO_PTR(errorObjKept)
+        memory.putJSValue(ptr + 24, msgFinal)      /* 槽 0: message */
+        memory.putJSValue(ptr + 32, stackVal)      /* 槽 1: stack */
+        return JS_Throw(this, errorObjKept)
     }
     
     fun getAtom(a: Int): JSValue {

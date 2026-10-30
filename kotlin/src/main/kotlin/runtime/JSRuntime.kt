@@ -7,7 +7,27 @@ import app.muka.project.kquickjs.OPCodeEnum
 
 class JSRuntime(private val ctx: JSContext) {
     
-    fun run(func: JSValue): JSValue {
+    /* 顶层入口：this 默认为全局对象（对照 C JS_Eval 的顶层帧） */
+    fun run(func: JSValue): JSValue = run(func, ctx.globalObj)
+    
+    fun run(func: JSValue, thisObj: JSValue): JSValue {
+        /* 维护 JS 调用栈记录（Kotlin 无 C 的 fp 帧链，用于生成错误对象的 stack 回溯） */
+        ctx.jsCallStack.addLast(readFuncName(func))
+        try {
+            return runBody(func, thisObj)
+        } finally {
+            ctx.jsCallStack.removeLast()
+        }
+    }
+    
+    /* 读取函数字节码的函数名（FUNCTION_BYTECODE 布局：funcName 在 ptr+8） */
+    private fun readFuncName(func: JSValue): String {
+        val funcPtr = JS_VALUE_TO_PTR(func)
+        val name = ctx.memory.getJSValue(funcPtr + 8)
+        return if (JS_IsString(ctx, name)) jsGetString(ctx, name) else "<anonymous>"
+    }
+    
+    private fun runBody(func: JSValue, thisObj: JSValue): JSValue {
         val funcPtr = JS_VALUE_TO_PTR(func)
         if (ctx.memory.getMTag(funcPtr) != JSMTags.JS_MTAG_FUNCTION_BYTECODE) {
             return JS_EXCEPTION
@@ -40,6 +60,10 @@ class JSRuntime(private val ctx: JSContext) {
             }
             
             val op = code[pc].toInt() and 0xFF
+            if (System.getenv("MQJS_TRACE") != null) {
+                val e = OPCodeEnum.entries.find { it.id == op }
+                println("TRACE pc=${pc} ${e?.name ?: "?"} stack=${stack.size} vars0=${vars.getOrNull(0)} vars1=${vars.getOrNull(1)} vars2=${vars.getOrNull(2)}")
+            }
             pc++
             
             when (op) {
@@ -47,7 +71,8 @@ class JSRuntime(private val ctx: JSContext) {
                 OPCodeEnum.OP_null.id -> stack.add(JS_NULL)
                 OPCodeEnum.OP_push_false.id -> stack.add(JS_FALSE)
                 OPCodeEnum.OP_push_true.id -> stack.add(JS_TRUE)
-                OPCodeEnum.OP_push_this.id -> stack.add(ctx.globalObj)
+                /* 压入当前函数帧的 this（对照 C fp[FRAME_OFFSET_THIS_OBJ]） */
+                OPCodeEnum.OP_push_this.id -> stack.add(thisObj)
                 
                 OPCodeEnum.OP_push_0.id -> stack.add(JS_NewShortInt(0))
                 OPCodeEnum.OP_push_1.id -> stack.add(JS_NewShortInt(1))
@@ -337,14 +362,14 @@ class JSRuntime(private val ctx: JSContext) {
                 }
                 
                 OPCodeEnum.OP_get_array_el2.id -> {
+                    /* 对照 C：与 get_field2 同构——弹出 key 但保留 obj（[obj, key] → [obj, val]） */
                     if (stack.size < 2) {
                         return JS_EXCEPTION
                     }
-                    val idx = stack[stack.size - 1]
-                    val obj = stack[stack.size - 2]
+                    val idx = stack.removeLast()
+                    val obj = stack.last()
                     val val1 = getElement(obj, idx)
-                    stack[stack.size - 2] = val1
-                    stack.removeAt(stack.size - 1)
+                    stack.add(val1)
                 }
                 
                 OPCodeEnum.OP_put_array_el.id -> {
@@ -396,7 +421,8 @@ class JSRuntime(private val ctx: JSContext) {
                         args.add(0, stack.removeLast())
                     }
                     val funcVal = stack.removeLast()
-                    val r = callFunction(funcVal, args)
+                    /* 普通调用的 this 为 undefined（对照 C generic_function_call 压入 JS_UNDEFINED） */
+                    val r = callFunction(funcVal, args, JS_UNDEFINED)
                     if (JS_IsException(r) && JS_HasException(ctx)) {
                         /* 调用产生异常：本帧展开，命中 catch 则继续执行（对照 C call_exception） */
                         val target = unwindToCatch(stack)
@@ -833,6 +859,9 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun hashProp(prop: JSValue, hashMask: Int): Int {
+        /* 属性哈希基于 key 内容（字符串逐字符、数值取值本身），与堆地址无关；
+         * hash_next 链存储的也是属性槽的相对索引——因此 GC 压缩搬移对象后
+         * 属性表无需 rehash（对照 C js_rehash_props：C 的哈希基于指针所以需要） */
         if (JS_IsString(ctx, prop)) {
             val str = jsGetString(ctx, prop)
             var h = 0
@@ -930,7 +959,9 @@ class JSRuntime(private val ctx: JSContext) {
         return getProperty(obj, JS_NewString(ctx, "length"))
     }
     
-    fun callFunction(func: JSValue, args: List<JSValue>): JSValue {
+    /* 调用函数：thisObj 为调用方提供的 this（普通调用对照 C 压入的 JS_UNDEFINED，
+     * 方法调用为对象本身，顶层默认为全局对象） */
+    fun callFunction(func: JSValue, args: List<JSValue>, thisObj: JSValue = ctx.globalObj): JSValue {
         if (!JS_IsPtr(func)) return JS_ThrowTypeError(ctx, "not a function")
         val funcPtr = JS_VALUE_TO_PTR(func)
         
@@ -939,12 +970,12 @@ class JSRuntime(private val ctx: JSContext) {
             if (classId == JSObjectClassEnum.JS_CLASS_C_FUNCTION.value) {
                 val funcIdx = ctx.memory.getI32(funcPtr + 24)
                 val params = ctx.memory.getJSValue(funcPtr + 28)
-                return callCFunction(funcIdx, ctx.globalObj, args, 0, params)
+                return callCFunction(funcIdx, thisObj, args, 0, params)
             }
         }
         
         if (ctx.memory.getMTag(funcPtr) == JSMTags.JS_MTAG_FUNCTION_BYTECODE) {
-            return run(func)
+            return run(func, thisObj)
         }
         
         return JS_ThrowTypeError(ctx, "not a function")
@@ -963,13 +994,16 @@ class JSRuntime(private val ctx: JSContext) {
             }
         }
         
-        return callFunction(func, args)
+        return callFunction(func, args, thisObj)
     }
     
     /* 构造器调用（对照 C OP_call_constructor：call_flags |= FRAME_CF_CTOR）：
      * - C 构造器：this 为 JS_UNDEFINED（对照 C generic_function_call 压入的 this），
      *   argc 带 FRAME_CF_CTOR 位，返回值直接作为 new 结果
-     * - 非 C 函数对象：回退普通调用（JS 构造器的 this 传递未实现，见 docs 缺口清单） */
+     * - JS 构造器（对照 C js_call_constructor_start）：创建 this（proto 取函数的
+     *   prototype 属性，非对象则回退 Object.prototype），传入执行；
+     *   返回值为对象时用返回值，否则用 this
+     * - 非 C 函数对象：回退普通调用 */
     fun callConstructor(func: JSValue, args: List<JSValue>): JSValue {
         if (!JS_IsPtr(func)) return JS_ThrowTypeError(ctx, "not a constructor")
         val funcPtr = JS_VALUE_TO_PTR(func)
@@ -981,9 +1015,32 @@ class JSRuntime(private val ctx: JSContext) {
                 val params = ctx.memory.getJSValue(funcPtr + 28)
                 return callCFunction(funcIdx, JS_UNDEFINED, args, FRAME_CF_CTOR, params)
             }
+            if (classId == JSObjectClassEnum.JS_CLASS_CLOSURE.value) {
+                /* 创建 this：proto 取函数的 prototype 属性，非对象回退 Object.prototype */
+                val proto = getProperty(func, JS_NewString(ctx, "prototype"))
+                val protoVal = if (JS_IsPtr(proto) &&
+                    ctx.memory.getMTag(JS_VALUE_TO_PTR(proto)) == JSMTags.JS_MTAG_OBJECT) {
+                    proto
+                } else {
+                    ctx.classProto[JSObjectClassEnum.JS_CLASS_OBJECT.value]
+                }
+                val thisObj = JS_NewObjectProtoClass(ctx, protoVal,
+                                                     JSObjectClassEnum.JS_CLASS_OBJECT.value, 0)
+                if (JS_IsException(thisObj)) return JS_EXCEPTION
+                
+                val r = callFunction(func, args, thisObj)
+                if (JS_IsException(r)) return JS_EXCEPTION
+                /* 返回值为对象则采用之，否则用 this（对照 ES new 语义） */
+                return if (JS_IsPtr(r) &&
+                    ctx.memory.getMTag(JS_VALUE_TO_PTR(r)) == JSMTags.JS_MTAG_OBJECT) {
+                    r
+                } else {
+                    thisObj
+                }
+            }
         }
         
-        return callFunction(func, args)
+        return JS_ThrowTypeError(ctx, "not a constructor")
     }
     
     /* 调用 C 函数（对照 C JS_Call 的 c_function 路径）：

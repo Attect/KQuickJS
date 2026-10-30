@@ -84,12 +84,18 @@ class JSParser(private val s: JSParseState) {
                 return parseFor()
             }
             JSTokenVal.TOK_BREAK.value -> {
-                emitOp(OPCodeEnum.OP_undefined)
                 s.nextToken()
                 if (s.token.val1 == JSTokenVal.TOK_IDENT.value) {
                     s.nextToken()
                 }
                 expectSemi()
+                /* 跳转目标占位：由最内层循环/switch 编译结束时 patch 到出口 */
+                val labels = s.breakLabelStack.lastOrNull()
+                if (labels == null) {
+                    s.error("illegal break statement")
+                    return false
+                }
+                labels.add(emitJump(OPCodeEnum.OP_goto))
                 return true
             }
             JSTokenVal.TOK_CONTINUE.value -> {
@@ -98,6 +104,13 @@ class JSParser(private val s: JSParseState) {
                     s.nextToken()
                 }
                 expectSemi()
+                /* 跳转目标占位：由最内层循环编译结束时 patch 到条件/update 处 */
+                val labels = s.continueLabelStack.lastOrNull()
+                if (labels == null) {
+                    s.error("illegal continue statement")
+                    return false
+                }
+                labels.add(emitJump(OPCodeEnum.OP_goto))
                 return true
             }
             JSTokenVal.TOK_RETURN.value -> {
@@ -280,81 +293,196 @@ class JSParser(private val s: JSParseState) {
         s.nextToken()
         expect('('.code)
         
+        /* break → 循环出口；continue → 条件（condPos 在体编译前已知） */
+        val breakLabels = mutableListOf<Int>()
+        val continueLabels = mutableListOf<Int>()
+        s.breakLabelStack.addLast(breakLabels)
+        s.continueLabelStack.addLast(continueLabels)
+        
         val condPos = s.byteCodeLen
-        if (!parseExpr()) return false
-        expect(')'.code)
-        
-        val endPos = emitJump(OPCodeEnum.OP_if_false)
-        
-        if (!parseStatement()) return false
-        
-        emitJumpTo(OPCodeEnum.OP_goto, condPos)
-        patchJump(endPos)
-        
-        return true
+        try {
+            if (!parseExpr()) return false
+            expect(')'.code)
+            
+            val endPos = emitJump(OPCodeEnum.OP_if_false)
+            
+            if (!parseStatement()) return false
+            
+            emitJumpTo(OPCodeEnum.OP_goto, condPos)
+            patchJump(endPos)
+            
+            val exitPos = s.byteCodeLen
+            for (p in continueLabels) patchJumpTo(p, condPos)
+            for (p in breakLabels) patchJumpTo(p, exitPos)
+            return true
+        } finally {
+            s.breakLabelStack.removeLast()
+            s.continueLabelStack.removeLast()
+        }
     }
     
     fun parseDoWhile(): Boolean {
         s.nextToken()
         
+        val breakLabels = mutableListOf<Int>()
+        val continueLabels = mutableListOf<Int>()
+        s.breakLabelStack.addLast(breakLabels)
+        s.continueLabelStack.addLast(continueLabels)
+        
         val startPos = s.byteCodeLen
-        if (!parseStatement()) return false
-        
-        expect(JSTokenVal.TOK_WHILE.value)
-        expect('('.code)
-        if (!parseExpr()) return false
-        expect(')'.code)
-        expect(';'.code)
-        
-        emitJumpTo(OPCodeEnum.OP_if_true, startPos)
-        
-        return true
+        try {
+            if (!parseStatement()) return false
+            
+            /* continue 目标 = 条件判断处（体编译后的当前位置） */
+            val condPos = s.byteCodeLen
+            expect(JSTokenVal.TOK_WHILE.value)
+            expect('('.code)
+            if (!parseExpr()) return false
+            expect(')'.code)
+            expect(';'.code)
+            
+            emitJumpTo(OPCodeEnum.OP_if_true, startPos)
+            
+            val exitPos = s.byteCodeLen
+            for (p in continueLabels) patchJumpTo(p, condPos)
+            for (p in breakLabels) patchJumpTo(p, exitPos)
+            return true
+        } finally {
+            s.breakLabelStack.removeLast()
+            s.continueLabelStack.removeLast()
+        }
     }
     
     fun parseFor(): Boolean {
         s.nextToken()
         expect('('.code)
         
-        if (s.token.val1 != ';'.code) {
-            if (s.token.val1 == JSTokenVal.TOK_VAR.value) {
-                if (!parseVarDecl()) return false
+        /* break → 循环出口；continue → update 处（体编译后跳回 update 再进条件） */
+        val breakLabels = mutableListOf<Int>()
+        val continueLabels = mutableListOf<Int>()
+        s.breakLabelStack.addLast(breakLabels)
+        s.continueLabelStack.addLast(continueLabels)
+        
+        try {
+            if (s.token.val1 != ';'.code) {
+                if (s.token.val1 == JSTokenVal.TOK_VAR.value) {
+                    if (!parseVarDecl()) return false
+                } else {
+                    if (!parseExpr()) return false
+                    emitOp(OPCodeEnum.OP_drop)
+                    expect(';'.code)
+                }
             } else {
-                if (!parseExpr()) return false
-                emitOp(OPCodeEnum.OP_drop)
-                expect(';'.code)
+                s.nextToken()
             }
+            
+            /* 物理布局对照 C parse_for：cond 与 if_false 在前，body 在中，
+             * update 在 body 之后。update 的源 token 在 body 源之前，
+             * 对照 C 的 expr3_pos/js_skip_expr/js_parse_seek：先记录并跳过
+             * update 源，body 编译完成后回跳源位置编译 update */
+            val condPos = s.byteCodeLen
+            var endPos = -1
+            
+            if (s.token.val1 != ';'.code) {
+                if (!parseExpr()) return false
+                endPos = emitJump(OPCodeEnum.OP_if_false)
+                expect(';'.code)
+                /* 消费 ';' 后 s.token 已是 update 首词、bufPos 在其后：快照此状态供回跳 */
+                val updateSrcBuf = s.bufPos
+                val updateSrcLine = s.lineNum
+                val updateSrcCol = s.colNum
+                val updateSrcLf = s.gotLf
+                val updateSrcToken = s.token.copy()
+                
+                /* 跳过 update 源 token */
+                if (s.token.val1 != ')'.code) {
+                    skipExpr()
+                }
+                /* 此时 s.token == ')' 且 bufPos 已指向 body 源首：先记录再消费 ')' */
+                val bodySrcBuf = s.bufPos
+                val bodySrcLine = s.lineNum
+                val bodySrcCol = s.colNum
+                val bodySrcLf = s.gotLf
+                expect(')'.code)
+                
+                if (!parseStatement()) return false
+                
+                /* body 尾跳回 update（目标占位，update 紧随其后发射） */
+                val gotoUpdate = emitJump(OPCodeEnum.OP_goto)
+                val updatePos = s.byteCodeLen
+                val bodyEndBuf = s.bufPos
+                val bodyEndLine = s.lineNum
+                val bodyEndCol = s.colNum
+                val bodyEndLf = s.gotLf
+                val bodyEndToken = s.token.copy()
+                
+                /* 回跳 update 源位置编译 update 表达式 */
+                seekSource(updateSrcBuf, updateSrcLine, updateSrcCol, updateSrcLf, updateSrcToken)
+                if (s.token.val1 != ')'.code) {
+                    if (!parseExpr()) return false
+                    emitOp(OPCodeEnum.OP_drop)
+                }
+                expect(')'.code)
+                
+                emitJumpTo(OPCodeEnum.OP_goto, condPos)
+                
+                /* body 尾的 goto 目标是 updatePos（不能用当前位定址） */
+                patchJumpTo(gotoUpdate, updatePos)
+                
+                if (endPos >= 0) {
+                    patchJump(endPos)
+                }
+                
+                /* 回跳 body 之后的源位置，继续解析后续语句 */
+                seekSource(bodyEndBuf, bodyEndLine, bodyEndCol, bodyEndLf, bodyEndToken)
+                
+                val exitPos = s.byteCodeLen
+                for (p in continueLabels) patchJumpTo(p, updatePos)
+                for (p in breakLabels) patchJumpTo(p, exitPos)
+                return true
+            } else {
+                /* 无条件的 for：cond 分支不存在，body/闭括号按普通顺序处理 */
+                s.nextToken()
+                if (!parseStatement()) return false
+                emitJumpTo(OPCodeEnum.OP_goto, condPos)
+                val exitPos = s.byteCodeLen
+                for (p in breakLabels) patchJumpTo(p, exitPos)
+                return true
+            }
+        } finally {
+            s.breakLabelStack.removeLast()
+            s.continueLabelStack.removeLast()
+        }
+    }
+    
+    /* 跳过一个表达式源的 token（用于 for 的 update 延迟编译，对照 C js_skip_expr）：
+     * 仅做括号深度平衡，遇到与 ')' 配平的 ')' 即停 */
+    private fun skipExpr() {
+        var depth = 0
+        while (s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
+            when (s.token.val1) {
+                '('.code, '['.code, '{'.code -> depth++
+                ')'.code -> if (depth == 0) return else depth--
+                ']'.code, '}'.code -> depth--
+            }
+            s.nextToken()
+        }
+    }
+    
+    /* 解析位置回跳（对照 C js_parse_seek）：恢复源缓冲位置与已缓存的 token。
+     * bufPos 指向"已读 token 之后"，直接 nextToken 会丢失缓存中的当前 token
+     * （例如 body 块后的语句首词），因此必须同时恢复 token 快照 */
+    private fun seekSource(bufPos: Int, lineNum: Int, colNum: Int, gotLf: Boolean,
+                           tokenSnapshot: JSToken?) {
+        s.bufPos = bufPos
+        s.lineNum = lineNum
+        s.colNum = colNum
+        s.gotLf = gotLf
+        if (tokenSnapshot != null) {
+            s.token = tokenSnapshot.copy()
         } else {
             s.nextToken()
         }
-        
-        val condPos = s.byteCodeLen
-        var endPos = -1
-        
-        if (s.token.val1 != ';'.code) {
-            if (!parseExpr()) return false
-            endPos = emitJump(OPCodeEnum.OP_if_false)
-            expect(';'.code)
-        } else {
-            s.nextToken()
-        }
-        
-        val updatePos = s.byteCodeLen
-        if (s.token.val1 != ')'.code) {
-            if (!parseExpr()) return false
-            emitOp(OPCodeEnum.OP_drop)
-        }
-        expect(')'.code)
-        
-        val bodyPos = s.byteCodeLen
-        if (!parseStatement()) return false
-        
-        emitJumpTo(OPCodeEnum.OP_goto, updatePos)
-        
-        if (endPos >= 0) {
-            patchJump(endPos)
-        }
-        
-        return true
     }
     
     fun parseTry(): Boolean {
@@ -441,38 +569,49 @@ class JSParser(private val s: JSParseState) {
         expect(')'.code)
         expect('{'.code)
         
+        /* switch 也是合法的 break 环境（对照 C push_break_entry）；
+         * case 值的分发跳转链尚未实现（既有半成品），break 跳到 switch 尾 */
+        val breakLabels = mutableListOf<Int>()
+        s.breakLabelStack.addLast(breakLabels)
+        
         val defaultPos = -1
         val endPos = emitJump(OPCodeEnum.OP_goto)
         
-        while (s.token.val1 != '}'.code && s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
-            when (s.token.val1) {
-                JSTokenVal.TOK_CASE.value -> {
-                    s.nextToken()
-                    if (!parseExpr()) return false
-                    expect(':'.code)
-                    while (s.token.val1 != JSTokenVal.TOK_CASE.value && 
-                           s.token.val1 != JSTokenVal.TOK_DEFAULT.value && 
-                           s.token.val1 != '}'.code) {
-                        if (!parseStatement()) return false
+        try {
+            while (s.token.val1 != '}'.code && s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
+                when (s.token.val1) {
+                    JSTokenVal.TOK_CASE.value -> {
+                        s.nextToken()
+                        if (!parseExpr()) return false
+                        expect(':'.code)
+                        while (s.token.val1 != JSTokenVal.TOK_CASE.value && 
+                               s.token.val1 != JSTokenVal.TOK_DEFAULT.value && 
+                               s.token.val1 != '}'.code) {
+                            if (!parseStatement()) return false
+                        }
                     }
-                }
-                JSTokenVal.TOK_DEFAULT.value -> {
-                    s.nextToken()
-                    expect(':'.code)
-                    while (s.token.val1 != JSTokenVal.TOK_CASE.value && 
-                           s.token.val1 != '}'.code) {
-                        if (!parseStatement()) return false
+                    JSTokenVal.TOK_DEFAULT.value -> {
+                        s.nextToken()
+                        expect(':'.code)
+                        while (s.token.val1 != JSTokenVal.TOK_CASE.value && 
+                               s.token.val1 != '}'.code) {
+                            if (!parseStatement()) return false
+                        }
                     }
-                }
-                else -> {
-                    s.error("expected case or default")
-                    return false
+                    else -> {
+                        s.error("expected case or default")
+                        return false
+                    }
                 }
             }
+            
+            expect('}'.code)
+            val exitPos = s.byteCodeLen
+            for (p in breakLabels) patchJumpTo(p, exitPos)
+            return true
+        } finally {
+            s.breakLabelStack.removeLast()
         }
-        
-        expect('}'.code)
-        return true
     }
     
     fun parseExprStatement(): Boolean {
@@ -1075,13 +1214,13 @@ class JSParser(private val s: JSParseState) {
             JSTokenVal.TOK_INC.value -> {
                 s.nextToken()
                 if (!parseUnaryExpr()) return false
-                emitOp(OPCodeEnum.OP_inc)
+                emitLValueIncDec(inc = true, pre = true)
                 return true
             }
             JSTokenVal.TOK_DEC.value -> {
                 s.nextToken()
                 if (!parseUnaryExpr()) return false
-                emitOp(OPCodeEnum.OP_dec)
+                emitLValueIncDec(inc = false, pre = true)
                 return true
             }
             JSTokenVal.TOK_TYPEOF.value -> {
@@ -1128,11 +1267,11 @@ class JSParser(private val s: JSParseState) {
             when (s.token.val1) {
                 JSTokenVal.TOK_INC.value -> {
                     s.nextToken()
-                    emitOp(OPCodeEnum.OP_post_inc)
+                    emitLValueIncDec(inc = true, pre = false)
                 }
                 JSTokenVal.TOK_DEC.value -> {
                     s.nextToken()
-                    emitOp(OPCodeEnum.OP_post_dec)
+                    emitLValueIncDec(inc = false, pre = false)
                 }
                 '('.code -> {
                     s.nextToken()
@@ -1176,33 +1315,11 @@ class JSParser(private val s: JSParseState) {
         return true
     }
     
+    /* member 链（. / [] / 调用 / 自增）已统一并入 parsePostfixExpr 的循环
+     * （对照 C js_parse_postfix_expr 的单层结构：'.' 先发 get_field 占位，
+     *  遇 ( 或 ++/-- 时回改 get_field2 / get_array_el2 并做方法调用或写回） */
     fun parseMemberExpr(): Boolean {
-        if (!parsePrimaryExpr()) return false
-        
-        while (true) {
-            when (s.token.val1) {
-                '['.code -> {
-                    s.nextToken()
-                    if (!parseExpr()) return false
-                    expect(']'.code)
-                    emitOp(OPCodeEnum.OP_get_array_el2)
-                }
-                '.'.code -> {
-                    s.nextToken()
-                    if (s.token.val1 != JSTokenVal.TOK_IDENT.value) {
-                        s.error("expected identifier after '.'")
-                        return false
-                    }
-                    val name = s.token.value
-                    s.nextToken()
-                    val idx = addConstPool(name)
-                    emitOpWithArg(OPCodeEnum.OP_get_field, idx)
-                }
-                else -> break
-            }
-        }
-        
-        return true
+        return parsePrimaryExpr()
     }
     
     /* 检查最后发射的指令是否为 OP_get_field（方法调用识别用） */
@@ -1217,6 +1334,73 @@ class JSParser(private val s: JSParseState) {
         if (s.lastOpcodePos < 0) return
         val ptr = JS_VALUE_TO_PTR(s.byteCode)
         ctx.memory.putU8(ptr + 8 + s.lastOpcodePos, op.id)
+    }
+    
+    /* 读取字节码中指定位置的 u16 操作数 */
+    private fun readU16From(pos: Int): Int {
+        val ptr = JS_VALUE_TO_PTR(s.byteCode)
+        return ctx.memory.getU16(ptr + 8 + pos)
+    }
+    
+    /* 自增/自减编译期临时槽（保存表达式值；与 C 的栈重排指令等价的 Kotlin 方案） */
+    private fun ensureTmpVar(): Int = addLocalVar(JS_NewString(ctx, "@inc_tmp"))
+    
+    /* 自增/自减的 lvalue 写回（对照 C put_lvalue 机制的 Kotlin 等价物）：
+     * - 局部变量（lastOpcode=OP_get_loc）：读写变量槽
+     * - 对象属性（lastOpcode=OP_get_field）：回改为 OP_get_field2 保留 obj，OP_put_field 写回
+     * - 其他形式：暂不支持写回，退化为对栈顶值的 inc/dec
+     * post 形式的表达式值为旧值、pre 形式为新值（对照 ES 语义） */
+    private fun emitLValueIncDec(inc: Boolean, pre: Boolean) {
+        val deltaOp = if (inc) OPCodeEnum.OP_push_1 else OPCodeEnum.OP_push_minus1
+        val addOp = if (inc) OPCodeEnum.OP_add else OPCodeEnum.OP_sub
+        
+        val lastPos = s.lastOpcodePos
+        val lastOp = if (lastPos >= 0) {
+            val ptr = JS_VALUE_TO_PTR(s.byteCode)
+            ctx.memory.getU8(ptr + 8 + lastPos).toInt()
+        } else -1
+        
+        when (lastOp) {
+            OPCodeEnum.OP_get_loc.id -> {
+                val idx = readU16From(lastPos + 1)
+                val tmp = ensureTmpVar()
+                if (pre) {
+                    emitOp(deltaOp); emitOp(addOp)              /* [new] */
+                    emitOp(OPCodeEnum.OP_dup)                   /* [new, new] */
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, tmp)   /* [new] */
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, idx)   /* [] 写回 */
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmp)   /* [new] */
+                } else {
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, tmp)   /* [] 存旧值 */
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, idx)   /* [old] */
+                    emitOp(deltaOp); emitOp(addOp)              /* [new] */
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, idx)   /* [] 写回 */
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmp)   /* [old] */
+                }
+            }
+            OPCodeEnum.OP_get_field.id -> {
+                rewriteLastOpcode(OPCodeEnum.OP_get_field2)     /* [obj, old] */
+                val cidx = readU16From(lastPos + 1)
+                val tmp = ensureTmpVar()
+                if (pre) {
+                    emitOp(deltaOp); emitOp(addOp)              /* [obj, new] */
+                    emitOp(OPCodeEnum.OP_dup)                   /* [obj, new, new] */
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, tmp)   /* [obj, new] */
+                    emitOpWithArg(OPCodeEnum.OP_put_field, cidx) /* [] 写回 */
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmp)   /* [new] */
+                } else {
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, tmp)   /* [obj] 存旧值 */
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmp)   /* [obj, old] */
+                    emitOp(deltaOp); emitOp(addOp)              /* [obj, new] */
+                    emitOpWithArg(OPCodeEnum.OP_put_field, cidx) /* [] 写回 */
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmp)   /* [old] */
+                }
+            }
+            else -> {
+                /* 不支持写回的 lvalue 形式：退化为对栈顶值的 inc/dec */
+                emitOp(deltaOp); emitOp(addOp)
+            }
+        }
     }
     
     fun parsePrimaryExpr(): Boolean {
@@ -1476,6 +1660,13 @@ class JSParser(private val s: JSParseState) {
         ctx.memory.putU32(ptr + 8 + pos + 1, offset.toLong())
     }
     
+    /* 跳转占位定址到指定目标位置（用于 continue/break 等目标在占位之后才确定的场景） */
+    private fun patchJumpTo(pos: Int, target: Int) {
+        val ptr = JS_VALUE_TO_PTR(s.byteCode)
+        val offset = target - pos - 5
+        ctx.memory.putU32(ptr + 8 + pos + 1, offset.toLong())
+    }
+    
     fun ensureByteCodeSize(n: Int) {
         val ptr = JS_VALUE_TO_PTR(s.byteCode)
         val size = ctx.memory.getI32(ptr + 4)
@@ -1640,3 +1831,4 @@ class JSParser(private val s: JSParseState) {
         return true
     }
 }
+
