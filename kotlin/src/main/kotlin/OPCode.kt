@@ -136,7 +136,12 @@ enum class OPCodeEnum(val id: Int, val size: Int, val nPop: Int, val nPush: Int,
     OP_put_arg0(122, 1, 1, 0, 0),
     OP_put_arg1(123, 1, 1, 0, 0),
     OP_put_arg2(124, 1, 1, 0, 0),
-    OP_put_arg3(125, 1, 1, 0, 0);
+    OP_put_arg3(125, 1, 1, 0, 0),
+    
+    /* 全局标识符读写（cpool 存名字，未声明标识符走此路径；对照 C 的
+       GLOBAL varref 经 globalObj 属性解析的语义） */
+    OP_get_global(126, 3, 0, 1, 7),
+    OP_put_global(127, 3, 1, 0, 7);
     
     companion object {
         fun fromId(id: Int): OPCodeEnum? = entries.find { it.id == id }

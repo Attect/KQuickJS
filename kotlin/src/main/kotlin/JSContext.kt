@@ -50,6 +50,10 @@ class JSContext(
      * 注意不要用 pushValue/popValue（ctx.sp）保活——解释器运行中 ctx.sp 与
      * 局部缓存的 sp 不同步，会破坏执行栈 */
     val gcKeepAlive: MutableList<JSValue> = mutableListOf()
+    /* 闭包捕获变量槽池：编译期被内层函数引用的外层局部变量提升为池槽，
+     * 外层与内层统一通过槽读写（对照 C JSVarRef 的 detached 近似语义，
+     * 槽值生命周期与上下文一致）。JSGC 作为根遍历 */
+    val varrefPool: MutableList<JSValue> = mutableListOf()
     var randomState: Long = 1
     
     var parseState: JSParseState? = null

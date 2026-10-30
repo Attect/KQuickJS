@@ -12,8 +12,22 @@ class JSParser(private val s: JSParseState) {
     
     private val ctx = s.ctx
     
+    /* 函数编译上下文（嵌套栈）：记录已发射的 loc 指令（供闭包捕获时回改）与
+     * 已提升的捕获槽映射。顶层上下文在 parse() 入口压入 */
+    private class LocEmit(val name: String, val byteCode: JSValue, val pos: Int, val isPut: Boolean)
+    
+    private class FuncCompileScope(val curFunc: JSValue) {
+        var localVarsLen = 0                                   /* 本层局部变量数（参数+声明） */
+        val varrefSlots = HashMap<String, Int>()               /* 被内层捕获的局部 var → varref 池槽 */
+        val locEmitLog = mutableListOf<LocEmit>()              /* 已发射的 get_loc/put_loc 记录 */
+    }
+    
+    private val compileScopes = ArrayDeque<FuncCompileScope>()
+    
     fun parse(): JSValue {
         if (!initFunction()) return JS_EXCEPTION
+        
+        compileScopes.addLast(FuncCompileScope(s.curFunc))
         
         if (s.hasRetval) {
             s.evalRetIdx = addLocalVar(JS_NewString(ctx, "_ret_"))
@@ -22,6 +36,8 @@ class JSParser(private val s: JSParseState) {
         while (s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
             if (!parseStatement()) break
         }
+        
+        compileScopes.removeLast()
         
         if (s.hasError) {
             return JS_EXCEPTION
@@ -208,6 +224,8 @@ class JSParser(private val s: JSParseState) {
         val savedFunc = s.curFunc
         val savedByteCode = s.byteCode
         val savedByteCodeLen = s.byteCodeLen
+        val savedLocalVarsLen = s.localVarsLen
+        val savedEvalRetIdx = s.evalRetIdx
         
         s.curFunc = allocFunctionBytecode()
         if (JS_IsException(s.curFunc)) {
@@ -219,6 +237,11 @@ class JSParser(private val s: JSParseState) {
         
         s.byteCode = allocByteArray(256)
         s.byteCodeLen = 0
+        s.localVarsLen = 0
+        s.evalRetIdx = -1
+        
+        /* 函数编译上下文入栈（闭包捕获的回改作用域） */
+        compileScopes.addLast(FuncCompileScope(s.curFunc))
         
         expect('('.code)
         val argCount = parseParams()
@@ -243,6 +266,9 @@ class JSParser(private val s: JSParseState) {
         s.curFunc = savedFunc
         s.byteCode = savedByteCode
         s.byteCodeLen = savedByteCodeLen
+        s.localVarsLen = savedLocalVarsLen
+        s.evalRetIdx = savedEvalRetIdx
+        compileScopes.removeLast()
         
         val cpoolIdx = addConstPool(newFunc)
         emitOpWithArg(OPCodeEnum.OP_fclosure, cpoolIdx)
@@ -653,258 +679,92 @@ class JSParser(private val s: JSParseState) {
                 val lvalueArg = getLastOpArg()
                 removeLastOp()
                 
+                /* 重发 lvalue 读取（get_field/get_array_el 用对象携带形式保留 obj） */
+                reemitLValueLoad(lvalueOp, lvalueArg)
+                
                 s.nextToken()
                 if (!parseAssignExpr()) return false
                 
-                emitOp(OPCodeEnum.OP_dup)
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-                    OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
-                }
+                /* 写回：对象携带形式 put_* 消费 obj 后表达式值自然保留，无需 dup */
+                emitLValueStore(lvalueOp, lvalueArg, needDup = !isObjCarrying(lvalueOp))
                 return true
             }
-            JSTokenVal.TOK_PLUS_ASSIGN.value -> {
-                val lvalueOp = getLastOp()
-                val lvalueArg = getLastOpArg()
-                removeLastOp()
-                
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_get_field, lvalueArg)
-                }
-                
-                s.nextToken()
-                if (!parseAssignExpr()) return false
-                emitOp(OPCodeEnum.OP_add)
-                
-                emitOp(OPCodeEnum.OP_dup)
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-                    OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
-                }
-                return true
+            JSTokenVal.TOK_PLUS_ASSIGN.value -> return emitCompoundAssign(OPCodeEnum.OP_add)
+            JSTokenVal.TOK_MINUS_ASSIGN.value -> return emitCompoundAssign(OPCodeEnum.OP_sub)
+            JSTokenVal.TOK_MUL_ASSIGN.value -> return emitCompoundAssign(OPCodeEnum.OP_mul)
+            JSTokenVal.TOK_DIV_ASSIGN.value -> return emitCompoundAssign(OPCodeEnum.OP_div)
+            JSTokenVal.TOK_MOD_ASSIGN.value -> return emitCompoundAssign(OPCodeEnum.OP_mod)
+            JSTokenVal.TOK_SHL_ASSIGN.value -> return emitCompoundAssign(OPCodeEnum.OP_shl)
+            JSTokenVal.TOK_SAR_ASSIGN.value -> return emitCompoundAssign(OPCodeEnum.OP_sar)
+            JSTokenVal.TOK_SHR_ASSIGN.value -> return emitCompoundAssign(OPCodeEnum.OP_shr)
+            JSTokenVal.TOK_AND_ASSIGN.value -> return emitCompoundAssign(OPCodeEnum.OP_and)
+            JSTokenVal.TOK_XOR_ASSIGN.value -> return emitCompoundAssign(OPCodeEnum.OP_xor)
+            JSTokenVal.TOK_OR_ASSIGN.value -> return emitCompoundAssign(OPCodeEnum.OP_or)
+        }
+        return true
+    }
+    
+    /* lvalue 读取指令的重发：get_field/get_array_el 换用保留 obj 的对象携带形式 */
+    private fun reemitLValueLoad(lvalueOp: Int, lvalueArg: Int) {
+        when (lvalueOp) {
+            OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_get_field2, lvalueArg)
+            OPCodeEnum.OP_get_array_el.id -> emitOpWithArg(OPCodeEnum.OP_get_array_el2, lvalueArg)
+            OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
+            OPCodeEnum.OP_get_var_ref.id -> emitOpWithArg(OPCodeEnum.OP_get_var_ref, lvalueArg)
+            OPCodeEnum.OP_get_global.id -> emitOpWithArg(OPCodeEnum.OP_get_global, lvalueArg)
+        }
+    }
+    
+    /* 对象携带形式的读取（get_field2/get_array_el2 压栈后保留 obj 供 put_* 消费） */
+    private fun isObjCarrying(lvalueOp: Int): Boolean {
+        return lvalueOp == OPCodeEnum.OP_get_field.id || lvalueOp == OPCodeEnum.OP_get_array_el.id
+    }
+    
+    /* lvalue 写回：needDup 时先复制栈顶（保证赋值表达式的值为写入值） */
+    private fun emitLValueStore(lvalueOp: Int, lvalueArg: Int, needDup: Boolean) {
+        if (needDup) emitOp(OPCodeEnum.OP_dup)
+        when (lvalueOp) {
+            OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
+            OPCodeEnum.OP_get_var_ref.id -> emitOpWithArg(OPCodeEnum.OP_put_var_ref, lvalueArg)
+            OPCodeEnum.OP_get_global.id -> emitOpWithArg(OPCodeEnum.OP_put_global, lvalueArg)
+            OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
+            OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
+        }
+    }
+    
+    /* 复合赋值（x op= v）：读取旧值 → rhs → 运算 → 写回（表达式值为运算结果） */
+    private fun emitCompoundAssign(binOp: OPCodeEnum): Boolean {
+        val lvalueOp = getLastOp()
+        val lvalueArg = getLastOpArg()
+        removeLastOp()
+        
+        reemitLValueLoad(lvalueOp, lvalueArg)
+        
+        s.nextToken()
+        if (!parseAssignExpr()) return false
+        emitOp(binOp)
+        
+        /* 写回并保证表达式值为运算结果（对象携带形式 put_* 消费 obj 后值自然在栈顶） */
+        when (lvalueOp) {
+            OPCodeEnum.OP_get_loc.id -> {
+                emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
+                emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
             }
-            JSTokenVal.TOK_MINUS_ASSIGN.value -> {
-                val lvalueOp = getLastOp()
-                val lvalueArg = getLastOpArg()
-                removeLastOp()
-                
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_get_field, lvalueArg)
-                }
-                
-                s.nextToken()
-                if (!parseAssignExpr()) return false
-                emitOp(OPCodeEnum.OP_sub)
-                
-                emitOp(OPCodeEnum.OP_dup)
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-                    OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
-                }
-                return true
+            OPCodeEnum.OP_get_var_ref.id -> {
+                emitOpWithArg(OPCodeEnum.OP_put_var_ref, lvalueArg)
+                emitOpWithArg(OPCodeEnum.OP_get_var_ref, lvalueArg)
             }
-            JSTokenVal.TOK_MUL_ASSIGN.value -> {
-                val lvalueOp = getLastOp()
-                val lvalueArg = getLastOpArg()
-                removeLastOp()
-                
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_get_field, lvalueArg)
-                }
-                
-                s.nextToken()
-                if (!parseAssignExpr()) return false
-                emitOp(OPCodeEnum.OP_mul)
-                
-                emitOp(OPCodeEnum.OP_dup)
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-                    OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
-                }
-                return true
+            OPCodeEnum.OP_get_global.id -> {
+                emitOpWithArg(OPCodeEnum.OP_put_global, lvalueArg)
+                emitOpWithArg(OPCodeEnum.OP_get_global, lvalueArg)
             }
-            JSTokenVal.TOK_DIV_ASSIGN.value -> {
-                val lvalueOp = getLastOp()
-                val lvalueArg = getLastOpArg()
-                removeLastOp()
-                
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_get_field, lvalueArg)
-                }
-                
-                s.nextToken()
-                if (!parseAssignExpr()) return false
-                emitOp(OPCodeEnum.OP_div)
-                
+            OPCodeEnum.OP_get_field.id -> {
                 emitOp(OPCodeEnum.OP_dup)
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-                    OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
-                }
-                return true
+                emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
             }
-            JSTokenVal.TOK_MOD_ASSIGN.value -> {
-                val lvalueOp = getLastOp()
-                val lvalueArg = getLastOpArg()
-                removeLastOp()
-                
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_get_field, lvalueArg)
-                }
-                
-                s.nextToken()
-                if (!parseAssignExpr()) return false
-                emitOp(OPCodeEnum.OP_mod)
-                
+            OPCodeEnum.OP_get_array_el.id -> {
                 emitOp(OPCodeEnum.OP_dup)
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-                    OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
-                }
-                return true
-            }
-            JSTokenVal.TOK_SHL_ASSIGN.value -> {
-                val lvalueOp = getLastOp()
-                val lvalueArg = getLastOpArg()
-                removeLastOp()
-                
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_get_field, lvalueArg)
-                }
-                
-                s.nextToken()
-                if (!parseAssignExpr()) return false
-                emitOp(OPCodeEnum.OP_shl)
-                
-                emitOp(OPCodeEnum.OP_dup)
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-                    OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
-                }
-                return true
-            }
-            JSTokenVal.TOK_SAR_ASSIGN.value -> {
-                val lvalueOp = getLastOp()
-                val lvalueArg = getLastOpArg()
-                removeLastOp()
-                
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_get_field, lvalueArg)
-                }
-                
-                s.nextToken()
-                if (!parseAssignExpr()) return false
-                emitOp(OPCodeEnum.OP_sar)
-                
-                emitOp(OPCodeEnum.OP_dup)
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-                    OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
-                }
-                return true
-            }
-            JSTokenVal.TOK_SHR_ASSIGN.value -> {
-                val lvalueOp = getLastOp()
-                val lvalueArg = getLastOpArg()
-                removeLastOp()
-                
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_get_field, lvalueArg)
-                }
-                
-                s.nextToken()
-                if (!parseAssignExpr()) return false
-                emitOp(OPCodeEnum.OP_shr)
-                
-                emitOp(OPCodeEnum.OP_dup)
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-                    OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
-                }
-                return true
-            }
-            JSTokenVal.TOK_AND_ASSIGN.value -> {
-                val lvalueOp = getLastOp()
-                val lvalueArg = getLastOpArg()
-                removeLastOp()
-                
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_get_field, lvalueArg)
-                }
-                
-                s.nextToken()
-                if (!parseAssignExpr()) return false
-                emitOp(OPCodeEnum.OP_and)
-                
-                emitOp(OPCodeEnum.OP_dup)
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-                    OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
-                }
-                return true
-            }
-            JSTokenVal.TOK_XOR_ASSIGN.value -> {
-                val lvalueOp = getLastOp()
-                val lvalueArg = getLastOpArg()
-                removeLastOp()
-                
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_get_field, lvalueArg)
-                }
-                
-                s.nextToken()
-                if (!parseAssignExpr()) return false
-                emitOp(OPCodeEnum.OP_xor)
-                
-                emitOp(OPCodeEnum.OP_dup)
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-                    OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
-                }
-                return true
-            }
-            JSTokenVal.TOK_OR_ASSIGN.value -> {
-                val lvalueOp = getLastOp()
-                val lvalueArg = getLastOpArg()
-                removeLastOp()
-                
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_get_field, lvalueArg)
-                }
-                
-                s.nextToken()
-                if (!parseAssignExpr()) return false
-                emitOp(OPCodeEnum.OP_or)
-                
-                emitOp(OPCodeEnum.OP_dup)
-                when (lvalueOp) {
-                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-                    OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
-                }
-                return true
+                emitOp(OPCodeEnum.OP_put_array_el)
             }
         }
         return true
@@ -1797,6 +1657,7 @@ class JSParser(private val s: JSParseState) {
         val newVarsPtr = JS_VALUE_TO_PTR(vars)
         ctx.memory.putJSValue(newVarsPtr + 8 + idx * 8, name)
         s.localVarsLen++
+        compileScopes.lastOrNull()?.localVarsLen = s.localVarsLen
         
         return idx
     }
@@ -1812,6 +1673,127 @@ class JSParser(private val s: JSParseState) {
             if (jsStringEquals(ctx, v, name)) return i
         }
         return -1
+    }
+    
+    /* 在指定函数的局部变量表中查找（闭包捕获的外层查找用） */
+    private fun findLocalVarIn(func: JSValue, count: Int, name: JSValue): Int {
+        val ptr = JS_VALUE_TO_PTR(func)
+        val vars = ctx.memory.getJSValue(ptr + 32)
+        if (JS_IsNull(vars)) return -1
+        
+        val varsPtr = JS_VALUE_TO_PTR(vars)
+        for (i in 0 until count) {
+            val v = ctx.memory.getJSValue(varsPtr + 8 + i * 8)
+            if (jsStringEquals(ctx, v, name)) return i
+        }
+        return -1
+    }
+    
+    /* 标识符变量读取的统一发射：局部 → get_loc；已捕获/可捕获的外层变量 → get_var_ref；
+     * 未声明 → get_global（未找到属性时运行时抛 ReferenceError） */
+    private fun emitVarLoad(name: JSValue): Boolean {
+        val nameStr = jsGetString(ctx, name)
+        
+        val localIdx = findLocalVar(name)
+        if (localIdx >= 0) {
+            /* 本层变量若已被提升（内层捕获）则走 varref 槽 */
+            val scope = compileScopes.lastOrNull()
+            val slot = scope?.varrefSlots?.get(nameStr)
+            if (slot != null) {
+                emitOpWithArg(OPCodeEnum.OP_get_var_ref, slot)
+            } else {
+                emitOpWithArg(OPCodeEnum.OP_get_loc, localIdx)
+            }
+            return true
+        }
+        
+        /* 沿函数编译栈向外查找可捕获的外层局部变量 */
+        val captured = tryCaptureOuterVar(nameStr)
+        if (captured >= 0) {
+            emitOpWithArg(OPCodeEnum.OP_get_var_ref, captured)
+            return true
+        }
+        
+        /* 未声明的全局标识符 */
+        val cidx = addConstPool(name)
+        emitOpWithArg(OPCodeEnum.OP_get_global, cidx)
+        return true
+    }
+    
+    /* 标识符变量写入的统一发射：局部 → put_loc；捕获槽 → put_var_ref；全局 → put_global */
+    private fun emitVarStore(name: JSValue, valueLoaded: Boolean): Boolean {
+        val nameStr = jsGetString(ctx, name)
+        
+        val localIdx = findLocalVar(name)
+        if (localIdx >= 0) {
+            if (!valueLoaded) emitOp(OPCodeEnum.OP_dup)
+            emitOpWithArg(OPCodeEnum.OP_put_loc, localIdx)
+            return true
+        }
+        
+        val captured = tryCaptureOuterVar(nameStr)
+        if (captured >= 0) {
+            if (!valueLoaded) emitOp(OPCodeEnum.OP_dup)
+            emitOpWithArg(OPCodeEnum.OP_put_var_ref, captured)
+            return true
+        }
+        
+        if (!valueLoaded) emitOp(OPCodeEnum.OP_dup)
+        val cidx = addConstPool(name)
+        emitOpWithArg(OPCodeEnum.OP_put_global, cidx)
+        return true
+    }
+    
+    /* 内层引用外层局部变量：分配捕获槽并回改外层已发射的 loc 指令（对照 C
+     * add_ext_var + varref 提升）。返回池槽索引；未找到可捕获的外层变量返回 -1 */
+    private fun tryCaptureOuterVar(nameStr: String): Int {
+        /* 从栈顶（当前内层）向栈底（顶层）查找声明该变量的外层层 */
+        for (i in compileScopes.indices.reversed().drop(1)) {
+            val scope = compileScopes[i]
+            
+            val existing = scope.varrefSlots[nameStr]
+            if (existing != null) return existing
+            
+            val name = JS_NewString(ctx, nameStr)
+            val localIdx = findLocalVarIn(scope.curFunc, scope.localVarsLen, name)
+            if (localIdx >= 0) {
+                val slot = ctx.varrefPool.size.also { ctx.varrefPool.add(JS_UNDEFINED) }
+                scope.varrefSlots[nameStr] = slot
+                rewriteLocToVarRef(scope.curFunc, localIdx, slot)
+                return slot
+            }
+        }
+        return -1
+    }
+    
+    /* 扫描函数字节码，将读写指定局部变量的 get_loc/put_loc 改写为
+     * get_var_ref/put_var_ref（操作数换为 varref 池槽；指令同为 3 字节） */
+    private fun rewriteLocToVarRef(func: JSValue, localIdx: Int, slot: Int) {
+        val funcPtr = JS_VALUE_TO_PTR(func)
+        val bc = ctx.memory.getJSValue(funcPtr + 16)
+        if (bc == JS_NULL) return
+        val bcPtr = JS_VALUE_TO_PTR(bc)
+        val len = ctx.memory.getI32(bcPtr + 4)
+        
+        var i = 0
+        while (i < len) {
+            val op = ctx.memory.getU8(bcPtr + 8 + i).toInt()
+            val e = OPCodeEnum.entries.find { it.id == op }
+            if (e == null) {
+                i++
+                continue
+            }
+            if (op == OPCodeEnum.OP_get_loc.id &&
+                ctx.memory.getU16(bcPtr + 8 + i + 1) == localIdx) {
+                ctx.memory.putU8(bcPtr + 8 + i, OPCodeEnum.OP_get_var_ref.id)
+                ctx.memory.putU16(bcPtr + 8 + i + 1, slot)
+            } else if (op == OPCodeEnum.OP_put_loc.id &&
+                ctx.memory.getU16(bcPtr + 8 + i + 1) == localIdx) {
+                ctx.memory.putU8(bcPtr + 8 + i, OPCodeEnum.OP_put_var_ref.id)
+                ctx.memory.putU16(bcPtr + 8 + i + 1, slot)
+            }
+            i += e.size
+        }
     }
     
     fun jsStringEquals(ctx: JSContext, a: JSValue, b: JSValue): Boolean {

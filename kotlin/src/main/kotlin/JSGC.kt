@@ -35,6 +35,11 @@ object JSGC {
             gcMark(ctx, markStack, v)
         }
         
+        /* 闭包捕获变量槽池（对照 C 的 varref 对象图） */
+        for (v in ctx.varrefPool) {
+            gcMark(ctx, markStack, v)
+        }
+        
         for (i in ctx.classProto.indices) {
             gcMark(ctx, markStack, ctx.classProto[i])
             gcMark(ctx, markStack, ctx.classObj[i])
@@ -383,6 +388,11 @@ object JSGC {
         /* 临时保活列表中的值随块搬移更新 */
         for (i in ctx.gcKeepAlive.indices) {
             ctx.gcKeepAlive[i] = remapValue(ctx.gcKeepAlive[i])
+        }
+        
+        /* 闭包捕获变量槽池随块搬移更新 */
+        for (i in ctx.varrefPool.indices) {
+            ctx.varrefPool[i] = remapValue(ctx.varrefPool[i])
         }
         
         for (i in ctx.classProto.indices) {

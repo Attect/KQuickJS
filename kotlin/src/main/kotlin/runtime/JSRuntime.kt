@@ -10,11 +10,13 @@ class JSRuntime(private val ctx: JSContext) {
     /* 顶层入口：this 默认为全局对象（对照 C JS_Eval 的顶层帧） */
     fun run(func: JSValue): JSValue = run(func, ctx.globalObj)
     
-    fun run(func: JSValue, thisObj: JSValue): JSValue {
+    fun run(func: JSValue, thisObj: JSValue): JSValue = run(func, thisObj, emptyList())
+    
+    fun run(func: JSValue, thisObj: JSValue, args: List<JSValue>): JSValue {
         /* 维护 JS 调用栈记录（Kotlin 无 C 的 fp 帧链，用于生成错误对象的 stack 回溯） */
         ctx.jsCallStack.addLast(readFuncName(func))
         try {
-            return runBody(func, thisObj)
+            return runBody(func, thisObj, args)
         } finally {
             ctx.jsCallStack.removeLast()
         }
@@ -27,7 +29,7 @@ class JSRuntime(private val ctx: JSContext) {
         return if (JS_IsString(ctx, name)) jsGetString(ctx, name) else "<anonymous>"
     }
     
-    private fun runBody(func: JSValue, thisObj: JSValue): JSValue {
+    private fun runBody(func: JSValue, thisObj: JSValue, args: List<JSValue>): JSValue {
         val funcPtr = JS_VALUE_TO_PTR(func)
         if (ctx.memory.getMTag(funcPtr) != JSMTags.JS_MTAG_FUNCTION_BYTECODE) {
             return JS_EXCEPTION
@@ -49,6 +51,11 @@ class JSRuntime(private val ctx: JSContext) {
         var pc = 0
         val stack = mutableListOf<JSValue>()
         val vars = MutableList(varsSize) { JS_UNDEFINED }
+        /* 函数参数填入 vars 前段（bytecode 头 u16 的高位存 argCount） */
+        val argCount = ctx.memory.getU16(funcPtr) shr 4
+        for (i in 0 until minOf(args.size, argCount, varsSize)) {
+            vars[i] = args[i]
+        }
         var loopCount = 0
         val maxLoopCount = 100000
         
@@ -67,6 +74,57 @@ class JSRuntime(private val ctx: JSContext) {
             pc++
             
             when (op) {
+                /* 闭包捕获变量读写（对照 C OP_get_var_ref/OP_put_var_ref：
+                 * 槽为 UNINITIALIZED 时抛 ReferenceError） */
+                OPCodeEnum.OP_get_var_ref.id -> {
+                    val idx = readU16(code, pc)
+                    pc += 2
+                    if (idx < 0 || idx >= ctx.varrefPool.size) {
+                        return JS_ThrowReferenceError(ctx, "variable is not defined")
+                    }
+                    val v = ctx.varrefPool[idx]
+                    if (JS_IsUninitialized(v)) {
+                        return JS_ThrowReferenceError(ctx, "variable is not defined")
+                    }
+                    stack.add(v)
+                }
+                
+                OPCodeEnum.OP_put_var_ref.id -> {
+                    val idx = readU16(code, pc)
+                    pc += 2
+                    val v = stack.removeLast()
+                    while (ctx.varrefPool.size <= idx) {
+                        ctx.varrefPool.add(JS_UNDEFINED)
+                    }
+                    ctx.varrefPool[idx] = v
+                }
+                
+                /* 全局标识符读写（对照 C GLOBAL varref 经 globalObj 属性解析；
+                 * 读取时属性不存在抛 ReferenceError） */
+                OPCodeEnum.OP_get_global.id -> {
+                    val idx = readU16(code, pc)
+                    pc += 2
+                    val cpool = ctx.memory.getJSValue(funcPtr + 24)
+                    val name = if (cpool != JS_NULL) {
+                        ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
+                    } else JS_UNDEFINED
+                    val v = getProperty(ctx.globalObj, name)
+                    if (JS_IsUndefined(v) && !hasProperty(ctx.globalObj, name)) {
+                        return JS_ThrowReferenceError(ctx, "'${jsGetString(ctx, name)}' is not defined")
+                    }
+                    stack.add(v)
+                }
+                
+                OPCodeEnum.OP_put_global.id -> {
+                    val idx = readU16(code, pc)
+                    pc += 2
+                    val v = stack.removeLast()
+                    val cpool = ctx.memory.getJSValue(funcPtr + 24)
+                    val name = if (cpool != JS_NULL) {
+                        ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
+                    } else JS_UNDEFINED
+                    setProperty(ctx.globalObj, name, v)
+                }
                 OPCodeEnum.OP_undefined.id -> stack.add(JS_UNDEFINED)
                 OPCodeEnum.OP_null.id -> stack.add(JS_NULL)
                 OPCodeEnum.OP_push_false.id -> stack.add(JS_FALSE)
@@ -779,6 +837,35 @@ class JSRuntime(private val ctx: JSContext) {
         return false
     }
     
+    /* 检查对象（含原型链）是否存在指定属性（对照 C find_own_property 的原型遍历） */
+    fun hasProperty(obj: JSValue, key: JSValue): Boolean {
+        if (!JS_IsPtr(obj)) return false
+        val objPtr = JS_VALUE_TO_PTR(obj)
+        if (ctx.memory.getMTag(objPtr) != JSMTags.JS_MTAG_OBJECT) return false
+        
+        var props = ctx.memory.getJSValue(objPtr + 16)
+        if (props != JS_NULL && props != ctx.emptyProps) {
+            val propsPtr = JS_VALUE_TO_PTR(props)
+            val hashMask = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 16))
+            val h = hashProp(key, hashMask)
+            var idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 24 + h * 8)) shr 1
+            while (idx != 0) {
+                val propPtr = propsPtr + 8 + idx * 8
+                val propKey = ctx.memory.getJSValue(propPtr)
+                if (propKey == key || jsValueEquals(propKey, key)) {
+                    return true
+                }
+                idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propPtr + 16)) shr 1
+            }
+        }
+        
+        val proto = ctx.memory.getJSValue(objPtr + 8)
+        if (proto != JS_NULL) {
+            return hasProperty(proto, key)
+        }
+        return false
+    }
+    
     fun setProperty(obj: JSValue, key: JSValue, val1: JSValue) {
         if (!JS_IsPtr(obj)) return
         val objPtr = JS_VALUE_TO_PTR(obj)
@@ -975,7 +1062,7 @@ class JSRuntime(private val ctx: JSContext) {
         }
         
         if (ctx.memory.getMTag(funcPtr) == JSMTags.JS_MTAG_FUNCTION_BYTECODE) {
-            return run(func, thisObj)
+            return run(func, thisObj, args)
         }
         
         return JS_ThrowTypeError(ctx, "not a function")

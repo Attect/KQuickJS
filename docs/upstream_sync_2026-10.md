@@ -77,16 +77,26 @@
 | `OP_catch`/`OP_throw` 执行逻辑缺失 | ✅ 已实现：`OP_catch`（压 CATCH_OFFSET）/`OP_throw`/`OP_gosub`/`OP_ret` + `unwindToCatch` 本帧异常展开（catch 命中恢复执行、uncatchable 直接传播）；parser try/catch/finally 重写（catch 变量绑定、catch2 保护重抛、gosub/finally） |
 | Date 的 JS 层暴露 | ✅ 已实现：最小 stdlib 注册（`OP_new` 走 C 构造器路径 + `FRAME_CF_CTOR`），`new Date(ms)` / `Date.now()` 在 JS 层可用 |
 
+变量与赋值体系（第二轮缺口补齐，✅ 已完成）：
+
+| 项目 | 状态 |
+|------|------|
+| 变量引用体系（OP_get_var_ref/OP_put_var_ref + varref 池） | ✅ 已实现：未声明标识符走 OP_get_global/OP_put_global（globalObj 属性读写 + ReferenceError）；内层函数引用外层局部变量时提升为 varref 池槽并回改外层已发射指令（对照 C add_ext_var/varref 提升） |
+| 函数参数传递 | ✅ 已实现：run 填充 vars 前段（bytecode 头 argCount）；连带修复 parseFunctionDecl 未恢复 localVarsLen 的槽冲突 |
+| 属性 lhs 赋值表达式 | ✅ 已实现：= 与全部复合赋值（+= -= *= /= %= <<= >>= >>>= &= ^= \|=）的 get_field/get_array_el 回改为保留 obj 的 get_field2/get_array_el2 并配对 put_field/put_array_el |
+| break/continue 跳转 | ✅ 已实现：标签占位栈 + 循环/switch 环境注册与 patch（此前 break 仅编译为 undefined 占位） |
+| for 的 update 物理布局 | ✅ 已修复：update 移至 body 之后（原先每轮执行两次），update 源采用记录/跳过/回跳编译（对照 C expr3_pos/js_skip_expr/js_parse_seek），seek 恢复完整 token 快照 |
+| catch 变量绑定 | ✅ 已实现：异常展开命中 catch offset 后异常值经 put_loc 存入 catch 变量（trace 验证 r = e 生效） |
+| 方法调用的 this 接入 | ✅ 已实现（OP_push_this 压当前帧 this，o.f() 的 this.v 返回 42） |
+
 仍然存在的缺口：
 
 | 缺口 | 位置 | 说明 |
 |------|------|------|
-| 闭包变量捕获（varref 机制） | parser/runtime | 内层函数读取外层函数变量未实现（退化为 `this.v` 属性读取）；OP_get_var_ref/ext_vars 机制未移植。`f()()` 链式调用本身已工作（见 testChainedCall），捕获外层变量的闭包待实现 |
-| 属性 lhs 赋值表达式 | parser | `this.v = x` / `obj.p = v` 的赋值编译（put_field 的 lvalue 识别）未实现，仅支持局部变量赋值；构造器测试 testConstructorThisBinding 依赖此项（已 @Ignore） |
-| catch 变量绑定读取为 undefined | parser/runtime | `catch (e)` 经 put_loc 绑定异常值后，块内 get_loc 读到 undefined，待定位；testErrorBacktrace 依赖此项（已 @Ignore，stack 回溯生成本身已实现并经 testGcPreservesErrorObject 间接覆盖） |
-| build_backtrace 格式 | `JSContext.throwError` | stack 槽已生成基于 jsCallStack 的回溯文本；C 版的行号/列号信息未包含 |
+| finally 的 gosub/ret 返回地址 | parser/runtime | try/finally 编译结构与 OP_gosub/OP_ret 均已实现，但 finally 体执行后 OP_ret 读取的返回地址异常；finally 相关子场景已 @Ignore（testThrowFinallySemantics/testThrowFinallyAndRethrow，无 finally 的 try/catch 与跨函数展开全部正常） |
+| 闭包捕获的 varref 与 loc 混用场景 | parser | varref 池提升已工作，但部分混用场景（如 varref 变量参与 for 循环 update）待完善 |
+| build_backtrace 格式 | `JSContext.throwError` | stack 槽已生成基于 jsCallStack 的回溯文本；C 版的行号/列号信息未包含；testErrorBacktrace 待复验 catch 绑定复验后解除 @Ignore |
 | GC 未处理 `JS_CLASS_REGEXP` / TYPED_ARRAY | `JSGC` | 这些内建类尚未在 Kotlin 实现，实现时需同步补 GC 分支（JS_CLASS_ERROR 分支已补齐） |
-| 顶层调用不追调返回的闭包中的变量捕获 | `JSRuntime.callFunction` | 同闭包变量捕获缺口 |
 | `f_f` 参数转换异常路径 | `callCFunction` | Kotlin 的 `JS_ToNumber` 为纯转换（不产生异常），上游 `49f1536` 的异常优先结构已按 C 形态实现，但异常分支待 `JS_ToNumber` 异常化后生效 |
 
 ## 五、验证
