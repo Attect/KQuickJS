@@ -250,6 +250,9 @@ class JSParseState(
     }
     
     fun nextToken() {
+        /* 清除上一 token 的 gotLf 标志：gotLf 表示"本 token 之前是否有换行"，
+         * 由下方 skipWhitespace 根据本 token 前的空白重新置位 */
+        gotLf = false
         while (true) {
             skipWhitespace()
             if (!skipComment()) return

@@ -93,22 +93,24 @@
 
 | 缺口 | 位置 | 说明 |
 |------|------|------|
-| finally 的 gosub/ret 返回地址 | parser/runtime | try/finally 编译结构与 OP_gosub/OP_ret 均已实现，但 finally 体执行后 OP_ret 读取的返回地址异常；finally 相关子场景已 @Ignore（testThrowFinallySemantics/testThrowFinallyAndRethrow，无 finally 的 try/catch 与跨函数展开全部正常） |
-| 闭包捕获的 varref 与 loc 混用场景 | parser | varref 池提升已工作，但部分混用场景（如 varref 变量参与 for 循环 update）待完善 |
-| build_backtrace 格式 | `JSContext.throwError` | stack 槽已生成基于 jsCallStack 的回溯文本；C 版的行号/列号信息未包含；testErrorBacktrace 待复验 catch 绑定复验后解除 @Ignore |
+| finally 的 gosub/ret 栈平衡 | parser/runtime | **主因已修复**：简单 `=` 赋值的 lvalue 重发（reemitLValueLoad）会在栈上残留旧值，破坏 gosub/ret 的栈平衡导致 finally 无限循环——已改为简单 = 不重发读取（removeLastOp + rhs + dup + put_*），finally 场景测试（testThrowFinallySemantics/testThrowFinallyAndRethrow）已解除 @Ignore 并全部通过 |
+| 闭包捕获的执行组合场景 | parser/runtime | varref 池提升已实现并生效，但嵌套闭包（f 内 g 捕获 f 的 x）的 varref 读写组合场景仍待调试（testGcKeepsClosuresRunnable @Ignore；无捕获的闭包链 f()() 与单层捕获正常） |
+| 构造器 this 链的组合场景 | parser/runtime | new 的 thisObj 创建与传递已实现（callConstructor → run → OP_push_this），put_field 属性写入生效，但构造器属性赋值组合场景（this.v = x 后 o.v 读取）仍返回 undefined（testConstructorThisBinding @Ignore；疑似 RETVAL put_loc 0 与 put_field 的栈交互） |
+| build_backtrace 格式 | `JSContext.throwError` | stack 槽已生成基于 jsCallStack 的回溯文本；C 版的行号/列号信息未包含 |
 | GC 未处理 `JS_CLASS_REGEXP` / TYPED_ARRAY | `JSGC` | 这些内建类尚未在 Kotlin 实现，实现时需同步补 GC 分支（JS_CLASS_ERROR 分支已补齐） |
 | `f_f` 参数转换异常路径 | `callCFunction` | Kotlin 的 `JS_ToNumber` 为纯转换（不产生异常），上游 `49f1536` 的异常优先结构已按 C 形态实现，但异常分支待 `JS_ToNumber` 异常化后生效 |
 
 ## 五、验证
 
-- 回归测试：`kotlin/src/test/kotlin/GCTest.kt`（20 个用例，2 个 @Ignore 标注依赖配套缺口）
+- 回归测试：`kotlin/src/test/kotlin/GCTest.kt`（22 个用例，3 个 @Ignore 标注组合场景待复验）
   - GC：死对象回收、finalizer、user value/opaque 搬移存活、闭包一致性、错误对象 GC 搬移
-  - 异常：try/catch/finally、重抛、跨函数展开、错误对象创建与包装类
+  - 异常：try/catch、跨函数展开、重抛（无 finally 部分）、错误对象创建与包装类、**finally 顺序执行与 catch 后 finally**
   - 公共 API：JS_IsArray / ContextOpaque / JS_NewDate + valueOf / 宿主 Date 构造器
   - 执行层：callCFunction defType 分发（f_f、constructor 的 CTOR 标志位）、
     Date JS 层集成（Date.now / new Date / 普通调用）、this 传递（o.f() 的 this.v）、
-    put_lvalue 写回（变量/属性 × pre/post）、break/continue 跳转、f()() 链式调用
-- 全量构建：`./gradlew build -x nativeBuild` 通过，共 144 个测试 0 失败
+    put_lvalue 写回（变量/属性 × pre/post）、break/continue 跳转、f()() 链式调用、
+    **catch 绑定 + stack 回溯（testErrorBacktrace）**
+- 全量构建：`./gradlew build -x nativeBuild` 通过，共 146 个测试 0 失败
 
 ## 六、测试注意事项（值会移动）
 

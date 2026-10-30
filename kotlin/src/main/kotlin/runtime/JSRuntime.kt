@@ -69,7 +69,22 @@ class JSRuntime(private val ctx: JSContext) {
             val op = code[pc].toInt() and 0xFF
             if (System.getenv("MQJS_TRACE") != null) {
                 val e = OPCodeEnum.entries.find { it.id == op }
-                println("TRACE pc=${pc} ${e?.name ?: "?"} stack=${stack.size} vars0=${vars.getOrNull(0)} vars1=${vars.getOrNull(1)} vars2=${vars.getOrNull(2)}")
+                val stackDump = stack.joinToString(",") { v ->
+                    when {
+                        JS_IsInt(v) -> JS_VALUE_GET_INT(v).toString()
+                        JS_IsUndefined(v) -> "undef"
+                        JS_IsNull(v) -> "null"
+                        JS_IsPtr(v) -> "p${JS_VALUE_TO_PTR(v)}"
+                        else -> "v$v"
+                    }
+                }
+                println("TRACE pc=$pc ${e?.name ?: "?"} [$stackDump] vars=${vars.joinToString(",") { v ->
+                    when {
+                        JS_IsInt(v) -> JS_VALUE_GET_INT(v).toString()
+                        JS_IsUndefined(v) -> "undef"
+                        else -> "v$v"
+                    }
+                }}")
             }
             pc++
             
@@ -154,7 +169,7 @@ class JSRuntime(private val ctx: JSContext) {
                     stack.add(JS_NewShortInt(v))
                 }
                 
-                OPCodeEnum.OP_push_const.id, OPCodeEnum.OP_fclosure.id -> {
+                OPCodeEnum.OP_push_const.id -> {
                     val idx = (code[pc].toInt() and 0xFF) or ((code[pc + 1].toInt() and 0xFF) shl 8)
                     pc += 2
                     val cpool = ctx.memory.getJSValue(funcPtr + 24)
@@ -164,6 +179,23 @@ class JSRuntime(private val ctx: JSContext) {
                     } else {
                         stack.add(JS_UNDEFINED)
                     }
+                }
+                
+                OPCodeEnum.OP_fclosure.id -> {
+                    /* 从 cpool 的函数字节码创建 JS_CLASS_CLOSURE 对象（extra 槽 0 = funcBytecode） */
+                    val idx = readU16(code, pc)
+                    pc += 2
+                    val cpool = ctx.memory.getJSValue(funcPtr + 24)
+                    val funcBytecode = if (cpool != JS_NULL) {
+                        ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
+                    } else JS_NULL
+                    
+                    val closure = JS_NewObjectProtoClass(ctx, JS_NULL,
+                                                         JSObjectClassEnum.JS_CLASS_CLOSURE.value, 1)
+                    if (JS_IsException(closure)) return JS_EXCEPTION
+                    val closurePtr = JS_VALUE_TO_PTR(closure)
+                    ctx.memory.putJSValue(closurePtr + 24, funcBytecode)
+                    stack.add(closure)
                 }
                 
                 OPCodeEnum.OP_drop.id -> stack.removeLast()
@@ -550,12 +582,18 @@ class JSRuntime(private val ctx: JSContext) {
                     val diff = readI32(code, pc)
                     pc += 4
                     stack.add(JS_NewShortInt(pc))
+                    if (System.getenv("MQJS_TRACE") != null) {
+                        println("TRACE gosub pushed addr=$pc raw=${JS_NewShortInt(pc)}")
+                    }
                     pc += diff
                 }
                 
                 OPCodeEnum.OP_ret.id -> {
                     /* 从 finally 返回（对照 C OP_ret：栈顶为 ShortInt 返回地址） */
                     val ret = stack.removeLast()
+                    if (System.getenv("MQJS_TRACE") != null) {
+                        println("TRACE ret popped raw=$ret isInt=${JS_IsInt(ret)} addr=${if (JS_IsInt(ret)) JS_VALUE_GET_INT(ret) else -1}")
+                    }
                     if (!JS_IsInt(ret)) return JS_EXCEPTION
                     pc = JS_VALUE_GET_INT(ret)
                 }
@@ -1059,6 +1097,11 @@ class JSRuntime(private val ctx: JSContext) {
                 val params = ctx.memory.getJSValue(funcPtr + 28)
                 return callCFunction(funcIdx, thisObj, args, 0, params)
             }
+            if (classId == JSObjectClassEnum.JS_CLASS_CLOSURE.value) {
+                /* 闭包对象：extra 槽 0 存函数字节码 */
+                val funcBytecode = ctx.memory.getJSValue(funcPtr + 24)
+                return run(funcBytecode, thisObj, args)
+            }
         }
         
         if (ctx.memory.getMTag(funcPtr) == JSMTags.JS_MTAG_FUNCTION_BYTECODE) {
@@ -1117,6 +1160,11 @@ class JSRuntime(private val ctx: JSContext) {
                 
                 val r = callFunction(func, args, thisObj)
                 if (JS_IsException(r)) return JS_EXCEPTION
+                if (System.getenv("MQJS_TRACE") != null) {
+                    println("TRACE ctor: thisObj=${JS_VALUE_TO_PTR(thisObj)} r=${r} rIsPtr=${JS_IsPtr(r)}")
+                    val pv = getProperty(thisObj, JS_NewString(ctx, "v"))
+                    println("TRACE ctor: thisObj.v after body=${if (JS_IsUndefined(pv)) "undef" else pv}")
+                }
                 /* 返回值为对象则采用之，否则用 this（对照 ES new 语义） */
                 return if (JS_IsPtr(r) &&
                     ctx.memory.getMTag(JS_VALUE_TO_PTR(r)) == JSMTags.JS_MTAG_OBJECT) {

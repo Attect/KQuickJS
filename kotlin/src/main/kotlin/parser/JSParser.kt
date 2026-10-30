@@ -193,7 +193,7 @@ class JSParser(private val s: JSParseState) {
                 val cidx = addConstPool(name)
                 emitOpWithArg(OPCodeEnum.OP_put_field, cidx)
             } else {
-                // 正常模式：将变量存储到局部变量
+                // 正常模式：将变量存储到局部变量（顶层脚本亦为顶层函数帧的局部）
                 if (s.token.val1 == '='.code) {
                     s.nextToken()
                     if (!parseAssignExpr()) return false
@@ -272,6 +272,10 @@ class JSParser(private val s: JSParseState) {
         
         val cpoolIdx = addConstPool(newFunc)
         emitOpWithArg(OPCodeEnum.OP_fclosure, cpoolIdx)
+        
+        /* 函数名绑定：闭包对象存入局部变量（fclosure 压栈后写入，对照 C 的函数声明 hoisting） */
+        val nameIdx = addLocalVar(funcName)
+        emitOpWithArg(OPCodeEnum.OP_put_loc, nameIdx)
         
         return !s.hasError
     }
@@ -679,14 +683,16 @@ class JSParser(private val s: JSParseState) {
                 val lvalueArg = getLastOpArg()
                 removeLastOp()
                 
-                /* 重发 lvalue 读取（get_field/get_array_el 用对象携带形式保留 obj） */
-                reemitLValueLoad(lvalueOp, lvalueArg)
+                /* 重发 lvalue 读取：仅复合赋值需要（读取旧值参与运算）；
+                   简单 = 无需重发（removeLastOp 已移除 lhs 读取，rhs 后 dup+put_* 完成写回
+                   并保留赋值表达式的值） */
+                reemitLValueLoad(lvalueOp, lvalueArg, forCompound = false)
                 
                 s.nextToken()
                 if (!parseAssignExpr()) return false
                 
-                /* 写回：对象携带形式 put_* 消费 obj 后表达式值自然保留，无需 dup */
-                emitLValueStore(lvalueOp, lvalueArg, needDup = !isObjCarrying(lvalueOp))
+                /* 写回：dup 保证赋值表达式的值为写入值（各形态 put_* 的压弹净差 + put 弹出配对） */
+                emitLValueStore(lvalueOp, lvalueArg, needDup = true)
                 return true
             }
             JSTokenVal.TOK_PLUS_ASSIGN.value -> return emitCompoundAssign(OPCodeEnum.OP_add)
@@ -704,8 +710,12 @@ class JSParser(private val s: JSParseState) {
         return true
     }
     
-    /* lvalue 读取指令的重发：get_field/get_array_el 换用保留 obj 的对象携带形式 */
-    private fun reemitLValueLoad(lvalueOp: Int, lvalueArg: Int) {
+    /* lvalue 读取指令的重发：仅复合赋值需要（读取旧值参与运算）。
+     * get_field/get_array_el 重发为保留 obj 的对象携带形式（get_field2/get_array_el2）；
+     * 简单 = 无需重发——removeLastOp 已移除 lhs 读取指令，rhs 后 dup+put_* 即可
+     * （重发读取会在栈上残留旧值，破坏 put_* 的 obj/val 配对） */
+    private fun reemitLValueLoad(lvalueOp: Int, lvalueArg: Int, forCompound: Boolean) {
+        if (!forCompound) return
         when (lvalueOp) {
             OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_get_field2, lvalueArg)
             OPCodeEnum.OP_get_array_el.id -> emitOpWithArg(OPCodeEnum.OP_get_array_el2, lvalueArg)
@@ -738,7 +748,8 @@ class JSParser(private val s: JSParseState) {
         val lvalueArg = getLastOpArg()
         removeLastOp()
         
-        reemitLValueLoad(lvalueOp, lvalueArg)
+        /* 复合赋值需要读取旧值参与运算（槽目标也要读） */
+        reemitLValueLoad(lvalueOp, lvalueArg, forCompound = true)
         
         s.nextToken()
         if (!parseAssignExpr()) return false
@@ -1288,14 +1299,8 @@ class JSParser(private val s: JSParseState) {
             JSTokenVal.TOK_IDENT.value -> {
                 val name = s.token.value
                 s.nextToken()
-                val idx = findLocalVar(name)
-                if (idx >= 0) {
-                    emitOpWithArg(OPCodeEnum.OP_get_loc, idx)
-                } else {
-                    emitOp(OPCodeEnum.OP_push_this)
-                    val cidx = addConstPool(name)
-                    emitOpWithArg(OPCodeEnum.OP_get_field, cidx)
-                }
+                /* 变量访问统一发射：局部 get_loc / 捕获 get_var_ref / 全局 get_global */
+                emitVarLoad(name)
                 return true
             }
             JSTokenVal.TOK_NULL.value -> {
@@ -1403,6 +1408,8 @@ class JSParser(private val s: JSParseState) {
         val savedFunc = s.curFunc
         val savedByteCode = s.byteCode
         val savedByteCodeLen = s.byteCodeLen
+        val savedLocalVarsLen = s.localVarsLen
+        val savedEvalRetIdx = s.evalRetIdx
         
         s.curFunc = allocFunctionBytecode()
         if (JS_IsException(s.curFunc)) {
@@ -1412,6 +1419,11 @@ class JSParser(private val s: JSParseState) {
         
         s.byteCode = allocByteArray(256)
         s.byteCodeLen = 0
+        s.localVarsLen = 0
+        s.evalRetIdx = -1
+        
+        /* 函数编译上下文入栈（闭包捕获的回改作用域） */
+        compileScopes.addLast(FuncCompileScope(s.curFunc))
         
         if (s.token.val1 == JSTokenVal.TOK_IDENT.value) {
             setFunctionName(s.curFunc, s.token.value)
@@ -1441,6 +1453,9 @@ class JSParser(private val s: JSParseState) {
         s.curFunc = savedFunc
         s.byteCode = savedByteCode
         s.byteCodeLen = savedByteCodeLen
+        s.localVarsLen = savedLocalVarsLen
+        s.evalRetIdx = savedEvalRetIdx
+        compileScopes.removeLast()
         
         val cpoolIdx = addConstPool(newFunc)
         emitOpWithArg(OPCodeEnum.OP_fclosure, cpoolIdx)
