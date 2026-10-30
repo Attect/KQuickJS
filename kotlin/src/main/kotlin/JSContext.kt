@@ -43,6 +43,16 @@ class JSContext(
     /* 用户对象的宿主 opaque 引用表：key 为对象块地址，GC 搬移时随块更新
      * （对照 C 版 p->u.user.opaque 的 per-object 语义，修复原先错存 ctx.opaque 的问题） */
     val userOpaqueTable: HashMap<Int, Any?> = HashMap()
+    /* 桥接层扩展函数表：cFunctionTable 定长表之后的追加槽，供宿主桥接层在
+     * JS_NewContext 之后动态注册函数（突破"创建后不可扩"的定长表限制）。
+     * callCFunction 在 funcIdx 超出基础表范围时，按 (funcIdx - 基础表长度) 偏移查找 */
+    val extFunctionTable: MutableList<JSCFunctionDef> = mutableListOf()
+    /* 桥接层扩展 finalizer 表：classId → finalizer，供桥接层运行期动态注册。
+     * - user 类（classId >= JS_CLASS_USER）：与 cFinalizerTable 等效的动态注册途径；
+     * - 内置类（classId < JS_CLASS_USER，如 JS_CLASS_OBJECT）：桥接层宿主对象的
+     *   实例分发 finalizer（GC 回收时按 opaque 中的宿主引用分发清理动作）。
+     * GC 调用约定与 cFinalizerTable 相同：finalizer 内禁止调用 JS 函数 */
+    val extFinalizerTable: HashMap<Int, ((ctx: JSContext, opaque: Any?) -> Unit)> = HashMap()
     /* JS 调用栈记录（最内层在末尾）：Kotlin 无 C 的 fp 帧链，
      * 由 JSRuntime.run 进入/退出时维护，用于生成错误对象的 stack 回溯 */
     val jsCallStack: ArrayDeque<String> = ArrayDeque()

@@ -105,15 +105,20 @@ object JSGC {
                     
                     if (ctx.memory.getMTag(ptr1) == JSMTags.JS_MTAG_OBJECT) {
                         val classId = ctx.memory.getU8(ptr1 + 2)
-                        if (classId >= JSObjectClassEnum.JS_CLASS_USER.value) {
-                            val fin = ctx.cFinalizerTable?.getOrNull(classId - JSObjectClassEnum.JS_CLASS_USER.value)
-                            if (fin != null) {
-                                /* 调用用户 finalizer（禁止在其中调用 JS 函数） */
-                                fin(ctx, ctx.userOpaqueTable[ptr1])
+                        /* finalizer 查找：user 类走 cFinalizerTable（建表给定）；
+                         * 其余类（含桥接层宿主对象复用的普通对象类）查扩展 finalizer 表 */
+                        val fin: ((ctx: JSContext, opaque: Any?) -> Unit)? =
+                            if (classId >= JSObjectClassEnum.JS_CLASS_USER.value) {
+                                ctx.cFinalizerTable?.getOrNull(classId - JSObjectClassEnum.JS_CLASS_USER.value)
+                            } else {
+                                ctx.extFinalizerTable[classId]
                             }
-                            /* 对象已释放，清理宿主 opaque 引用表条目 */
-                            ctx.userOpaqueTable.remove(ptr1)
+                        if (fin != null) {
+                            /* 调用用户 finalizer（禁止在其中调用 JS 函数） */
+                            fin(ctx, ctx.userOpaqueTable[ptr1])
                         }
+                        /* 对象已释放，清理宿主 opaque 引用表条目 */
+                        ctx.userOpaqueTable.remove(ptr1)
                     }
                     
                     total += size1

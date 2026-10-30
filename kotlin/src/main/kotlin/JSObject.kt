@@ -66,26 +66,22 @@ fun JS_GetClassID(ctx: JSContext, val1: JSValue): Int {
 }
 
 /* opaque 存放在按对象地址索引的宿主引用表中（对照 C 的 p->u.user.opaque），
- * GC 搬移对象时由压缩器同步更新表 key，对象释放时由 GC 清理条目 */
+ * GC 搬移对象时由压缩器同步更新表 key，对象释放时由 GC 清理条目。
+ * Kotlin 扩展：opaque 在本实现中是 JVM 侧引用表而非块内槽位，因此不限定
+ * classId >= JS_CLASS_USER——任意对象（含普通对象）均可挂载宿主引用，
+ * 供桥接层以普通对象封装 Kotlin 实例（C 版仅 user 对象有 opaque 语义） */
 fun JS_SetOpaque(ctx: JSContext, val1: JSValue, opaque: Any?) {
     if (!JS_IsPtr(val1)) return
     val ptr = JS_VALUE_TO_PTR(val1)
     if (ctx.memory.getMTag(ptr) != JS_MTAG_OBJECT) return
-    val classId = ctx.memory.getU8(ptr + 2)
-    if (classId >= JSObjectClassEnum.JS_CLASS_USER.value) {
-        ctx.userOpaqueTable[ptr] = opaque
-    }
+    ctx.userOpaqueTable[ptr] = opaque
 }
 
 fun JS_GetOpaque(ctx: JSContext, val1: JSValue): Any? {
     if (!JS_IsPtr(val1)) return null
     val ptr = JS_VALUE_TO_PTR(val1)
     if (ctx.memory.getMTag(ptr) != JS_MTAG_OBJECT) return null
-    val classId = ctx.memory.getU8(ptr + 2)
-    if (classId >= JSObjectClassEnum.JS_CLASS_USER.value) {
-        return ctx.userOpaqueTable[ptr]
-    }
-    return null
+    return ctx.userOpaqueTable[ptr]
 }
 
 /* 设置/读取用户对象的私有 JSValue（idx 从 0 开始，位于 opaque 占位槽之后）

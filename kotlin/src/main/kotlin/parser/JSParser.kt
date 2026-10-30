@@ -746,7 +746,31 @@ class JSParser(private val s: JSParseState) {
         val lvalueOp = getLastOp()
         val lvalueArg = getLastOpArg()
         removeLastOp()
-        
+
+        /* 数组元素（a[E] op= v）：obj/idx 已在栈顶，存临时槽后按需重载，
+         * 写回时 put_array_el 消费 [obj, idx, val]（idx 为运行期栈值，
+         * 不能像 put_field 那样编码进指令参数） */
+        if (lvalueOp == OPCodeEnum.OP_get_array_el.id) {
+            val tmpObj = ensureTmpVar()
+            val tmpIdx = ensureTmpVar()
+            val tmpVal = ensureTmpVar()
+            emitOpWithArg(OPCodeEnum.OP_put_loc, tmpIdx)   /* [obj] */
+            emitOpWithArg(OPCodeEnum.OP_put_loc, tmpObj)   /* [] */
+            emitOpWithArg(OPCodeEnum.OP_get_loc, tmpObj)
+            emitOpWithArg(OPCodeEnum.OP_get_loc, tmpIdx)
+            emitOp(OPCodeEnum.OP_get_array_el)             /* [old] */
+            s.nextToken()
+            if (!parseAssignExpr()) return false           /* [old, rhs] */
+            emitOp(binOp)                                  /* [new] */
+            emitOpWithArg(OPCodeEnum.OP_put_loc, tmpVal)   /* [] */
+            emitOpWithArg(OPCodeEnum.OP_get_loc, tmpObj)
+            emitOpWithArg(OPCodeEnum.OP_get_loc, tmpIdx)
+            emitOpWithArg(OPCodeEnum.OP_get_loc, tmpVal)   /* [obj, idx, new] */
+            emitOp(OPCodeEnum.OP_put_array_el)             /* [] 写回 */
+            emitOpWithArg(OPCodeEnum.OP_get_loc, tmpVal)   /* [new] 表达式值 */
+            return true
+        }
+
         /* 复合赋值需要读取旧值参与运算（槽目标也要读） */
         reemitLValueLoad(lvalueOp, lvalueArg, forCompound = true)
         
@@ -1236,6 +1260,44 @@ class JSParser(private val s: JSParseState) {
                     emitOp(deltaOp); emitOp(addOp)              /* [new] */
                     emitOpWithArg(OPCodeEnum.OP_put_loc, idx)   /* [] 写回 */
                     emitOpWithArg(OPCodeEnum.OP_get_loc, tmp)   /* [old] */
+                }
+            }
+            OPCodeEnum.OP_get_array_el.id -> {
+                /* 数组元素（a[E]++/--）：obj/idx 存临时槽（只求值一次），
+                 * put_array_el 消费 [obj, idx, val]，post 形式表达式值为旧值。
+                 * 先移除原 get_array_el 读取指令（保留其前面的 obj/idx 压栈指令，
+                 * 与 get_loc 分支"原读取指令留存"的处理不同：数组读取是消耗
+                 * obj/idx 的弹出式指令，留存会残留旧值破坏栈序） */
+                removeLastOp()
+                val tmpObj = ensureTmpVar()
+                val tmpIdx = ensureTmpVar()
+                val tmpVal = ensureTmpVar()
+                if (pre) {
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, tmpIdx)  /* [obj] */
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, tmpObj)  /* [] */
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmpObj)
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmpIdx)
+                    emitOp(OPCodeEnum.OP_get_array_el)            /* [old] */
+                    emitOp(deltaOp); emitOp(addOp)                /* [new] */
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, tmpVal)  /* [] */
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmpObj)
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmpIdx)
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmpVal)  /* [obj, idx, new] */
+                    emitOp(OPCodeEnum.OP_put_array_el)            /* [] 写回 */
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmpVal)  /* [new] */
+                } else {
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, tmpIdx)  /* [obj] */
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, tmpObj)  /* [] */
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmpObj)
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmpIdx)
+                    emitOp(OPCodeEnum.OP_get_array_el)            /* [old] */
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, tmpVal)  /* [] 存旧值 */
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmpObj)
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmpIdx)
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmpVal)
+                    emitOp(deltaOp); emitOp(addOp)                /* [obj, idx, new] */
+                    emitOp(OPCodeEnum.OP_put_array_el)            /* [] 写回 */
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, tmpVal)  /* [old] */
                 }
             }
             OPCodeEnum.OP_get_field.id -> {

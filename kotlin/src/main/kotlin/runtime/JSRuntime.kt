@@ -398,17 +398,40 @@ class JSRuntime(private val ctx: JSContext) {
                 OPCodeEnum.OP_array_from.id -> {
                     val argc = readU16(code, pc)
                     pc += 2
+                    /* JS_NewArray 的分配可能触发 GC 搬移：此刻元素仍在解释器栈上
+                     * （栈是 GC 根，随搬移自动更新），先建数组再取元素 */
                     val arr = JS_NewArray(ctx, argc)
-                    val arrPtr = JS_VALUE_TO_PTR(arr)
-                    val arrData = ctx.memory.getJSValue(arrPtr + 24)
-                    for (i in argc - 1 downTo 0) {
-                        val v = stack.removeLast()
+                    val keepBase = ctx.gcKeepAlive.size
+                    /* 元素先出栈入保活列表：随后补分配元素存储（见下）可能触发
+                     * GC 搬移，Kotlin 局部值会过期，保活列表中的值随搬移更新 */
+                    ctx.gcKeepAlive.add(arr)
+                    val elems = ArrayList<JSValue>(argc)
+                    for (i in 0 until argc) elems.add(stack.removeLast())
+                    for (e in elems) ctx.gcKeepAlive.add(e)
+
+                    /* JS_NewArray 不分配元素存储（arrData 为 JS_NULL）：补分配并
+                     * 写入元素（对照 C OP_array_from 的数组构造语义） */
+                    val arrKept = ctx.gcKeepAlive[keepBase]
+                    val arrPtr = JS_VALUE_TO_PTR(arrKept)
+                    var arrData = ctx.memory.getJSValue(arrPtr + 24)
+                    if (arrData == JS_NULL) {
+                        arrData = allocValueArray(argc)
                         if (arrData != JS_NULL) {
-                            val arrDataPtr = JS_VALUE_TO_PTR(arrData)
-                            ctx.memory.putJSValue(arrDataPtr + 8 + i * 8, v)
+                            ctx.memory.putJSValue(arrPtr + 24, arrData)
                         }
                     }
-                    stack.add(arr)
+                    if (arrData != JS_NULL) {
+                        val dataPtr = JS_VALUE_TO_PTR(arrData)
+                        /* elems[i] 为第 argc-1-i 个元素（出栈序与写入序相反） */
+                        for (j in 0 until argc) {
+                            ctx.memory.putJSValue(
+                                dataPtr + 8 + j * 8,
+                                ctx.gcKeepAlive[keepBase + 1 + (argc - 1 - j)]
+                            )
+                        }
+                    }
+                    while (ctx.gcKeepAlive.size > keepBase) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+                    stack.add(arrKept)
                 }
                 
                 OPCodeEnum.OP_get_field.id -> {
@@ -868,34 +891,42 @@ class JSRuntime(private val ctx: JSContext) {
         return ctx.memory.getString(ptr + 8, len)
     }
     
+    /* 读取对象属性：自身属性表 → 数组 length 回退 → 原型链。
+     * 数组 length 回退：本引擎解析器未实现 OP_get_length 特化（C 引擎的
+     * `.length` 走专用字节码），`.length` 会落到普通属性查找并得到 undefined，
+     * 在此补齐 ES 数组 length 语义（长度字段存于数组对象头 ptr+32） */
     fun getProperty(obj: JSValue, key: JSValue): JSValue {
         if (!JS_IsPtr(obj)) return JS_UNDEFINED
         val objPtr = JS_VALUE_TO_PTR(obj)
         if (ctx.memory.getMTag(objPtr) != JSMTags.JS_MTAG_OBJECT) return JS_UNDEFINED
-        
+
         val props = ctx.memory.getJSValue(objPtr + 16)
-        if (props == JS_NULL || props == ctx.emptyProps) return JS_UNDEFINED
-        
-        val propsPtr = JS_VALUE_TO_PTR(props)
-        val hashMask = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 16))
-        
-        val h = hashProp(key, hashMask)
-        var idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 24 + h * 8)) shr 1
-        
-        while (idx != 0) {
-            val propPtr = propsPtr + 8 + idx * 8
-            val propKey = ctx.memory.getJSValue(propPtr)
-            if (propKey == key || jsValueEquals(propKey, key)) {
-                return ctx.memory.getJSValue(propPtr + 8)
+        if (props != JS_NULL && props != ctx.emptyProps) {
+            val propsPtr = JS_VALUE_TO_PTR(props)
+            val hashMask = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 16))
+            val h = hashProp(key, hashMask)
+            var idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 24 + h * 8)) shr 1
+            while (idx != 0) {
+                val propPtr = propsPtr + 8 + idx * 8
+                val propKey = ctx.memory.getJSValue(propPtr)
+                if (propKey == key || jsValueEquals(propKey, key)) {
+                    return ctx.memory.getJSValue(propPtr + 8)
+                }
+                idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propPtr + 16)) shr 1
             }
-            idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propPtr + 16)) shr 1
         }
-        
+
+        val classId = ctx.memory.getU8(objPtr + 2)
+        if (classId == JSObjectClassEnum.JS_CLASS_ARRAY.value &&
+            JS_IsString(ctx, key) && jsGetString(ctx, key) == "length"
+        ) {
+            return JS_NewShortInt(ctx.memory.getI32(objPtr + 32))
+        }
+
         val proto = ctx.memory.getJSValue(objPtr + 8)
         if (proto != JS_NULL) {
             return getProperty(proto, key)
         }
-        
         return JS_UNDEFINED
     }
     
@@ -931,6 +962,14 @@ class JSRuntime(private val ctx: JSContext) {
             }
         }
         
+        /* 数组 length 回退（与 getProperty 保持一致，见其注释） */
+        val classIdHp = ctx.memory.getU8(objPtr + 2)
+        if (classIdHp == JSObjectClassEnum.JS_CLASS_ARRAY.value &&
+            JS_IsString(ctx, key) && jsGetString(ctx, key) == "length"
+        ) {
+            return true
+        }
+
         val proto = ctx.memory.getJSValue(objPtr + 8)
         if (proto != JS_NULL) {
             return hasProperty(proto, key)
@@ -1243,10 +1282,14 @@ class JSRuntime(private val ctx: JSContext) {
      * f_f 路径采用上游 49f1536 修复语义：参数转换异常时不得用计算结果覆盖异常值 */
     fun callCFunction(idx: Int, thisObj: JSValue, args: List<JSValue>,
                       callFlags: Int = 0, params: JSValue = JS_UNDEFINED): JSValue {
-        if (ctx.cFunctionTable == null || idx >= ctx.cFunctionTable.size) {
-            return JS_ThrowTypeError(ctx, "invalid c function index")
-        }
-        val def = ctx.cFunctionTable[idx]
+        /* 函数定义查找：先查建上下文时的定长基础表，超出范围再查桥接层扩展表
+         * （extFunctionTable 的槽位编号从基础表长度起算，见 JSContext 注释） */
+        val base = ctx.cFunctionTable
+        val def = if (base != null && idx < base.size) {
+            base[idx]
+        } else {
+            ctx.extFunctionTable.getOrNull(idx - (base?.size ?: 0))
+        } ?: return JS_ThrowTypeError(ctx, "invalid c function index")
         val callArgc = (args.size and FRAME_CF_ARGC_MASK) or callFlags
         val argv = args.toLongArray()
         return when (def.defType) {

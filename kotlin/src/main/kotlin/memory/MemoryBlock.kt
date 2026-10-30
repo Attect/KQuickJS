@@ -48,11 +48,17 @@ class MemoryBlock(val memory: Memory, val offset: Int) {
                 }
                 JSMTags.JS_MTAG_BYTE_ARRAY -> {
                     val size = memory.getI32(offset + 4)
-                    16 + ((size + JSW - 1) and (JSW - 1).inv())
+                    /* 与分配点 malloc(8 + size) 保持一致（修正原先按 16 起算导致
+                     * 块大小多算 8 字节、GC 堆遍历错位的缺陷） */
+                    8 + ((size + JSW - 1) and (JSW - 1).inv())
                 }
                 JSMTags.JS_MTAG_VALUE_ARRAY -> {
                     val size = memory.getI32(offset + 4)
-                    16 + size * JSW
+                    /* 与分配点 malloc(8 + size * JSW) 保持一致（allocProps /
+                     * allocValueArray / resizeValueArray / jsAllocValueArray /
+                     * JSContextFactory.emptyProps），
+                     * 修正原先多算 8 字节导致 GC 压缩后堆块错位的缺陷 */
+                    8 + size * JSW
                 }
                 JSMTags.JS_MTAG_FREE -> {
                     memory.getI32(offset + 4) * JSW + HEADER_SIZE

@@ -57,6 +57,7 @@ KQuickJS提供了完整的Kotlin实现，将JavaScript引擎移植到Kotlin/JVM�
 - 跨平台支持 (Windows/Linux/macOS)
 - 内存管理系统
 - 类型安全的值操作
+- **宿主方法桥接层**：builder式注册宿主函数与嵌套命名空间、JSValue↔Kotlin类型自动双向转换、异常双向桥接、宿主对象opaque+finalizer生命周期管理，零运行时反射（详见 [docs/kotlin_host_bridge.md](docs/kotlin_host_bridge.md)）
 
 ### 环境要求
 
@@ -126,6 +127,10 @@ kotlin/
 │   ├── JSGC.kt                  # 垃圾回收
 │   ├── JSObject.kt              # 对象实现
 │   ├── JSCFunctionDef.kt        # C函数定义
+│   ├── bridge/                  # 宿主桥接层
+│   │   ├── JSBridge.kt          # builder式注册（命名空间/函数/构造器/宿主对象）
+│   │   ├── JSBridgeConvert.kt   # JSValue↔Kotlin类型转换与异常类型
+│   │   └── JSPlatformExample.kt # platform命名空间完整示例
 │   ├── memory/
 │   │   ├── Memory.kt            # 内存管理
 │   │   └── MemoryBlock.kt       # 内存块
@@ -138,9 +143,36 @@ kotlin/
 └── build.gradle.kts             # 构建配置
 ```
 
+### 宿主桥接层简介
+
+KQuickJS Kotlin 实现内置宿主方法桥接层（`bridge/` 包），面向"JS 脚本调用 JVM
+宿主注入能力"的嵌入式场景：
+
+```kotlin
+val bridge = JSBridge(ctx)
+bridge.namespace("platform").apply {
+    function("http.get", "url", "timeoutMs") { _, url, timeoutMs ->
+        mapOf("status" to 200, "body" to "...")   // Kotlin Map 自动转 JS 对象
+    }
+}
+bridge.eval("platform.http.get('https://example.test', 100).status")  // 200
+```
+
+- **便捷注册**：`JS_NewContext` 后动态注册任意数量的宿主函数与嵌套命名空间
+  （如 `platform.http.get`），无需预建定长函数表；支持普通函数与构造器两种变体；
+- **类型转换**：null/Boolean/Int/Long/Double/String/ByteArray/List/Map 与 JSValue
+  自动双向转换，转换失败抛出可定位的 TypeError（含函数路径、参数名与实际类型）；
+- **异常桥接**：宿主异常转为对应 JS Error（不炸穿解释器调用栈）；JS 错误包装为
+  宿主可捕获的 `JSBridgeScriptException`（携带 message/stack）；
+- **宿主对象生命周期**：Kotlin 实例包装为 JS 对象，GC 搬移后引用保持正确，
+  对象回收时自动执行宿主清理回调；
+- **零反射**：全部基于 lambda 与显式注册，兼容 GraalVM Native Image；
+  宿主函数内长时间阻塞时 `interruptHandler` 无效，推荐"自带 timeout 参数 +
+  超时标记值"模式（详见 [docs/kotlin_host_bridge.md](docs/kotlin_host_bridge.md)）。
+
 ### 测试覆盖
 
-Kotlin实现包含124个测试用例，覆盖：
+Kotlin实现包含170个测试用例，覆盖：
 
 - 基础语言特性 (变量、运算符、表达式)
 - 控制流 (if/else、循环、switch)
@@ -148,6 +180,9 @@ Kotlin实现包含124个测试用例，覆盖：
 - 对象和数组操作
 - 内置函数 (Math、String、Array)
 - 异常处理
+- **宿主桥接层** (`JSBridgeTest`)：类型转换、命名空间与函数/构造器注册、
+  属性绑定近似、异常双向桥接、宿主对象生命周期（含 GC 搬移与 finalizer）、
+  platform 命名空间示例全链路
 
 ---
 
