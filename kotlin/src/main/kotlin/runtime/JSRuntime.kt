@@ -286,22 +286,21 @@ class JSRuntime(private val ctx: JSContext) {
                 }
                 
                 OPCodeEnum.OP_get_field2.id -> {
+                    /* 对照 C：sp-- 后 sp[0] = get_field(sp[0], atom)
+                     * —— 栈顶对象被保留，属性值压入其上（[obj] → [obj, value]），
+                     * 供方法调用把 obj 作为 this 使用 */
                     val idx = readU16(code, pc)
                     pc += 2
-                    if (stack.size < 2) {
+                    if (stack.isEmpty()) {
                         return JS_EXCEPTION
                     }
-                    // 对应C语言的sp--和sp[0] = sp[1]
-                    // 在Kotlin中，我们需要移除栈顶元素，然后获取新的栈顶元素
-                    val obj = stack[stack.size - 2] // 获取原来的栈顶下一个元素
-                    stack.removeLast() // 移除栈顶元素
+                    val obj = stack.last()
                     val cpool = ctx.memory.getJSValue(funcPtr + 24)
                     val key = if (cpool != JS_NULL) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
                         ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
                     } else JS_UNDEFINED
-                    val val1 = getProperty(obj, key)
-                    stack[stack.size - 1] = val1 // 用属性值替换栈顶的对象
+                    stack.add(getProperty(obj, key))
                 }
                 
                 OPCodeEnum.OP_put_field.id -> {
@@ -397,7 +396,15 @@ class JSRuntime(private val ctx: JSContext) {
                         args.add(0, stack.removeLast())
                     }
                     val funcVal = stack.removeLast()
-                    stack.add(callFunction(funcVal, args))
+                    val r = callFunction(funcVal, args)
+                    if (JS_IsException(r) && JS_HasException(ctx)) {
+                        /* 调用产生异常：本帧展开，命中 catch 则继续执行（对照 C call_exception） */
+                        val target = unwindToCatch(stack)
+                        if (target < 0) return JS_EXCEPTION
+                        pc = target
+                    } else {
+                        stack.add(r)
+                    }
                 }
                 
                 OPCodeEnum.OP_call_method.id -> {
@@ -409,7 +416,14 @@ class JSRuntime(private val ctx: JSContext) {
                     }
                     val funcVal = stack.removeLast()
                     val thisObj = stack.removeLast()
-                    stack.add(callMethod(funcVal, thisObj, args))
+                    val r = callMethod(funcVal, thisObj, args)
+                    if (JS_IsException(r) && JS_HasException(ctx)) {
+                        val target = unwindToCatch(stack)
+                        if (target < 0) return JS_EXCEPTION
+                        pc = target
+                    } else {
+                        stack.add(r)
+                    }
                 }
                 
                 OPCodeEnum.OP_call_constructor.id -> {
@@ -420,7 +434,46 @@ class JSRuntime(private val ctx: JSContext) {
                         args.add(0, stack.removeLast())
                     }
                     val funcVal = stack.removeLast()
-                    stack.add(callConstructor(funcVal, args))
+                    val r = callConstructor(funcVal, args)
+                    if (JS_IsException(r) && JS_HasException(ctx)) {
+                        val target = unwindToCatch(stack)
+                        if (target < 0) return JS_EXCEPTION
+                        pc = target
+                    } else {
+                        stack.add(r)
+                    }
+                }
+                
+                OPCodeEnum.OP_catch.id -> {
+                    /* 压入 catch 目标偏移（对照 C：JS_VALUE_MAKE_SPECIAL(JS_TAG_CATCH_OFFSET, 目标)），
+                     * 异常展开时该值被替换为异常本身 */
+                    val diff = readI32(code, pc)
+                    pc += 4
+                    stack.add(JS_VALUE_MAKE_SPECIAL(JSTags.JS_TAG_CATCH_OFFSET, pc + diff))
+                }
+                
+                OPCodeEnum.OP_throw.id -> {
+                    /* 弹出异常值并抛出，转入本帧异常处理（对照 C OP_throw → goto exception） */
+                    val ex = stack.removeLast()
+                    JS_Throw(ctx, ex)
+                    val target = unwindToCatch(stack)
+                    if (target < 0) return JS_EXCEPTION
+                    pc = target
+                }
+                
+                OPCodeEnum.OP_gosub.id -> {
+                    /* 压入返回地址后跳转（finally 机制，对照 C OP_gosub） */
+                    val diff = readI32(code, pc)
+                    pc += 4
+                    stack.add(JS_NewShortInt(pc))
+                    pc += diff
+                }
+                
+                OPCodeEnum.OP_ret.id -> {
+                    /* 从 finally 返回（对照 C OP_ret：栈顶为 ShortInt 返回地址） */
+                    val ret = stack.removeLast()
+                    if (!JS_IsInt(ret)) return JS_EXCEPTION
+                    pc = JS_VALUE_GET_INT(ret)
                 }
             }
         }
@@ -430,6 +483,31 @@ class JSRuntime(private val ctx: JSContext) {
     
     private fun readU16(code: ByteArray, pc: Int): Int {
         return (code[pc].toInt() and 0xFF) or ((code[pc + 1].toInt() and 0xFF) shl 8)
+    }
+    
+    /* 本帧异常展开（对照 C JS_Call 的 exception 标签）：
+     * 从栈顶向栈底扫描本帧操作数栈中的 CATCH_OFFSET 值。
+     * 找到：用异常值替换该槽并截断其上内容，返回 catch 目标 pc（调用方继续执行）；
+     * 未找到：清空本帧栈，返回 -1（向上传播）；
+     * 异常不可捕获时不清异常状态、直接向上传播（对照 C sp = stack_top 分支） */
+    private fun unwindToCatch(stack: MutableList<JSValue>): Int {
+        if (ctx.currentExceptionIsUncatchable) {
+            stack.clear()
+            return -1
+        }
+        for (i in stack.indices.reversed()) {
+            val v = stack[i]
+            if (JS_VALUE_GET_SPECIAL_TAG(v) == JSTags.JS_TAG_CATCH_OFFSET) {
+                val target = JS_VALUE_GET_SPECIAL_VALUE(v)
+                stack[i] = ctx.currentException
+                while (stack.size > i + 1) stack.removeAt(stack.size - 1)
+                ctx.currentException = JS_UNINITIALIZED
+                ctx.currentExceptionIsUncatchable = false
+                return target
+            }
+        }
+        stack.clear()
+        return -1
     }
     
     private fun readI32(code: ByteArray, pc: Int): Int {
@@ -853,14 +931,15 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun callFunction(func: JSValue, args: List<JSValue>): JSValue {
-        if (!JS_IsPtr(func)) return JS_EXCEPTION
+        if (!JS_IsPtr(func)) return JS_ThrowTypeError(ctx, "not a function")
         val funcPtr = JS_VALUE_TO_PTR(func)
         
         if (ctx.memory.getMTag(funcPtr) == JSMTags.JS_MTAG_OBJECT) {
             val classId = ctx.memory.getU8(funcPtr + 2)
             if (classId == JSObjectClassEnum.JS_CLASS_C_FUNCTION.value) {
                 val funcIdx = ctx.memory.getI32(funcPtr + 24)
-                return callCFunction(funcIdx, ctx.globalObj, args)
+                val params = ctx.memory.getJSValue(funcPtr + 28)
+                return callCFunction(funcIdx, ctx.globalObj, args, 0, params)
             }
         }
         
@@ -868,45 +947,72 @@ class JSRuntime(private val ctx: JSContext) {
             return run(func)
         }
         
-        return JS_EXCEPTION
+        return JS_ThrowTypeError(ctx, "not a function")
     }
     
     fun callMethod(func: JSValue, thisObj: JSValue, args: List<JSValue>): JSValue {
-        if (!JS_IsPtr(func)) return JS_EXCEPTION
+        if (!JS_IsPtr(func)) return JS_ThrowTypeError(ctx, "not a function")
         val funcPtr = JS_VALUE_TO_PTR(func)
         
         if (ctx.memory.getMTag(funcPtr) == JSMTags.JS_MTAG_OBJECT) {
             val classId = ctx.memory.getU8(funcPtr + 2)
             if (classId == JSObjectClassEnum.JS_CLASS_C_FUNCTION.value) {
                 val funcIdx = ctx.memory.getI32(funcPtr + 24)
-                return callCFunction(funcIdx, thisObj, args)
+                val params = ctx.memory.getJSValue(funcPtr + 28)
+                return callCFunction(funcIdx, thisObj, args, 0, params)
             }
         }
         
         return callFunction(func, args)
     }
     
+    /* 构造器调用（对照 C OP_call_constructor：call_flags |= FRAME_CF_CTOR）：
+     * - C 构造器：this 为 JS_UNDEFINED（对照 C generic_function_call 压入的 this），
+     *   argc 带 FRAME_CF_CTOR 位，返回值直接作为 new 结果
+     * - 非 C 函数对象：回退普通调用（JS 构造器的 this 传递未实现，见 docs 缺口清单） */
     fun callConstructor(func: JSValue, args: List<JSValue>): JSValue {
-        if (!JS_IsPtr(func)) return JS_EXCEPTION
+        if (!JS_IsPtr(func)) return JS_ThrowTypeError(ctx, "not a constructor")
         val funcPtr = JS_VALUE_TO_PTR(func)
         
         if (ctx.memory.getMTag(funcPtr) == JSMTags.JS_MTAG_OBJECT) {
             val classId = ctx.memory.getU8(funcPtr + 2)
             if (classId == JSObjectClassEnum.JS_CLASS_C_FUNCTION.value) {
-                return JS_NewObject(ctx)
+                val funcIdx = ctx.memory.getI32(funcPtr + 24)
+                val params = ctx.memory.getJSValue(funcPtr + 28)
+                return callCFunction(funcIdx, JS_UNDEFINED, args, FRAME_CF_CTOR, params)
             }
         }
         
         return callFunction(func, args)
     }
     
-    fun callCFunction(idx: Int, thisObj: JSValue, args: List<JSValue>): JSValue {
-        if (ctx.cFunctionTable == null || idx >= ctx.cFunctionTable.size) return JS_UNDEFINED
-        val def = ctx.cFunctionTable[idx]
-        if (def.func != null) {
-            return def.func.invoke(ctx, thisObj, args.size, args.toLongArray())
+    /* 调用 C 函数（对照 C JS_Call 的 c_function 路径）：
+     * 按 defType 分发到对应的函数形态；callFlags 携带 FRAME_CF_CTOR 等调用标志，
+     * 传给 C 函数的 argc 同时包含个数与标志位（对照 C call_flags & (CTOR | ARGC_MASK)）。
+     * f_f 路径采用上游 49f1536 修复语义：参数转换异常时不得用计算结果覆盖异常值 */
+    fun callCFunction(idx: Int, thisObj: JSValue, args: List<JSValue>,
+                      callFlags: Int = 0, params: JSValue = JS_UNDEFINED): JSValue {
+        if (ctx.cFunctionTable == null || idx >= ctx.cFunctionTable.size) {
+            return JS_ThrowTypeError(ctx, "invalid c function index")
         }
-        return JS_UNDEFINED
+        val def = ctx.cFunctionTable[idx]
+        val callArgc = (args.size and FRAME_CF_ARGC_MASK) or callFlags
+        val argv = args.toLongArray()
+        return when (def.defType) {
+            JSCFunctionDefEnum.JS_CFUNC_generic.value,
+            JSCFunctionDefEnum.JS_CFUNC_constructor.value ->
+                def.func?.invoke(ctx, thisObj, callArgc, argv) ?: JS_UNDEFINED
+            JSCFunctionDefEnum.JS_CFUNC_generic_magic.value,
+            JSCFunctionDefEnum.JS_CFUNC_constructor_magic.value ->
+                def.funcMagic?.invoke(ctx, thisObj, callArgc, argv, def.magic) ?: JS_UNDEFINED
+            JSCFunctionDefEnum.JS_CFUNC_generic_params.value ->
+                def.funcParams?.invoke(ctx, thisObj, callArgc, argv, params) ?: JS_UNDEFINED
+            JSCFunctionDefEnum.JS_CFUNC_f_f.value -> {
+                val d = JS_ToNumber(ctx, args.getOrElse(0) { JS_UNDEFINED })
+                JS_NewFloat64(ctx, def.funcFF?.invoke(d) ?: Double.NaN)
+            }
+            else -> JS_UNDEFINED
+        }
     }
     
     fun allocProps(n: Int): JSValue {

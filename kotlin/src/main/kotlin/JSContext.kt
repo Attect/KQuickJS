@@ -163,10 +163,22 @@ class JSContext(
         return ex
     }
     
+    /* 抛出错误对象（对照 C JS_ThrowError）：
+     * 创建 class_id = JS_CLASS_ERROR 的对象，proto 取具体错误类的 class_proto，
+     * extra 槽 0 = message 字符串、槽 1 = stack。
+     * build_backtrace 机制尚未实现，stack 槽恒为 JS_NULL */
     fun throwError(errorClass: JSObjectClassEnum, message: String): JSValue {
-        // TODO: Implement error creation
-        currentException = JS_UNINITIALIZED
-        return JS_EXCEPTION
+        val msg = JS_NewString(this, message)
+        if (JS_IsException(msg)) return JS_EXCEPTION
+        pushValue(msg)
+        val errorObj = JS_NewObjectProtoClass(this, classProto[errorClass.value],
+                                              JSObjectClassEnum.JS_CLASS_ERROR.value, 2)
+        val msgKept = popValue()
+        if (JS_IsException(errorObj)) return JS_EXCEPTION
+        val ptr = JS_VALUE_TO_PTR(errorObj)
+        memory.putJSValue(ptr + 24, msgKept)      /* 槽 0: message */
+        memory.putJSValue(ptr + 32, JS_NULL)      /* 槽 1: stack */
+        return JS_Throw(this, errorObj)
     }
     
     fun getAtom(a: Int): JSValue {

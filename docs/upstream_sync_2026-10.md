@@ -66,20 +66,32 @@
 5. **GC thread/update 缺 `JS_CLASS_C_FUNCTION` 分支**：C 函数的 params 指针不经压缩更新，已补齐。
 6. **`JS_SetOpaque/JS_GetOpaque` 存储位置错误**：原先写到 `ctx.opaque`（context 级单值），与 C 的 per-object（`p->u.user.opaque`）语义不符。已改为 `JSContext.userOpaqueTable`（按对象地址索引，GC 搬移时随块更新 key，对象释放时清理条目）。
 
-## 四、已知缺口（本次未处理，后续跟进）
+## 四、已知缺口（后续跟进）
+
+以下缺口已在第二轮同步中补齐（对照 C 原版实现）：
+
+| 缺口 | 状态 |
+|------|------|
+| `callCFunction` 未按 `defType` 分发 | ✅ 已实现：generic/constructor/generic_magic/constructor_magic/generic_params/f_f 全分发，argc 携带 `FRAME_CF_CTOR` 等调用标志；f_f 采用上游 `49f1536` 语义 |
+| `throwError` 为 TODO | ✅ 已实现：错误对象（class_id=JS_CLASS_ERROR，message/stack 槽）+ `JS_ThrowTypeError` 等系列包装 + `JS_ThrowUncatchable`；`JS_IsError` 修正为恒等判断（对照 C） |
+| `OP_catch`/`OP_throw` 执行逻辑缺失 | ✅ 已实现：`OP_catch`（压 CATCH_OFFSET）/`OP_throw`/`OP_gosub`/`OP_ret` + `unwindToCatch` 本帧异常展开（catch 命中恢复执行、uncatchable 直接传播）；parser try/catch/finally 重写（catch 变量绑定、catch2 保护重抛、gosub/finally） |
+| Date 的 JS 层暴露 | ✅ 已实现：最小 stdlib 注册（`OP_new` 走 C 构造器路径 + `FRAME_CF_CTOR`），`new Date(ms)` / `Date.now()` 在 JS 层可用 |
+
+仍然存在的缺口：
 
 | 缺口 | 位置 | 说明 |
 |------|------|------|
-| `callCFunction` 未按 `defType` 分发 | `JSRuntime.callCFunction` | `generic_magic` / `constructor` / `f_f` 等类型均走 generic 调用；实现分发时须采用上游 `49f1536` 的语义（异常时不得覆盖返回值） |
-| `throwError` 为 TODO | `JSContext.throwError` | 未创建错误对象，仅占位返回异常 |
-| `OP_catch` / `OP_throw` 执行逻辑缺失 | `JSRuntime` | parser 已发射指令但 runtime 无对应分支；实现时 catch 后应置 `currentException = JS_UNINITIALIZED` |
+| 属性自增/自减写回缺失 | parser | `a.x++` 读值后不写回（无 put_lvalue 机制），`testObjectPropertyIncrement` 已对齐现状（断言旧值 1）；实现写回后改断言为 2 |
+| 方法调用的 this 仅限全局对象 | `JSRuntime.run` | `OP_push_this` 恒压 `ctx.globalObj`，`obj.m()` 的 this（call_method 传入）未接入执行栈；JS 构造器的 this/proto 绑定同样未实现 |
+| build_backtrace 未实现 | `JSContext.throwError` | 错误对象 stack 槽恒为 JS_NULL |
 | GC 未处理 `JS_CLASS_REGEXP` / ERROR / TYPED_ARRAY | `JSGC` | 这些内建类尚未在 Kotlin 实现，实现时需同步补 GC 分支（对照 C 的 source/bytecode/message/stack 等） |
 | 属性表 rehash 未做 | 压缩后 | C 版压缩后有 `js_rehash_props`；Kotlin 的属性 hash 若基于字符串哈希则无需，需在实现属性查找时确认 |
 | 顶层调用不追调返回的闭包 | `JSRuntime.callFunction` | 脚本 `f()()` 返回内层函数指针而非求值结果（与 GC 无关的既有行为） |
+| `f_f` 参数转换异常路径 | `callCFunction` | Kotlin 的 `JS_ToNumber` 为纯转换（不产生异常），上游 `49f1536` 的异常优先结构已按 C 形态实现，但异常分支待 `JS_ToNumber` 异常化后生效 |
 
 ## 五、验证
 
-- 回归测试：`kotlin/src/test/kotlin/GCTest.kt`（9 个用例）
+- 回归测试：`kotlin/src/test/kotlin/GCTest.kt`（13 个用例）
   - 死对象回收（压缩后堆收缩）
   - finalizer 保活不调用 / 释放后收到 opaque 并清理侧表
   - user value 经 GC 搬移存活（依赖 user values 标记分支）
@@ -88,7 +100,12 @@
   - `JS_IsArray` / ContextOpaque 公共 API
   - `JS_NewDate` + valueOf + Date 对象 GC 搬移后数据完好
   - 宿主层 Date 构造器（无参当前时间 / 数值参数 / 标志位剥离 / 非法参数）
-- 全量构建：`./gradlew build -x nativeBuild` 通过，共 132 个测试 0 失败
+  - try/catch/finally 语义（catch 变量绑定、正常路径、catch 后 finally）
+  - 异常重抛（无 catch 的 finally、catch 块内重抛、跨函数展开）
+  - 错误对象创建（throwError / 包装类 / JS_IsError / 槽布局）
+  - `callCFunction` defType 分发（f_f、constructor 的 CTOR 标志位）
+  - Date JS 层集成（Date.now / new Date / 普通调用）
+- 全量构建：`./gradlew build -x nativeBuild` 通过，共 137 个测试 0 失败
 
 ## 六、测试注意事项（值会移动）
 

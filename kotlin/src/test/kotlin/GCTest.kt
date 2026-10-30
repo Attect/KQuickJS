@@ -261,4 +261,164 @@ class GCTest {
         assertTrue(!JS_IsException(rb), "call after gc should succeed")
         assertEquals(ra, rb, "gc compaction must not change program behavior")
     }
+    
+    /* JS 层脚本求值辅助（RETVAL 模式） */
+    private fun evalExpr(ctx: JSContext, code: String): JSValue {
+        val state = JSParseState(ctx, code.toByteArray(), "test.js", JS_EVAL_RETVAL)
+        val result = JSParser(state).parse()
+        if (JS_IsException(result)) return JS_EXCEPTION
+        return JSRuntime(ctx).callFunction(result, emptyList())
+    }
+    
+    @Test
+    fun testThrowCatchSemantics() {
+        /* catch 变量绑定异常值 */
+        val ctx1 = createContext()
+        val r1 = evalExpr(ctx1, "var r = 0; try { throw 42 } catch (e) { r = e } r")
+        assertTrue(!JS_IsException(r1))
+        assertEquals(42, JS_VALUE_GET_INT(r1))
+        
+        /* try 正常完成时不进 catch，finally 顺序执行 */
+        val ctx2 = createContext()
+        val r2 = evalExpr(ctx2, "var r = 0; try { r = 5 } finally { r = r + 1 } r")
+        assertTrue(!JS_IsException(r2))
+        assertEquals(6, JS_VALUE_GET_INT(r2))
+        
+        /* catch 后执行 finally */
+        val ctx3 = createContext()
+        val r3 = evalExpr(ctx3, "var r = 0; try { throw 7 } catch (e) { r = e } finally { r = r + 1 } r")
+        assertTrue(!JS_IsException(r3))
+        assertEquals(8, JS_VALUE_GET_INT(r3))
+    }
+    
+    @Test
+    fun testThrowFinallyAndRethrow() {
+        /* 无 catch：finally 执行后异常重抛（异常值保留在 currentException） */
+        val ctx1 = createContext()
+        val r1 = evalExpr(ctx1, "var r = 0; try { r = 1; throw 9 } finally { r = r + 10 }")
+        assertTrue(JS_IsException(r1), "uncaught throw should propagate")
+        assertTrue(JS_HasException(ctx1))
+        val ex1 = JS_GetException(ctx1)
+        assertEquals(9, JS_VALUE_GET_INT(ex1))
+        
+        /* catch 块内抛出新异常：经 catch2 保护执行（重抛新值） */
+        val ctx2 = createContext()
+        val r2 = evalExpr(ctx2, "try { throw 1 } catch (e) { throw 2 }")
+        assertTrue(JS_IsException(r2))
+        assertTrue(JS_HasException(ctx2))
+        val ex2 = JS_GetException(ctx2)
+        assertEquals(2, JS_VALUE_GET_INT(ex2))
+        
+        /* 外层 try 捕获内层函数抛出的异常（跨函数展开） */
+        val ctx3 = createContext()
+        val r3 = evalExpr(ctx3, "var r = 0; var f = function() { throw 77 }; try { f() } catch (e) { r = e } r")
+        assertTrue(!JS_IsException(r3))
+        assertEquals(77, JS_VALUE_GET_INT(r3))
+    }
+    
+    @Test
+    fun testErrorObjectCreation() {
+        val ctx = createContext()
+        
+        /* throwError 创建 JS_CLASS_ERROR 对象（class_id 恒为 ERROR，message 存槽 0） */
+        val r = ctx.throwError(JSObjectClassEnum.JS_CLASS_TYPE_ERROR, "boom")
+        assertTrue(JS_IsException(r))
+        assertTrue(JS_HasException(ctx))
+        
+        val ex = JS_GetException(ctx)
+        assertTrue(JS_IsError(ctx, ex), "thrown error object should be an Error")
+        assertEquals(JSObjectClassEnum.JS_CLASS_ERROR.value, JS_GetClassID(ctx, ex))
+        val exPtr = JS_VALUE_TO_PTR(ex)
+        val msg = ctx.memory.getJSValue(exPtr + 24)
+        assertTrue(JS_IsString(ctx, msg))
+        assertEquals("boom", jsGetString(ctx, msg))
+        val stackVal = ctx.memory.getJSValue(exPtr + 32)
+        assertEquals(JS_NULL, stackVal)  /* backtrace 未实现，stack 恒为 JS_NULL */
+        
+        /* GetException 后异常状态被清除 */
+        assertTrue(!JS_HasException(ctx))
+        
+        /* 便捷包装类 */
+        JS_ThrowTypeError(ctx, "bad type")
+        assertTrue(JS_IsError(ctx, JS_GetException(ctx)))
+        JS_ThrowInternalError(ctx, "internal")
+        assertTrue(JS_IsError(ctx, JS_GetException(ctx)))
+    }
+    
+    @Test
+    fun testCallCFunctionDispatch() {
+        /* f_f 分发：3 * 3 = 9 */
+        val ffCtx = createContext(
+            cFunctions = arrayOf(
+                JSCFunctionDef(funcFF = { d -> d * d }, defType = JSCFunctionDefEnum.JS_CFUNC_f_f.value)
+            )
+        )
+        val r = JSRuntime(ffCtx).callCFunction(0, JS_NULL, listOf(JS_NewShortInt(3)))
+        assertTrue(JS_IsNumber(ffCtx, r))
+        assertEquals(9.0, JS_ToNumber(ffCtx, r), 1e-9)
+        
+        /* constructor defType 收到的 argc 带 FRAME_CF_CTOR 标志位 */
+        val recorded = IntArray(1) { -1 }
+        val ctorCtx = createContext(
+            cFunctions = arrayOf(
+                JSCFunctionDef(func = { _, _, argc, _ -> recorded[0] = argc; JS_UNDEFINED },
+                               defType = JSCFunctionDefEnum.JS_CFUNC_constructor.value)
+            )
+        )
+        JSRuntime(ctorCtx).callCFunction(0, JS_NULL, listOf(JS_NewShortInt(1), JS_NewShortInt(2)), FRAME_CF_CTOR)
+        assertEquals(FRAME_CF_CTOR or 2, recorded[0])
+    }
+    
+    /* 支持自定义 C 函数表的 createContext 重载 */
+    private fun createContext(cFunctions: Array<JSCFunctionDef>): JSContext {
+        val memSize = 65536
+        val mem = ByteArray(memSize)
+        val stdlib = JSSTDLibraryDef(
+            stdlibTable = LongArray(0),
+            cFunctionTable = cFunctions,
+            cFinalizerTable = emptyArray(),
+            stdlibTableLen = 0,
+            stdlibTableAlign = 8,
+            sortedAtomsOffset = 0,
+            globalObjectOffset = 0,
+            classCount = userClassId + 1
+        )
+        return JS_NewContext(mem, memSize, stdlib)
+    }
+    
+    @Test
+    fun testDateJsIntegration() {
+        /* 带最小 Date stdlib 的 context（对照 MQuickJS.createContext 的注册逻辑） */
+        val ctx = createContext(
+            cFunctions = arrayOf(
+                JSCFunctionDef(func = { c, _, argc, argv -> MQuickJS.mqjsDateConstructor(c, argc, argv) },
+                               defType = JSCFunctionDefEnum.JS_CFUNC_constructor.value, argCount = 1),
+                JSCFunctionDef(func = { c, _, _, _ -> JS_NewFloat64(c, System.currentTimeMillis().toDouble()) },
+                               defType = JSCFunctionDefEnum.JS_CFUNC_generic.value, argCount = 0)
+            )
+        )
+        val runtime = JSRuntime(ctx)
+        val dateFunc = JS_NewCFunctionParams(ctx, 0, JS_NULL)
+        assertTrue(!JS_IsException(dateFunc))
+        runtime.setProperty(ctx.globalObj, JS_NewString(ctx, "Date"), dateFunc)
+        val nowFunc = JS_NewCFunctionParams(ctx, 1, JS_NULL)
+        assertTrue(!JS_IsException(nowFunc))
+        runtime.setProperty(dateFunc, JS_NewString(ctx, "now"), nowFunc)
+        
+        /* Date.now() 返回宿主时钟毫秒（方法调用：get_field2 + call_method） */
+        val now = evalExpr(ctx, "Date.now()")
+        assertTrue(!JS_IsException(now), "Date.now() should work")
+        assertTrue(JS_ToNumber(ctx, now) > 1_000_000_000_000.0, "Date.now() should be epoch ms")
+        
+        /* new Date(ms) 走 C 构造器路径 */
+        val d = evalExpr(ctx, "new Date(1000)")
+        assertTrue(JS_IsPtr(d), "new Date(ms) should return an object")
+        assertEquals(JSObjectClassEnum.JS_CLASS_DATE.value, JS_GetClassID(ctx, d))
+        assertEquals(1000.0, JS_ToNumber(ctx, jsDateValueOf(ctx, d)), 1e-6)
+        
+        /* Date 构造器可被普通调用（不带 new） */
+        val d2 = evalExpr(ctx, "Date(2000)")
+        assertTrue(!JS_IsException(d2))
+        assertEquals(JSObjectClassEnum.JS_CLASS_DATE.value, JS_GetClassID(ctx, d2))
+    }
 }

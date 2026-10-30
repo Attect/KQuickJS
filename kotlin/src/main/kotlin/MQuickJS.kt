@@ -215,9 +215,17 @@ usage: mqjs [options] [file [args]]
     
     private fun createContext(memSize: Int): JSContext {
         val mem = ByteArray(memSize)
+        /* 最小 stdlib：Date 构造器与 Date.now（对照 C mqjs_stdlib.c 的 js_date 表） */
         val stdlib = JSSTDLibraryDef(
             stdlibTable = LongArray(0),
-            cFunctionTable = emptyArray(),
+            cFunctionTable = arrayOf(
+                /* funcIdx 0: Date 构造器 */
+                JSCFunctionDef(func = { c, _, argc, argv -> mqjsDateConstructor(c, argc, argv) },
+                               defType = JSCFunctionDefEnum.JS_CFUNC_constructor.value, argCount = 1),
+                /* funcIdx 1: Date.now */
+                JSCFunctionDef(func = { c, _, _, _ -> JS_NewFloat64(c, System.currentTimeMillis().toDouble()) },
+                               defType = JSCFunctionDefEnum.JS_CFUNC_generic.value, argCount = 0)
+            ),
             cFinalizerTable = emptyArray(),
             stdlibTableLen = 0,
             stdlibTableAlign = 8,
@@ -225,7 +233,20 @@ usage: mqjs [options] [file [args]]
             globalObjectOffset = 0,
             classCount = JSObjectClassEnum.JS_CLASS_USER.value
         )
-        return JS_NewContext(mem, memSize, stdlib)
+        val ctx = JS_NewContext(mem, memSize, stdlib)
+        
+        /* 注册全局 Date 对象并挂载 Date.now（对照 C js_date 类注册） */
+        val dateFunc = JS_NewCFunctionParams(ctx, 0, JS_NULL)
+        if (!JS_IsException(dateFunc)) {
+            val runtime = JSRuntime(ctx)
+            runtime.setProperty(ctx.globalObj, JS_NewString(ctx, "Date"), dateFunc)
+            val nowFunc = JS_NewCFunctionParams(ctx, 1, JS_NULL)
+            if (!JS_IsException(nowFunc)) {
+                runtime.setProperty(dateFunc, JS_NewString(ctx, "now"), nowFunc)
+            }
+        }
+        
+        return ctx
     }
     
     private fun compileFile(filename: String, outFilename: String, memSize: Int, dumpMemory: Int, parseFlags: Int) {
@@ -313,7 +334,22 @@ usage: mqjs [options] [file [args]]
         val runtimeResult = runtime.callFunction(result, emptyList())
         
         if (JS_IsException(runtimeResult)) {
-            System.err.println("Runtime error")
+            /* 打印未捕获异常（对照 mqjs.c 的异常报告） */
+            if (JS_HasException(ctx)) {
+                val ex = JS_GetException(ctx)
+                if (JS_IsError(ctx, ex)) {
+                    val exPtr = JS_VALUE_TO_PTR(ex)
+                    val msg = ctx.memory.getJSValue(exPtr + 24)  /* 槽 0: message */
+                    val msgStr = if (JS_IsString(ctx, msg)) jsGetString(ctx, msg) else ""
+                    System.err.println("Uncaught Error: $msgStr")
+                } else if (JS_IsString(ctx, ex)) {
+                    System.err.println("Uncaught \"${jsGetString(ctx, ex)}\"")
+                } else {
+                    System.err.println("Uncaught exception")
+                }
+            } else {
+                System.err.println("Runtime error")
+            }
             return false
         }
         

@@ -360,34 +360,76 @@ class JSParser(private val s: JSParseState) {
     fun parseTry(): Boolean {
         s.nextToken()
         
-        emitOp(OPCodeEnum.OP_undefined)
-        
-        val catchPos = emitJump(OPCodeEnum.OP_catch)
+        /* 对照 C js_parse_statement 的 try 编译：
+         * - try 块前 OP_catch 压入 catch 目标偏移（异常时由 VM 替换为异常值）
+         * - 正常路径丢弃 offset 后经 gosub 执行 finally
+         * - catch(e) 将异常值存入局部变量；catch 块内异常经 catch2 保护后重抛
+         * - 无 catch 的 finally 在异常路径 gosub 后重抛 */
+        val jumpsToFinally = mutableListOf<Int>()
+        val jumpsToEnd = mutableListOf<Int>()
+        val labelCatch = emitJump(OPCodeEnum.OP_catch)
         
         if (!parseBlock()) return false
         
-        val endPos = emitJump(OPCodeEnum.OP_goto)
+        emitOp(OPCodeEnum.OP_drop)                         /* 丢弃 catch offset */
+        emitOp(OPCodeEnum.OP_undefined)                    /* 占位保持栈平衡 */
+        jumpsToFinally.add(emitJump(OPCodeEnum.OP_gosub))
+        emitOp(OPCodeEnum.OP_drop)                         /* 丢弃 gosub 返回地址 */
+        jumpsToEnd.add(emitJump(OPCodeEnum.OP_goto))
         
-        patchJump(catchPos)
+        var hasCatch = false
+        var labelCatch2 = -1
         
         if (s.token.val1 == JSTokenVal.TOK_CATCH.value) {
+            hasCatch = true
             s.nextToken()
             expect('('.code)
             if (s.token.val1 != JSTokenVal.TOK_IDENT.value) {
                 s.error("expected identifier")
                 return false
             }
+            val name = s.token.value
+            val catchVarIdx = addLocalVar(name)
             s.nextToken()
             expect(')'.code)
+            
+            /* label_catch：异常值已由 VM 压入栈顶，存入 catch 变量 */
+            patchJump(labelCatch)
+            emitOpWithArg(OPCodeEnum.OP_put_loc, catchVarIdx)
+            labelCatch2 = emitJump(OPCodeEnum.OP_catch)    /* catch 块内异常保护 */
+            
             if (!parseBlock()) return false
+            
+            emitOp(OPCodeEnum.OP_drop)                     /* 丢弃 catch2 offset */
+            emitOp(OPCodeEnum.OP_undefined)
+            jumpsToFinally.add(emitJump(OPCodeEnum.OP_gosub))
+            emitOp(OPCodeEnum.OP_drop)
+            jumpsToEnd.add(emitJump(OPCodeEnum.OP_goto))
+            
+            /* label_catch2：catch 块内抛出的异常（异常值在栈顶）执行 finally 后重抛 */
+            patchJump(labelCatch2)
+            jumpsToFinally.add(emitJump(OPCodeEnum.OP_gosub))
+            emitOp(OPCodeEnum.OP_throw)
+        } else if (s.token.val1 == JSTokenVal.TOK_FINALLY.value) {
+            /* 无 catch 的 finally：异常路径执行 finally 后重抛 */
+            patchJump(labelCatch)
+            jumpsToFinally.add(emitJump(OPCodeEnum.OP_gosub))
+            emitOp(OPCodeEnum.OP_throw)
+        } else {
+            s.error("expecting catch or finally")
+            return false
         }
         
+        /* label_finally：所有 gosub 汇合（栈顶为 gosub 返回地址） */
+        for (pos in jumpsToFinally) patchJump(pos)
         if (s.token.val1 == JSTokenVal.TOK_FINALLY.value) {
             s.nextToken()
             if (!parseBlock()) return false
         }
+        emitOp(OPCodeEnum.OP_ret)
         
-        patchJump(endPos)
+        /* label_end */
+        for (pos in jumpsToEnd) patchJump(pos)
         
         return true
     }
@@ -1094,9 +1136,20 @@ class JSParser(private val s: JSParseState) {
                 }
                 '('.code -> {
                     s.nextToken()
+                    /* 方法调用识别（对照 C js_parse_postfix_expr）：
+                     * 前一条指令是 OP_get_field 时，回改为 OP_get_field2（保留 obj 作 this）
+                     * 并改用 OP_call_method；否则普通调用 OP_call（this 由 VM 提供为 undefined） */
+                    val isMethodCall = isLastOpcodeGetField()
+                    if (isMethodCall) {
+                        rewriteLastOpcode(OPCodeEnum.OP_get_field2)
+                    }
                     val argc = parseArgs()
                     expect(')'.code)
-                    emitOpWithArg(OPCodeEnum.OP_call, argc)
+                    if (isMethodCall) {
+                        emitOpWithArg(OPCodeEnum.OP_call_method, argc)
+                    } else {
+                        emitOpWithArg(OPCodeEnum.OP_call, argc)
+                    }
                 }
                 '['.code -> {
                     s.nextToken()
@@ -1112,6 +1165,7 @@ class JSParser(private val s: JSParseState) {
                     }
                     val name = s.token.value
                     s.nextToken()
+                    /* 先按普通属性读取发射（消费 obj），若后续紧跟 ( 再回改为 get_field2 */
                     val idx = addConstPool(name)
                     emitOpWithArg(OPCodeEnum.OP_get_field, idx)
                 }
@@ -1142,13 +1196,27 @@ class JSParser(private val s: JSParseState) {
                     val name = s.token.value
                     s.nextToken()
                     val idx = addConstPool(name)
-                    emitOpWithArg(OPCodeEnum.OP_get_field2, idx)
+                    emitOpWithArg(OPCodeEnum.OP_get_field, idx)
                 }
                 else -> break
             }
         }
         
         return true
+    }
+    
+    /* 检查最后发射的指令是否为 OP_get_field（方法调用识别用） */
+    private fun isLastOpcodeGetField(): Boolean {
+        if (s.lastOpcodePos < 0) return false
+        val ptr = JS_VALUE_TO_PTR(s.byteCode)
+        return ctx.memory.getU8(ptr + 8 + s.lastOpcodePos) == OPCodeEnum.OP_get_field.id
+    }
+    
+    /* 将最后发射的指令改写为指定 opcode（对照 C 的 byte_code[last_opcode_pos] = ...） */
+    private fun rewriteLastOpcode(op: OPCodeEnum) {
+        if (s.lastOpcodePos < 0) return
+        val ptr = JS_VALUE_TO_PTR(s.byteCode)
+        ctx.memory.putU8(ptr + 8 + s.lastOpcodePos, op.id)
     }
     
     fun parsePrimaryExpr(): Boolean {

@@ -157,13 +157,13 @@ fun JS_IsFunction(ctx: JSContext, val1: JSValue): Boolean {
            classId == JSObjectClassEnum.JS_CLASS_C_FUNCTION.value
 }
 
+/* 判断是否为错误对象（对照 C JS_IsError：错误对象 class_id 恒为 JS_CLASS_ERROR，
+ * 具体错误类型由 proto 区分） */
 fun JS_IsError(ctx: JSContext, val1: JSValue): Boolean {
     if (!JS_IsPtr(val1)) return false
     val ptr = JS_VALUE_TO_PTR(val1)
     if (ctx.memory.getMTag(ptr) != JS_MTAG_OBJECT) return false
-    val classId = ctx.memory.getU8(ptr + 2)
-    return classId >= JSObjectClassEnum.JS_CLASS_ERROR.value &&
-           classId <= JSObjectClassEnum.JS_CLASS_INTERNAL_ERROR.value
+    return ctx.memory.getU8(ptr + 2) == JSObjectClassEnum.JS_CLASS_ERROR.value
 }
 
 fun JS_GetGlobalObject(ctx: JSContext): JSValue = ctx.globalObj
@@ -184,6 +184,28 @@ fun JS_Throw(ctx: JSContext, obj: JSValue): JSValue {
     ctx.currentExceptionIsUncatchable = false
     return JS_EXCEPTION
 }
+
+/* 标记异常为不可捕获（对照 C JS_ThrowUncatchable，中断处理器等场景使用） */
+fun JS_ThrowUncatchable(ctx: JSContext): JSValue {
+    ctx.currentExceptionIsUncatchable = true
+    return JS_EXCEPTION
+}
+
+/* 错误类便捷包装（对照 C JS_ThrowTypeError/RangeError/ReferenceError/SyntaxError/InternalError） */
+fun JS_ThrowTypeError(ctx: JSContext, message: String): JSValue =
+    ctx.throwError(JSObjectClassEnum.JS_CLASS_TYPE_ERROR, message)
+
+fun JS_ThrowRangeError(ctx: JSContext, message: String): JSValue =
+    ctx.throwError(JSObjectClassEnum.JS_CLASS_RANGE_ERROR, message)
+
+fun JS_ThrowReferenceError(ctx: JSContext, message: String): JSValue =
+    ctx.throwError(JSObjectClassEnum.JS_CLASS_REFERENCE_ERROR, message)
+
+fun JS_ThrowSyntaxError(ctx: JSContext, message: String): JSValue =
+    ctx.throwError(JSObjectClassEnum.JS_CLASS_SYNTAX_ERROR, message)
+
+fun JS_ThrowInternalError(ctx: JSContext, message: String): JSValue =
+    ctx.throwError(JSObjectClassEnum.JS_CLASS_INTERNAL_ERROR, message)
 
 fun jsAllocValueArray(ctx: JSContext, size: Int): Int {
     val totalSize = 8 + size * JSW
