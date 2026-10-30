@@ -8,6 +8,7 @@ object JSGC {
     
     fun gc(ctx: JSContext, keepAtoms: Boolean = true) {
         gcMarkAll(ctx, keepAtoms)
+        gcFreeUnmarked(ctx)
         gcCompactHeap(ctx)
     }
     
@@ -72,6 +73,50 @@ object JSGC {
         }
     }
     
+    /* 释放未标记块（对照 C gc_mark_all 的释放阶段，含上游 #71 修复语义）：
+     * - 存活块：清除标记位（对所有 mtag 生效，对齐 C 的 b->gc_mark = 0）
+     * - 死块：遍历连续未标记区域，对其中每个用户对象块调用 finalizer
+     *   （修复前 C 实现只调用区域首块的 finalizer），随后合并为一个 free 块 */
+    private fun gcFreeUnmarked(ctx: JSContext) {
+        var ptr = ctx.heapBase
+        while (ptr < ctx.heapFree) {
+            val size = ctx.memory.getBlockSize(ptr)
+            
+            if (ctx.memory.getGCMark(ptr) != 0) {
+                /* 存活块：清除标记位 */
+                ctx.memory.putU8(ptr, ctx.memory.getU8(ptr) and 0xFE)
+                ptr += size
+            } else {
+                /* 死块：遍历连续未标记区域 */
+                var ptr1 = ptr
+                var total = 0
+                while (ptr1 < ctx.heapFree && ctx.memory.getGCMark(ptr1) == 0) {
+                    val size1 = ctx.memory.getBlockSize(ptr1)
+                    
+                    if (ctx.memory.getMTag(ptr1) == JSMTags.JS_MTAG_OBJECT) {
+                        val classId = ctx.memory.getU8(ptr1 + 2)
+                        if (classId >= JSObjectClassEnum.JS_CLASS_USER.value) {
+                            val fin = ctx.cFinalizerTable?.getOrNull(classId - JSObjectClassEnum.JS_CLASS_USER.value)
+                            if (fin != null) {
+                                /* 调用用户 finalizer（禁止在其中调用 JS 函数） */
+                                fin(ctx, ctx.userOpaqueTable[ptr1])
+                            }
+                            /* 对象已释放，清理宿主 opaque 引用表条目 */
+                            ctx.userOpaqueTable.remove(ptr1)
+                        }
+                    }
+                    
+                    total += size1
+                    ptr1 += size1
+                }
+                
+                /* 合并连续死块为一个 free 块（对照 C set_free_block） */
+                ctx.setFreeBlock(ptr, total)
+                ptr += total
+            }
+        }
+    }
+    
     private fun gcMark(ctx: JSContext, markStack: ArrayDeque<JSValue>, val1: JSValue) {
         if (!JS_IsPtr(val1)) return
         
@@ -110,8 +155,8 @@ object JSGC {
                 gcMark(ctx, markStack, proto)
                 gcMark(ctx, markStack, props)
                 
-                val classId = ctx.memory.getU8(ptr + 3)
-                val extraSize = ctx.memory.getU8(ptr + 2)
+                val classId = ctx.memory.getU8(ptr + 2)
+                val extraSize = ctx.memory.getU8(ptr + 3)
                 
                 when (classId) {
                     JSObjectClassEnum.JS_CLASS_CLOSURE.value -> {
@@ -131,6 +176,15 @@ object JSGC {
                     JSObjectClassEnum.JS_CLASS_ARRAY.value -> {
                         val tab = ctx.memory.getJSValue(ptr + 24)
                         gcMark(ctx, markStack, tab)
+                    }
+                    else -> {
+                        /* 用户对象：标记 opaque 占位槽之后的私有 JSValue（同步上游 #80） */
+                        if (classId >= JSObjectClassEnum.JS_CLASS_USER.value) {
+                            for (i in 0 until extraSize - 1) {
+                                val userVal = ctx.memory.getJSValue(ptr + 24 + (1 + i) * 8)
+                                gcMark(ctx, markStack, userVal)
+                            }
+                        }
                     }
                 }
             }
@@ -168,72 +222,56 @@ object JSGC {
         }
     }
     
+    /* 压缩堆（对照 C gc_compact_heap 的搬移语义）：
+     * pass1 为存活块建立 旧地址→新地址 映射；随后按对象结构更新堆内字段与
+     * 根区域的指针（ctx 字段、字符串位置缓存、执行栈、GCRef、parseState）；
+     * pass2 搬移块并收缩堆顶。Kotlin 的 context 字段位于 JVM 堆上，无法参与
+     * C 版 Jonkers 链表技法，故改用映射表实现，语义等价 */
     private fun gcCompactHeap(ctx: JSContext) {
-        gcThreadPointer(ctx, ctx.uniqueStrings)
-        gcThreadPointer(ctx, ctx.emptyProps)
-        gcThreadPointer(ctx, ctx.globalObj)
-        gcThreadPointer(ctx, ctx.minusZero)
-        gcThreadPointer(ctx, ctx.currentException)
-        
-        for (i in ctx.classProto.indices) {
-            gcThreadPointer(ctx, ctx.classProto[i])
-            gcThreadPointer(ctx, ctx.classObj[i])
-        }
-        
-        var sp = ctx.sp
-        while (sp < ctx.memory.size) {
-            val val1 = ctx.memory.getJSValue(sp)
-            gcThreadPointer(ctx, val1)
-            sp += JSW
-        }
-        
-        var refOffset = ctx.topGCRef
-        while (refOffset != 0) {
-            val prev = ctx.memory.getI32(refOffset)
-            gcThreadPointer(ctx, refOffset + 8)
-            refOffset = prev
-        }
-        
-        refOffset = ctx.lastGCRef
-        while (refOffset != 0) {
-            val prev = ctx.memory.getI32(refOffset)
-            gcThreadPointer(ctx, refOffset + 8)
-            refOffset = prev
-        }
-        
-        if (ctx.parseState != null) {
-            val ps = ctx.parseState!!
-            gcThreadPointer(ctx, ps.sourceStr)
-            gcThreadPointer(ctx, ps.filenameStr)
-            gcThreadPointer(ctx, ps.tokenValue)
-            gcThreadPointer(ctx, ps.curFunc)
-            gcThreadPointer(ctx, ps.byteCode)
-        }
-        
+        /* pass1：建立存活块的地址映射 */
+        val moveMap = HashMap<Int, Int>()
         var newPtr = ctx.heapBase
         var ptr = ctx.heapBase
-        
         while (ptr < ctx.heapFree) {
-            gcUpdateThreadedPointers(ctx, ptr, newPtr)
             val size = ctx.memory.getBlockSize(ptr)
-            val mtag = ctx.memory.getMTag(ptr)
-            
-            if (mtag != JSMTags.JS_MTAG_FREE) {
-                gcThreadBlock(ctx, ptr)
+            if (ctx.memory.getMTag(ptr) != JSMTags.JS_MTAG_FREE) {
+                moveMap[ptr] = newPtr
                 newPtr += size
             }
             ptr += size
         }
         
+        if (moveMap.isEmpty()) return
+        
+        /* 更新堆内所有块的指针字段 */
+        ptr = ctx.heapBase
+        while (ptr < ctx.heapFree) {
+            val size = ctx.memory.getBlockSize(ptr)
+            if (ctx.memory.getMTag(ptr) != JSMTags.JS_MTAG_FREE) {
+                gcUpdateBlockPointers(ctx, ptr, moveMap)
+            }
+            ptr += size
+        }
+        
+        /* 更新根区域指针 */
+        gcUpdateRootPointers(ctx, moveMap)
+        
+        /* 宿主 opaque 引用表的 key 随块搬移更新（保持 per-object 语义） */
+        if (ctx.userOpaqueTable.isNotEmpty()) {
+            val remapped = HashMap<Int, Any?>()
+            for ((oldPtr, v) in ctx.userOpaqueTable) {
+                remapped[moveMap[oldPtr] ?: oldPtr] = v
+            }
+            ctx.userOpaqueTable.clear()
+            ctx.userOpaqueTable.putAll(remapped)
+        }
+        
+        /* pass2：搬移存活块 */
         newPtr = ctx.heapBase
         ptr = ctx.heapBase
-        
         while (ptr < ctx.heapFree) {
-            gcUpdateThreadedPointers(ctx, ptr, newPtr)
             val size = ctx.memory.getBlockSize(ptr)
-            val mtag = ctx.memory.getMTag(ptr)
-            
-            if (mtag != JSMTags.JS_MTAG_FREE) {
+            if (ctx.memory.getMTag(ptr) != JSMTags.JS_MTAG_FREE) {
                 if (newPtr != ptr) {
                     ctx.memory.copy(ptr, newPtr, size)
                 }
@@ -241,166 +279,130 @@ object JSGC {
             }
             ptr += size
         }
-        
         ctx.heapFree = newPtr
+    }
+    
+    /* 按块结构更新其内部 GC 指针字段（旧地址 → 新地址） */
+    private fun gcUpdateBlockPointers(ctx: JSContext, ptr: Int, moveMap: HashMap<Int, Int>) {
+        fun remap(offset: Int) {
+            val v = ctx.memory.getJSValue(offset)
+            if (JS_IsPtr(v)) {
+                val np = moveMap[JS_VALUE_TO_PTR(v)]
+                if (np != null) {
+                    ctx.memory.putJSValue(offset, JS_VALUE_FROM_PTR(np))
+                }
+            }
+        }
         
-        ptr = ctx.heapBase
-        while (ptr < ctx.heapFree) {
-            val size = ctx.memory.getBlockSize(ptr)
-            val mtag = ctx.memory.getMTag(ptr)
-            
-            if (mtag == JSMTags.JS_MTAG_OBJECT) {
-                gcClearMark(ctx, ptr)
-            }
-            ptr += size
-        }
-    }
-    
-    private fun gcThreadPointer(ctx: JSContext, offset: Int) {
-        val val1 = ctx.memory.getJSValue(offset)
-        if (JS_IsPtr(val1)) {
-            val ptr = JS_VALUE_TO_PTR(val1)
-            if (ptr >= ctx.heapBase && ptr < ctx.heapFree) {
-                ctx.memory.putJSValue(offset, ptr.toLong())
-            }
-        }
-    }
-    
-    private fun gcThreadPointer(ctx: JSContext, val1: JSValue): JSValue {
-        if (JS_IsPtr(val1)) {
-            val ptr = JS_VALUE_TO_PTR(val1)
-            if (ptr >= ctx.heapBase && ptr < ctx.heapFree) {
-                return ptr.toLong()
-            }
-        }
-        return val1
-    }
-    
-    private fun gcThreadBlock(ctx: JSContext, ptr: Int) {
-        val mtag = ctx.memory.getMTag(ptr)
-        
-        when (mtag) {
+        when (ctx.memory.getMTag(ptr)) {
             JSMTags.JS_MTAG_OBJECT -> {
-                val protoOffset = ptr + 8
-                val propsOffset = ptr + 16
+                remap(ptr + 8)   /* proto */
+                remap(ptr + 16)  /* props */
                 
-                var proto = ctx.memory.getJSValue(protoOffset)
-                var props = ctx.memory.getJSValue(propsOffset)
-                
-                proto = gcThreadPointer(ctx, proto)
-                props = gcThreadPointer(ctx, props)
-                
-                ctx.memory.putJSValue(protoOffset, proto)
-                ctx.memory.putJSValue(propsOffset, props)
-                
-                val classId = ctx.memory.getU8(ptr + 3)
-                val extraSize = ctx.memory.getU8(ptr + 2)
+                val classId = ctx.memory.getU8(ptr + 2)
+                val extraSize = ctx.memory.getU8(ptr + 3)
                 
                 when (classId) {
                     JSObjectClassEnum.JS_CLASS_CLOSURE.value -> {
-                        var funcBytecode = ctx.memory.getJSValue(ptr + 24)
-                        funcBytecode = gcThreadPointer(ctx, funcBytecode)
-                        ctx.memory.putJSValue(ptr + 24, funcBytecode)
-                        
+                        remap(ptr + 24)
                         for (i in 0 until extraSize - 1) {
-                            var varRef = ctx.memory.getJSValue(ptr + 32 + i * 8)
-                            varRef = gcThreadPointer(ctx, varRef)
-                            ctx.memory.putJSValue(ptr + 32 + i * 8, varRef)
+                            remap(ptr + 32 + i * 8)
+                        }
+                    }
+                    JSObjectClassEnum.JS_CLASS_C_FUNCTION.value -> {
+                        if (extraSize > 1) {
+                            remap(ptr + 24)
                         }
                     }
                     JSObjectClassEnum.JS_CLASS_ARRAY.value -> {
-                        var tab = ctx.memory.getJSValue(ptr + 24)
-                        tab = gcThreadPointer(ctx, tab)
-                        ctx.memory.putJSValue(ptr + 24, tab)
+                        remap(ptr + 24)
+                    }
+                    else -> {
+                        /* 用户对象：更新 opaque 占位槽之后的私有 JSValue（同步上游 #80） */
+                        if (classId >= JSObjectClassEnum.JS_CLASS_USER.value) {
+                            for (i in 0 until extraSize - 1) {
+                                remap(ptr + 24 + (1 + i) * 8)
+                            }
+                        }
                     }
                 }
             }
             JSMTags.JS_MTAG_VALUE_ARRAY -> {
                 val size = ctx.memory.getI32(ptr + 4)
                 for (i in 0 until size) {
-                    val elemOffset = ptr + 8 + i * 8
-                    var elem = ctx.memory.getJSValue(elemOffset)
-                    elem = gcThreadPointer(ctx, elem)
-                    ctx.memory.putJSValue(elemOffset, elem)
+                    remap(ptr + 8 + i * 8)
                 }
             }
             JSMTags.JS_MTAG_VARREF -> {
                 val isDetached = ctx.memory.getU8(ptr + 2) and 1
                 if (isDetached == 0) {
-                    val valueOffset = ptr + 16
-                    var value = ctx.memory.getJSValue(valueOffset)
-                    value = gcThreadPointer(ctx, value)
-                    ctx.memory.putJSValue(valueOffset, value)
+                    remap(ptr + 16)
                 }
             }
             JSMTags.JS_MTAG_FUNCTION_BYTECODE -> {
-                val offsets = intArrayOf(8, 16, 24, 32, 40, 48, 56)
-                for (offset in offsets) {
-                    val valOffset = ptr + offset
-                    var val1 = ctx.memory.getJSValue(valOffset)
-                    val1 = gcThreadPointer(ctx, val1)
-                    ctx.memory.putJSValue(valOffset, val1)
+                for (off in intArrayOf(8, 16, 24, 32, 40, 48, 56)) {
+                    remap(ptr + off)
                 }
             }
         }
     }
     
-    private fun gcUpdateThreadedPointers(ctx: JSContext, ptr: Int, newPtr: Int) {
-        val mtag = ctx.memory.getMTag(ptr)
-        if (mtag == JSMTags.JS_MTAG_FREE) return
+    /* 更新根区域指针：context 字段、字符串位置缓存、执行栈、GCRef 链、parseState */
+    private fun gcUpdateRootPointers(ctx: JSContext, moveMap: HashMap<Int, Int>) {
+        fun remapValue(v: JSValue): JSValue {
+            if (JS_IsPtr(v)) {
+                val np = moveMap[JS_VALUE_TO_PTR(v)]
+                if (np != null) {
+                    return JS_VALUE_FROM_PTR(np)
+                }
+            }
+            return v
+        }
         
-        val offset = newPtr - ptr
+        ctx.uniqueStrings = remapValue(ctx.uniqueStrings)
+        ctx.currentException = remapValue(ctx.currentException)
+        ctx.emptyProps = remapValue(ctx.emptyProps)
+        ctx.globalObj = remapValue(ctx.globalObj)
+        ctx.minusZero = remapValue(ctx.minusZero)
         
-        when (mtag) {
-            JSMTags.JS_MTAG_OBJECT -> {
-                gcUpdatePointer(ctx, ptr + 8, offset)
-                gcUpdatePointer(ctx, ptr + 16, offset)
-                
-                val classId = ctx.memory.getU8(ptr + 3)
-                val extraSize = ctx.memory.getU8(ptr + 2)
-                
-                when (classId) {
-                    JSObjectClassEnum.JS_CLASS_CLOSURE.value -> {
-                        gcUpdatePointer(ctx, ptr + 24, offset)
-                        for (i in 0 until extraSize - 1) {
-                            gcUpdatePointer(ctx, ptr + 32 + i * 8, offset)
-                        }
-                    }
-                    JSObjectClassEnum.JS_CLASS_ARRAY.value -> {
-                        gcUpdatePointer(ctx, ptr + 24, offset)
-                    }
-                }
-            }
-            JSMTags.JS_MTAG_VALUE_ARRAY -> {
-                val size = ctx.memory.getI32(ptr + 4)
-                for (i in 0 until size) {
-                    gcUpdatePointer(ctx, ptr + 8 + i * 8, offset)
-                }
-            }
-            JSMTags.JS_MTAG_VARREF -> {
-                val isDetached = ctx.memory.getU8(ptr + 2) and 1
-                if (isDetached == 0) {
-                    gcUpdatePointer(ctx, ptr + 16, offset)
-                }
-            }
-            JSMTags.JS_MTAG_FUNCTION_BYTECODE -> {
-                val offsets = intArrayOf(8, 16, 24, 32, 40, 48, 56)
-                for (off in offsets) {
-                    gcUpdatePointer(ctx, ptr + off, offset)
-                }
-            }
+        for (i in ctx.classProto.indices) {
+            ctx.classProto[i] = remapValue(ctx.classProto[i])
+            ctx.classObj[i] = remapValue(ctx.classObj[i])
+        }
+        
+        for (i in 0 until JS_STRING_POS_CACHE_SIZE) {
+            val ce = ctx.stringPosCache[i]
+            ce.str = remapValue(ce.str)
+        }
+        
+        var sp = ctx.sp
+        while (sp < ctx.memory.size) {
+            ctx.memory.putJSValue(sp, remapValue(ctx.memory.getJSValue(sp)))
+            sp += JSW
+        }
+        
+        var refOffset = ctx.topGCRef
+        while (refOffset != 0) {
+            val prev = ctx.memory.getI32(refOffset)
+            ctx.memory.putJSValue(refOffset + 8, remapValue(ctx.memory.getJSValue(refOffset + 8)))
+            refOffset = prev
+        }
+        
+        refOffset = ctx.lastGCRef
+        while (refOffset != 0) {
+            val prev = ctx.memory.getI32(refOffset)
+            ctx.memory.putJSValue(refOffset + 8, remapValue(ctx.memory.getJSValue(refOffset + 8)))
+            refOffset = prev
+        }
+        
+        if (ctx.parseState != null) {
+            val ps = ctx.parseState!!
+            ps.sourceStr = remapValue(ps.sourceStr)
+            ps.filenameStr = remapValue(ps.filenameStr)
+            ps.tokenValue = remapValue(ps.tokenValue)
+            ps.curFunc = remapValue(ps.curFunc)
+            ps.byteCode = remapValue(ps.byteCode)
         }
     }
     
-    private fun gcUpdatePointer(ctx: JSContext, offset: Int, delta: Int) {
-        val val1 = ctx.memory.getJSValue(offset)
-        if (val1 in ctx.heapBase..<(ctx.heapFree + delta)) {
-            ctx.memory.putJSValue(offset, val1 + delta)
-        }
-    }
-    
-    private fun gcClearMark(ctx: JSContext, ptr: Int) {
-        val header = ctx.memory.getU8(ptr)
-        ctx.memory.putU8(ptr, header and 0xFE)
-    }
 }

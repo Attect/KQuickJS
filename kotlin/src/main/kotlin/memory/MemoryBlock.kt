@@ -37,7 +37,8 @@ class MemoryBlock(val memory: Memory, val offset: Int) {
             val mtag = getMTag(memory, offset)
             return when (mtag) {
                 JSMTags.JS_MTAG_OBJECT -> {
-                    val extraSize = memory.getU8(offset + 2)
+                    /* 对象头布局：ptr+2 = class_id，ptr+3 = extra_size（JSValue 槽数） */
+                    val extraSize = memory.getU8(offset + 3)
                     24 + extraSize * JSW
                 }
                 JSMTags.JS_MTAG_FLOAT64 -> 16

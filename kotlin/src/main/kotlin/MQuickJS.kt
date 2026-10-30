@@ -197,6 +197,22 @@ usage: mqjs [options] [file [args]]
         return count.toInt()
     }
     
+    /* 宿主层 Date 构造器（对照 C mqjs.c 的 js_date_constructor，同步上游 new Date() 支持）：
+     * 无参 → 当前时间；单个数值参数 → 该 epoch 毫秒值；
+     * 其他参数抛异常（TypeError 待错误对象机制完成后接入）。
+     * 注意：JS 层的 new Date() 暴露还依赖 OP_new 的构造器调用机制与 stdlib 注册，见 docs 同步文档 */
+    @JvmStatic
+    fun mqjsDateConstructor(ctx: JSContext, argc: Int, argv: LongArray): JSValue {
+        /* 剥离构造器调用标志位（对照 C 的 argc &= ~FRAME_CF_CTOR） */
+        val realArgc = argc and FRAME_CF_CTOR.inv()
+        val v: Double = when {
+            realArgc == 0 -> System.currentTimeMillis().toDouble()
+            realArgc == 1 && JS_IsNumber(ctx, argv[0]) -> JS_ToNumber(ctx, argv[0])
+            else -> return JS_EXCEPTION
+        }
+        return JS_NewDate(ctx, v)
+    }
+    
     private fun createContext(memSize: Int): JSContext {
         val mem = ByteArray(memSize)
         val stdlib = JSSTDLibraryDef(

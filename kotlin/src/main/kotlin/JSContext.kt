@@ -28,7 +28,7 @@ class JSContext(
     var topGCRef: Int = 0
     var lastGCRef: Int = 0
     
-    var currentException: JSValue = JS_UNDEFINED
+    var currentException: JSValue = JS_UNINITIALIZED
     var uniqueStrings: JSValue = JS_NULL
     var emptyProps: JSValue = JS_NULL
     var globalObj: JSValue = JS_NULL
@@ -40,6 +40,9 @@ class JSContext(
     var interruptHandler: ((ctx: JSContext) -> Int)? = null
     var writeFunc: ((buf: ByteArray, len: Int) -> Unit)? = null
     var opaque: Any? = null
+    /* 用户对象的宿主 opaque 引用表：key 为对象块地址，GC 搬移时随块更新
+     * （对照 C 版 p->u.user.opaque 的 per-object 语义，修复原先错存 ctx.opaque 的问题） */
+    val userOpaqueTable: HashMap<Int, Any?> = HashMap()
     var randomState: Long = 1
     
     var parseState: JSParseState? = null
@@ -162,7 +165,7 @@ class JSContext(
     
     fun throwError(errorClass: JSObjectClassEnum, message: String): JSValue {
         // TODO: Implement error creation
-        currentException = JS_NULL
+        currentException = JS_UNINITIALIZED
         return JS_EXCEPTION
     }
     
