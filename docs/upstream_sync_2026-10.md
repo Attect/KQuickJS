@@ -93,11 +93,18 @@
 
 | 缺口 | 位置 | 说明 |
 |------|------|------|
-| 嵌套闭包捕获的执行组合场景 | parser/runtime | varref 池提升已实现并生效（单层捕获正常），但嵌套闭包（f 内 g 捕获 f 的 x）的 varref 读写组合场景仍待调试（testGcKeepsClosuresRunnable @Ignore；本地运行时报 'x' is not defined，varref 槽的跨层读写待定位） |
-| 构造器 this 链的组合场景 | parser/runtime | new 的 thisObj 创建与传递已实现（callConstructor → run → OP_push_this，GC 保活修复后 thisObj.v 写入正确），但构造器属性赋值组合场景（this.v = x 后 o.v 读取）仍返回 undefined（testConstructorThisBinding @Ignore；疑似 RETVAL put_loc 0 与 put_field 的栈交互） |
-| build_backtrace 格式 | `JSContext.throwError` | stack 槽已生成基于 jsCallStack 的回溯文本；C 版的行号/列号信息未包含；testErrorBacktrace 的 catch 绑定已修复（见下），回溯断言待随场景复验 |
 | GC 未处理 `JS_CLASS_REGEXP` / TYPED_ARRAY | `JSGC` | 这些内建类尚未在 Kotlin 实现，实现时需同步补 GC 分支（JS_CLASS_ERROR 分支已补齐） |
 | `f_f` 参数转换异常路径 | `callCFunction` | Kotlin 的 `JS_ToNumber` 为纯转换（不产生异常），上游 `49f1536` 的异常优先结构已按 C 形态实现，但异常分支待 `JS_ToNumber` 异常化后生效 |
+| backtrace 行号/列号 | `JSContext.throwError` | 回溯文本已可用（函数名栈）；C 版的源位置（行/列号）信息未包含，可后续增强 |
+
+第四轮缺口补齐（✅ 全部完成，@Ignore 全部解除）：
+
+| 项目 | 状态 |
+|------|------|
+| 嵌套闭包捕获的执行组合场景 | ✅ 已修复（本轮根因）：编译期字节码存于解析器状态（s.byteCode），函数对象 +16 槽在 finalize 前为 JS_NULL——rewriteLocToVarRef 读 +16 槽提前退出、重写从未发生。修复：FuncCompileScope 持有本层 byteCode 引用，emitOp/emitOpWithArg 每次发射后同步 scope.byteCodeLen，捕获回改扫描本层实时字节码。`f()()`（g 捕获 f 的 x）返回 2 ✓ |
+| 构造器 this 链的组合场景 | ✅ 已修复：'=' 赋值重构为「rhs 值经临时槽中转」模式（rhs → dup → put_loc tmp → put_* 写回 → get_loc tmp 作表达式值），彻底规避对象携带目标（put_field 需弹 obj+val 对）与 RETVAL 读取的栈序冲突。`function P(x){this.v=x}; new P(7).v` 返回 7 ✓ |
+| testErrorBacktrace 组合断言 | ✅ 通过（catch 绑定 + 回溯文本 + 异常展开组合场景全部生效） |
+| 赋值表达式值语义 | ✅ 统一：'=' 与复合赋值（+= 等）均为「临时槽中转」实现，各目标形态（loc/var_ref/global/field/array_el）栈平衡一致，表达式值=RHS/运算结果 |
 
 第三轮缺口补齐（✅ 已完成）：
 
@@ -113,9 +120,9 @@
 
 ## 五、验证
 
-- 回归测试：`kotlin/src/test/kotlin/GCTest.kt`（22 个用例，3 个 @Ignore 标注组合场景待复验）
+- 回归测试：`kotlin/src/test/kotlin/GCTest.kt`（22 个用例，**全部启用，0 个 @Ignore**）
   - GC：死对象回收、finalizer、user value/opaque 搬移存活、闭包一致性、错误对象 GC 搬移
-  - 异常：try/catch、跨函数展开、重抛（无 finally 部分）、错误对象创建与包装类、**finally 顺序执行与 catch 后 finally**
+  - 异常：try/catch、跨函数展开、重抛（无 finally 部分）、错误对象创建与包装类、**finally 顺序执行与 catch 后 finally**、**错误回溯（catch 绑定 + stack 文本）**
   - 公共 API：JS_IsArray / ContextOpaque / JS_NewDate + valueOf / 宿主 Date 构造器
   - 执行层：callCFunction defType 分发（f_f、constructor 的 CTOR 标志位）、
     Date JS 层集成（Date.now / new Date / 普通调用）、this 传递（o.f() 的 this.v）、

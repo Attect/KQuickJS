@@ -16,8 +16,9 @@ class JSParser(private val s: JSParseState) {
      * 已提升的捕获槽映射。顶层上下文在 parse() 入口压入 */
     private class LocEmit(val name: String, val byteCode: JSValue, val pos: Int, val isPut: Boolean)
     
-    private class FuncCompileScope(val curFunc: JSValue) {
+    private class FuncCompileScope(val curFunc: JSValue, val byteCode: JSValue) {
         var localVarsLen = 0                                   /* 本层局部变量数（参数+声明） */
+        var byteCodeLen = 0                                    /* 本层已发射长度（emitOp 同步，供捕获回改扫描） */
         val varrefSlots = HashMap<String, Int>()               /* 被内层捕获的局部 var → varref 池槽 */
         val locEmitLog = mutableListOf<LocEmit>()              /* 已发射的 get_loc/put_loc 记录 */
     }
@@ -27,7 +28,7 @@ class JSParser(private val s: JSParseState) {
     fun parse(): JSValue {
         if (!initFunction()) return JS_EXCEPTION
         
-        compileScopes.addLast(FuncCompileScope(s.curFunc))
+        compileScopes.addLast(FuncCompileScope(s.curFunc, s.byteCode))
         
         if (s.hasRetval) {
             s.evalRetIdx = addLocalVar(JS_NewString(ctx, "_ret_"))
@@ -240,8 +241,9 @@ class JSParser(private val s: JSParseState) {
         s.localVarsLen = 0
         s.evalRetIdx = -1
         
-        /* 函数编译上下文入栈（闭包捕获的回改作用域） */
-        compileScopes.addLast(FuncCompileScope(s.curFunc))
+        /* 函数编译上下文入栈（闭包捕获的回改作用域）——byteCode 为本层对象，
+           内层捕获本层变量时据此回改本层已发射的 get_loc/put_loc */
+        compileScopes.addLast(FuncCompileScope(s.curFunc, s.byteCode))
         
         expect('('.code)
         val argCount = parseParams()
@@ -683,16 +685,24 @@ class JSParser(private val s: JSParseState) {
                 val lvalueArg = getLastOpArg()
                 removeLastOp()
                 
-                /* 重发 lvalue 读取：仅复合赋值需要（读取旧值参与运算）；
-                   简单 = 无需重发（removeLastOp 已移除 lhs 读取，rhs 后 dup+put_* 完成写回
-                   并保留赋值表达式的值） */
-                reemitLValueLoad(lvalueOp, lvalueArg, forCompound = false)
-                
                 s.nextToken()
                 if (!parseAssignExpr()) return false
                 
-                /* 写回：dup 保证赋值表达式的值为写入值（各形态 put_* 的压弹净差 + put 弹出配对） */
-                emitLValueStore(lvalueOp, lvalueArg, needDup = true)
+                /* rhs 值复制后保存到临时槽（put_* 写回会消费栈上的副本），
+                   读回 tmp 作为赋值表达式的值 */
+                emitOp(OPCodeEnum.OP_dup)
+                val tmpIdx = ensureTmpVar()
+                emitOpWithArg(OPCodeEnum.OP_put_loc, tmpIdx)
+                
+                when (lvalueOp) {
+                    OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
+                    OPCodeEnum.OP_get_var_ref.id -> emitOpWithArg(OPCodeEnum.OP_put_var_ref, lvalueArg)
+                    OPCodeEnum.OP_get_global.id -> emitOpWithArg(OPCodeEnum.OP_put_global, lvalueArg)
+                    OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
+                    OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
+                }
+                
+                emitOpWithArg(OPCodeEnum.OP_get_loc, tmpIdx)
                 return true
             }
             JSTokenVal.TOK_PLUS_ASSIGN.value -> return emitCompoundAssign(OPCodeEnum.OP_add)
@@ -730,25 +740,8 @@ class JSParser(private val s: JSParseState) {
         return lvalueOp == OPCodeEnum.OP_get_field.id || lvalueOp == OPCodeEnum.OP_get_array_el.id
     }
     
-    /* lvalue 写回：needDup 时调整栈序保证赋值表达式的值为写入值。
-     * - 槽目标（loc/var_ref/global）：读取指令已压旧值，dup 后 put_* 弹旧值
-     *   （[old, val_new] -> dup -> put_* -> [val_new]）
-     * - 对象携带目标（field/array_el）：读取指令压 [obj, old]，rhs 后为
-     *   [obj, old, val_new]——swap 后 [obj, val_new, old]，put_* 弹 old/obj
-     *   保留 val_new（对照 C PUT_LVALUE_KEEP_TOP 的 insert2 语义） */
-    private fun emitLValueStore(lvalueOp: Int, lvalueArg: Int, needDup: Boolean) {
-        if (needDup && isObjCarrying(lvalueOp)) emitOp(OPCodeEnum.OP_swap)
-        if (needDup && !isObjCarrying(lvalueOp)) emitOp(OPCodeEnum.OP_dup)
-        when (lvalueOp) {
-            OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-            OPCodeEnum.OP_get_var_ref.id -> emitOpWithArg(OPCodeEnum.OP_put_var_ref, lvalueArg)
-            OPCodeEnum.OP_get_global.id -> emitOpWithArg(OPCodeEnum.OP_put_global, lvalueArg)
-            OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-            OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
-        }
-    }
-    
-    /* 复合赋值（x op= v）：读取旧值 → rhs → 运算 → 写回（表达式值为运算结果） */
+    /* 复合赋值（x op= v）：读取旧值 → rhs → 运算 → 复制结果 → 临时槽保存 → 写回 →
+       读回临时槽作为表达式值（对照 C put_lvalue 的值语义，规避栈序问题） */
     private fun emitCompoundAssign(binOp: OPCodeEnum): Boolean {
         val lvalueOp = getLastOp()
         val lvalueArg = getLastOpArg()
@@ -761,29 +754,19 @@ class JSParser(private val s: JSParseState) {
         if (!parseAssignExpr()) return false
         emitOp(binOp)
         
-        /* 写回并保证表达式值为运算结果（对象携带形式 put_* 消费 obj 后值自然在栈顶） */
+        /* 结果复制后保存到临时槽，写回消费栈上副本，读回作为表达式值 */
+        emitOp(OPCodeEnum.OP_dup)
+        val tmpIdx = ensureTmpVar()
+        emitOpWithArg(OPCodeEnum.OP_put_loc, tmpIdx)
+        
         when (lvalueOp) {
-            OPCodeEnum.OP_get_loc.id -> {
-                emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
-                emitOpWithArg(OPCodeEnum.OP_get_loc, lvalueArg)
-            }
-            OPCodeEnum.OP_get_var_ref.id -> {
-                emitOpWithArg(OPCodeEnum.OP_put_var_ref, lvalueArg)
-                emitOpWithArg(OPCodeEnum.OP_get_var_ref, lvalueArg)
-            }
-            OPCodeEnum.OP_get_global.id -> {
-                emitOpWithArg(OPCodeEnum.OP_put_global, lvalueArg)
-                emitOpWithArg(OPCodeEnum.OP_get_global, lvalueArg)
-            }
-            OPCodeEnum.OP_get_field.id -> {
-                emitOp(OPCodeEnum.OP_dup)
-                emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
-            }
-            OPCodeEnum.OP_get_array_el.id -> {
-                emitOp(OPCodeEnum.OP_dup)
-                emitOp(OPCodeEnum.OP_put_array_el)
-            }
+            OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
+            OPCodeEnum.OP_get_var_ref.id -> emitOpWithArg(OPCodeEnum.OP_put_var_ref, lvalueArg)
+            OPCodeEnum.OP_get_global.id -> emitOpWithArg(OPCodeEnum.OP_put_global, lvalueArg)
+            OPCodeEnum.OP_get_field.id -> emitOpWithArg(OPCodeEnum.OP_put_field, lvalueArg)
+            OPCodeEnum.OP_get_array_el.id -> emitOp(OPCodeEnum.OP_put_array_el)
         }
+        emitOpWithArg(OPCodeEnum.OP_get_loc, tmpIdx)
         return true
     }
     
@@ -1428,8 +1411,8 @@ class JSParser(private val s: JSParseState) {
         s.localVarsLen = 0
         s.evalRetIdx = -1
         
-        /* 函数编译上下文入栈（闭包捕获的回改作用域） */
-        compileScopes.addLast(FuncCompileScope(s.curFunc))
+        /* 函数编译上下文入栈（闭包捕获的回改作用域）——byteCode 为本层对象 */
+        compileScopes.addLast(FuncCompileScope(s.curFunc, s.byteCode))
         
         if (s.token.val1 == JSTokenVal.TOK_IDENT.value) {
             setFunctionName(s.curFunc, s.token.value)
@@ -1489,12 +1472,18 @@ class JSParser(private val s: JSParseState) {
         return true
     }
     
+    /* 发射指令后同步编译上下文的已发射长度（内层捕获本层变量时回改扫描用） */
+    private fun syncScopeLen() {
+        compileScopes.lastOrNull()?.byteCodeLen = s.byteCodeLen
+    }
+    
     fun emitOp(op: OPCodeEnum) {
         ensureByteCodeSize(1)
         val ptr = JS_VALUE_TO_PTR(s.byteCode)
         s.lastOpcodePos = s.byteCodeLen
         ctx.memory.putU8(ptr + 8 + s.byteCodeLen, op.id)
         s.byteCodeLen++
+        syncScopeLen()
     }
     
     fun emitI8(v: Byte) {
@@ -1513,6 +1502,7 @@ class JSParser(private val s: JSParseState) {
         ctx.memory.putU8(ptr + 8 + s.byteCodeLen, op.id)
         ctx.memory.putU16(ptr + 8 + s.byteCodeLen + 1, arg)
         s.byteCodeLen += 3
+        syncScopeLen()
     }
     
     fun emitJump(op: OPCodeEnum): Int {
@@ -1789,7 +1779,7 @@ class JSParser(private val s: JSParseState) {
             if (localIdx >= 0) {
                 val slot = ctx.varrefPool.size.also { ctx.varrefPool.add(JS_UNDEFINED) }
                 scope.varrefSlots[nameStr] = slot
-                rewriteLocToVarRef(scope.curFunc, localIdx, slot)
+                rewriteLocToVarRef(scope.byteCode, scope.byteCodeLen, localIdx, slot)
                 return slot
             }
         }
@@ -1797,14 +1787,14 @@ class JSParser(private val s: JSParseState) {
     }
     
     /* 扫描函数字节码，将读写指定局部变量的 get_loc/put_loc 改写为
-     * get_var_ref/put_var_ref（操作数换为 varref 池槽；指令同为 3 字节） */
-    private fun rewriteLocToVarRef(func: JSValue, localIdx: Int, slot: Int) {
-        val funcPtr = JS_VALUE_TO_PTR(func)
-        val bc = ctx.memory.getJSValue(funcPtr + 16)
-        if (bc == JS_NULL) return
-        val bcPtr = JS_VALUE_TO_PTR(bc)
-        val len = ctx.memory.getI32(bcPtr + 4)
+     * get_var_ref/put_var_ref（操作数换为 varref 池槽；指令同为 3 字节）。
+     * 字节码与长度来自编译上下文快照——编译中的函数对象 +16 槽尚未挂载字节码 */
+    private fun rewriteLocToVarRef(byteCode: JSValue, codeLen: Int, localIdx: Int, slot: Int) {
+        if (byteCode == JS_NULL || codeLen <= 0) return
+        val bcPtr = JS_VALUE_TO_PTR(byteCode)
+        val len = codeLen
         
+        var rewritten = 0
         var i = 0
         while (i < len) {
             val op = ctx.memory.getU8(bcPtr + 8 + i).toInt()
@@ -1817,12 +1807,17 @@ class JSParser(private val s: JSParseState) {
                 ctx.memory.getU16(bcPtr + 8 + i + 1) == localIdx) {
                 ctx.memory.putU8(bcPtr + 8 + i, OPCodeEnum.OP_get_var_ref.id)
                 ctx.memory.putU16(bcPtr + 8 + i + 1, slot)
+                rewritten++
             } else if (op == OPCodeEnum.OP_put_loc.id &&
                 ctx.memory.getU16(bcPtr + 8 + i + 1) == localIdx) {
                 ctx.memory.putU8(bcPtr + 8 + i, OPCodeEnum.OP_put_var_ref.id)
                 ctx.memory.putU16(bcPtr + 8 + i + 1, slot)
+                rewritten++
             }
             i += e.size
+        }
+        if (System.getenv("MQJS_TRACE") != null) {
+            println("DBG rewrite len=$len localIdx=$localIdx slot=$slot rewritten=$rewritten")
         }
     }
     
