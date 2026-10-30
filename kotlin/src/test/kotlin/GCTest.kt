@@ -237,8 +237,7 @@ class GCTest {
     }
     
     @Test
-    @Ignore /* 嵌套闭包捕获（varref 提升）的执行组合场景待复验（捕获提升已实现，
-       嵌套 g/x 的 varref 读写仍待调试，见 docs 缺口清单） */
+    @Ignore /* 嵌套闭包捕获（varref 提升）的执行组合场景待调试（捕获提升已实现，嵌套 g/x 的 varref 读写待定位），见 docs 缺口清单 */
     fun testGcKeepsClosuresRunnable() {
         /* 捕获外层变量的闭包脚本在「不 GC」与「解析后 GC 压缩再执行」两种情况下
          * 行为必须一致，验证字节码/闭包变量经 GC 搬移后仍正确 */
@@ -406,7 +405,7 @@ class GCTest {
     }
     
     @Test
-    @Ignore /* 构造器 this 链的组合场景待复验（thisObj 传递与属性写入，机制已实现，见 docs 缺口清单） */
+    @Ignore /* 构造器 this 链的组合场景待定位：this.v = x 的 put_field 写入对象错位（swap 来源待查），机制已实现，见 docs */
     fun testConstructorThisBinding() {
         /* 构造器的 this/proto 绑定：this.v 写入新对象，返回值非对象时用 this */
         val ctx2 = createContext()
@@ -462,7 +461,7 @@ class GCTest {
     }
     
     @Test
-    @Ignore /* catch 绑定 + stack 回溯的组合场景待复验（机制已实现，见 docs 缺口清单） */
+    @Ignore /* catch 绑定已修复（trace 验证），组合断言待复验 */
     fun testErrorBacktrace() {
         val ctx = createContext()
         /* 解释器内抛 TypeError：jsCallStack 记录生成 stack 槽回溯 */

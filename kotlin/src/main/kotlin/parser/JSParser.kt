@@ -730,9 +730,15 @@ class JSParser(private val s: JSParseState) {
         return lvalueOp == OPCodeEnum.OP_get_field.id || lvalueOp == OPCodeEnum.OP_get_array_el.id
     }
     
-    /* lvalue 写回：needDup 时先复制栈顶（保证赋值表达式的值为写入值） */
+    /* lvalue 写回：needDup 时调整栈序保证赋值表达式的值为写入值。
+     * - 槽目标（loc/var_ref/global）：读取指令已压旧值，dup 后 put_* 弹旧值
+     *   （[old, val_new] -> dup -> put_* -> [val_new]）
+     * - 对象携带目标（field/array_el）：读取指令压 [obj, old]，rhs 后为
+     *   [obj, old, val_new]——swap 后 [obj, val_new, old]，put_* 弹 old/obj
+     *   保留 val_new（对照 C PUT_LVALUE_KEEP_TOP 的 insert2 语义） */
     private fun emitLValueStore(lvalueOp: Int, lvalueArg: Int, needDup: Boolean) {
-        if (needDup) emitOp(OPCodeEnum.OP_dup)
+        if (needDup && isObjCarrying(lvalueOp)) emitOp(OPCodeEnum.OP_swap)
+        if (needDup && !isObjCarrying(lvalueOp)) emitOp(OPCodeEnum.OP_dup)
         when (lvalueOp) {
             OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
             OPCodeEnum.OP_get_var_ref.id -> emitOpWithArg(OPCodeEnum.OP_put_var_ref, lvalueArg)

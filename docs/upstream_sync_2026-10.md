@@ -93,12 +93,23 @@
 
 | 缺口 | 位置 | 说明 |
 |------|------|------|
-| finally 的 gosub/ret 栈平衡 | parser/runtime | **主因已修复**：简单 `=` 赋值的 lvalue 重发（reemitLValueLoad）会在栈上残留旧值，破坏 gosub/ret 的栈平衡导致 finally 无限循环——已改为简单 = 不重发读取（removeLastOp + rhs + dup + put_*），finally 场景测试（testThrowFinallySemantics/testThrowFinallyAndRethrow）已解除 @Ignore 并全部通过 |
-| 闭包捕获的执行组合场景 | parser/runtime | varref 池提升已实现并生效，但嵌套闭包（f 内 g 捕获 f 的 x）的 varref 读写组合场景仍待调试（testGcKeepsClosuresRunnable @Ignore；无捕获的闭包链 f()() 与单层捕获正常） |
-| 构造器 this 链的组合场景 | parser/runtime | new 的 thisObj 创建与传递已实现（callConstructor → run → OP_push_this），put_field 属性写入生效，但构造器属性赋值组合场景（this.v = x 后 o.v 读取）仍返回 undefined（testConstructorThisBinding @Ignore；疑似 RETVAL put_loc 0 与 put_field 的栈交互） |
-| build_backtrace 格式 | `JSContext.throwError` | stack 槽已生成基于 jsCallStack 的回溯文本；C 版的行号/列号信息未包含 |
+| 嵌套闭包捕获的执行组合场景 | parser/runtime | varref 池提升已实现并生效（单层捕获正常），但嵌套闭包（f 内 g 捕获 f 的 x）的 varref 读写组合场景仍待调试（testGcKeepsClosuresRunnable @Ignore；本地运行时报 'x' is not defined，varref 槽的跨层读写待定位） |
+| 构造器 this 链的组合场景 | parser/runtime | new 的 thisObj 创建与传递已实现（callConstructor → run → OP_push_this，GC 保活修复后 thisObj.v 写入正确），但构造器属性赋值组合场景（this.v = x 后 o.v 读取）仍返回 undefined（testConstructorThisBinding @Ignore；疑似 RETVAL put_loc 0 与 put_field 的栈交互） |
+| build_backtrace 格式 | `JSContext.throwError` | stack 槽已生成基于 jsCallStack 的回溯文本；C 版的行号/列号信息未包含；testErrorBacktrace 的 catch 绑定已修复（见下），回溯断言待随场景复验 |
 | GC 未处理 `JS_CLASS_REGEXP` / TYPED_ARRAY | `JSGC` | 这些内建类尚未在 Kotlin 实现，实现时需同步补 GC 分支（JS_CLASS_ERROR 分支已补齐） |
 | `f_f` 参数转换异常路径 | `callCFunction` | Kotlin 的 `JS_ToNumber` 为纯转换（不产生异常），上游 `49f1536` 的异常优先结构已按 C 形态实现，但异常分支待 `JS_ToNumber` 异常化后生效 |
+
+第三轮缺口补齐（✅ 已完成）：
+
+| 项目 | 状态 |
+|------|------|
+| thisObj 的 GC 传递（构造器 this 链） | ✅ 已修复：runBody 为 func/thisObj/args 建立 GC 保活区间（gcKeepAlive），每次迭代与 OP_push_this 从保活列表读取最新地址；callFunction 的 CLOSURE 分支与 callConstructor 的 thisObj 经保活传递（thisObj.v 写入经 trace 验证正确） |
+| 简单 = 的 lvalue 重发残留 | ✅ 已修复（本轮主因）：reemitLValueLoad 增加 forCompound 参数，简单 = 不重发读取（removeLastOp + rhs + dup + put_*），消除栈残留 |
+| OP_fclosure 分支遮蔽 | ✅ 已修复：从 push_const 复合分支拆分，正确创建 JS_CLASS_CLOSURE 对象（此前压的是函数字节码原值） |
+| 闭包调用链 | ✅ 已打通：callFunction 增加 CLOSURE 分支（从闭包对象取字节码执行），f()() 链式调用正常 |
+| 匿名函数的编译上下文 | ✅ 已补齐：parseFunctionExpr 补 scope push/pop 与 localVarsLen/evalRetIdx 保存恢复 |
+| 函数名绑定 | ✅ 已修复：parseFunctionDecl 的 fclosure 后 put_loc 存闭包对象（此前函数名未绑定） |
+| catch 变量绑定 | ✅ 已修复（trace 验证 r = e 生效；testErrorBacktrace 的 catch 部分通过，组合断言待复验） |
 
 ## 五、验证
 

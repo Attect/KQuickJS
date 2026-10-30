@@ -30,13 +30,27 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     private fun runBody(func: JSValue, thisObj: JSValue, args: List<JSValue>): JSValue {
-        val funcPtr = JS_VALUE_TO_PTR(func)
+        /* func/thisObj/args 元素加入 GC 保活列表：函数体执行期间的分配可能触发
+         * GC 压缩搬移，Kotlin 局部值会过期——执行中通过保活列表读取最新地址 */
+        val keepStart = ctx.gcKeepAlive.size
+        ctx.gcKeepAlive.add(func)
+        ctx.gcKeepAlive.add(thisObj)
+        for (a in args) ctx.gcKeepAlive.add(a)
+        
+        var funcKept = func
+        var thisObjKept = thisObj
+        
+        val funcPtr = JS_VALUE_TO_PTR(funcKept)
         if (ctx.memory.getMTag(funcPtr) != JSMTags.JS_MTAG_FUNCTION_BYTECODE) {
+            while (ctx.gcKeepAlive.size > keepStart) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
             return JS_EXCEPTION
         }
         
         val byteCode = ctx.memory.getJSValue(funcPtr + 16)
-        if (byteCode == JS_NULL) return JS_UNDEFINED
+        if (byteCode == JS_NULL) {
+            while (ctx.gcKeepAlive.size > keepStart) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+            return JS_UNDEFINED
+        }
         
         val byteCodePtr = JS_VALUE_TO_PTR(byteCode)
         val byteCodeLen = ctx.memory.getI32(byteCodePtr + 4)
@@ -59,12 +73,20 @@ class JSRuntime(private val ctx: JSContext) {
         var loopCount = 0
         val maxLoopCount = 100000
         
+        try {
         while (pc < code.size) {
             loopCount++
             if (loopCount > maxLoopCount) {
                 println("Error: Infinite loop detected, pc=$pc, op=${code[pc].toInt() and 0xFF}")
                 return JS_EXCEPTION
             }
+            
+            /* GC 可能在上一条指令的分配中触发并搬移对象：从保活列表刷新
+             * func 的最新地址（funcPtr 随之重算）；thisObj 由 OP_push_this
+             * 从保活列表读取 */
+            funcKept = ctx.gcKeepAlive[keepStart]
+            thisObjKept = ctx.gcKeepAlive[keepStart + 1]
+            val iterFuncPtr = JS_VALUE_TO_PTR(funcKept)
             
             val op = code[pc].toInt() and 0xFF
             if (System.getenv("MQJS_TRACE") != null) {
@@ -119,7 +141,7 @@ class JSRuntime(private val ctx: JSContext) {
                 OPCodeEnum.OP_get_global.id -> {
                     val idx = readU16(code, pc)
                     pc += 2
-                    val cpool = ctx.memory.getJSValue(funcPtr + 24)
+                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
                     val name = if (cpool != JS_NULL) {
                         ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
                     } else JS_UNDEFINED
@@ -134,7 +156,7 @@ class JSRuntime(private val ctx: JSContext) {
                     val idx = readU16(code, pc)
                     pc += 2
                     val v = stack.removeLast()
-                    val cpool = ctx.memory.getJSValue(funcPtr + 24)
+                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
                     val name = if (cpool != JS_NULL) {
                         ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
                     } else JS_UNDEFINED
@@ -144,8 +166,9 @@ class JSRuntime(private val ctx: JSContext) {
                 OPCodeEnum.OP_null.id -> stack.add(JS_NULL)
                 OPCodeEnum.OP_push_false.id -> stack.add(JS_FALSE)
                 OPCodeEnum.OP_push_true.id -> stack.add(JS_TRUE)
-                /* 压入当前函数帧的 this（对照 C fp[FRAME_OFFSET_THIS_OBJ]） */
-                OPCodeEnum.OP_push_this.id -> stack.add(thisObj)
+                /* 压入当前函数帧的 this（对照 C fp[FRAME_OFFSET_THIS_OBJ]）；
+                   从保活列表读取以获取 GC 搬移后的最新地址 */
+                OPCodeEnum.OP_push_this.id -> stack.add(ctx.gcKeepAlive[keepStart + 1])
                 
                 OPCodeEnum.OP_push_0.id -> stack.add(JS_NewShortInt(0))
                 OPCodeEnum.OP_push_1.id -> stack.add(JS_NewShortInt(1))
@@ -172,7 +195,7 @@ class JSRuntime(private val ctx: JSContext) {
                 OPCodeEnum.OP_push_const.id -> {
                     val idx = (code[pc].toInt() and 0xFF) or ((code[pc + 1].toInt() and 0xFF) shl 8)
                     pc += 2
-                    val cpool = ctx.memory.getJSValue(funcPtr + 24)
+                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
                     if (cpool != JS_NULL) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
                         stack.add(ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8))
@@ -185,7 +208,7 @@ class JSRuntime(private val ctx: JSContext) {
                     /* 从 cpool 的函数字节码创建 JS_CLASS_CLOSURE 对象（extra 槽 0 = funcBytecode） */
                     val idx = readU16(code, pc)
                     pc += 2
-                    val cpool = ctx.memory.getJSValue(funcPtr + 24)
+                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
                     val funcBytecode = if (cpool != JS_NULL) {
                         ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
                     } else JS_NULL
@@ -392,12 +415,16 @@ class JSRuntime(private val ctx: JSContext) {
                     val idx = readU16(code, pc)
                     pc += 2
                     val obj = stack.removeLast()
-                    val cpool = ctx.memory.getJSValue(funcPtr + 24)
+                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
                     val key = if (cpool != JS_NULL) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
                         ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
                     } else JS_UNDEFINED
-                    stack.add(getProperty(obj, key))
+                    val v = getProperty(obj, key)
+                    if (System.getenv("MQJS_TRACE") != null) {
+                        println("TRACE get_field obj=${if (JS_IsPtr(obj)) JS_VALUE_TO_PTR(obj) else obj} key='${jsGetString(ctx, key)}' -> isUnd=${JS_IsUndefined(v)}")
+                    }
+                    stack.add(v)
                 }
                 
                 OPCodeEnum.OP_get_field2.id -> {
@@ -410,7 +437,7 @@ class JSRuntime(private val ctx: JSContext) {
                         return JS_EXCEPTION
                     }
                     val obj = stack.last()
-                    val cpool = ctx.memory.getJSValue(funcPtr + 24)
+                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
                     val key = if (cpool != JS_NULL) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
                         ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
@@ -423,12 +450,15 @@ class JSRuntime(private val ctx: JSContext) {
                     pc += 2
                     val val1 = stack.removeLast()
                     val obj = stack.removeLast()
-                    val cpool = ctx.memory.getJSValue(funcPtr + 24)
+                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
                     val key = if (cpool != JS_NULL) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
                         ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
                     } else JS_UNDEFINED
                     setProperty(obj, key, val1)
+                    if (System.getenv("MQJS_TRACE") != null) {
+                        println("TRACE put_field obj=${if (JS_IsPtr(obj)) JS_VALUE_TO_PTR(obj) else obj} key='${jsGetString(ctx, key)}' val=${if (JS_IsInt(val1)) JS_VALUE_GET_INT(val1) else -1}")
+                    }
                 }
                 
                 OPCodeEnum.OP_define_field.id -> {
@@ -436,7 +466,7 @@ class JSRuntime(private val ctx: JSContext) {
                     pc += 2
                     val val1 = stack.removeLast()
                     val obj = stack.removeLast()
-                    val cpool = ctx.memory.getJSValue(funcPtr + 24)
+                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
                     val key = if (cpool != JS_NULL) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
                         ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
@@ -598,6 +628,10 @@ class JSRuntime(private val ctx: JSContext) {
                     pc = JS_VALUE_GET_INT(ret)
                 }
             }
+        }
+        } finally {
+            /* 移除本层的 func/thisObj/args 保活（递归时每层有自己的 keepStart 区间） */
+            while (ctx.gcKeepAlive.size > keepStart) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
         }
         
         return if (stack.isEmpty()) JS_UNDEFINED else stack.last()
@@ -905,13 +939,32 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun setProperty(obj: JSValue, key: JSValue, val1: JSValue) {
+        /* obj/key/val1 保活：写入路径的 allocProps/扩容 malloc 可能触发 GC 搬移，
+         * Kotlin 局部值会过期——内部通过保活列表读取最新地址 */
+        ctx.gcKeepAlive.add(obj)
+        ctx.gcKeepAlive.add(key)
+        ctx.gcKeepAlive.add(val1)
+        try {
+            setPropertyInternal()
+        } finally {
+            repeat(3) { ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1) }
+        }
+    }
+    
+    private fun setPropertyInternal() {
+        val obj = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 3]
+        val key = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 2]
+        val val1 = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
+        
         if (!JS_IsPtr(obj)) return
-        val objPtr = JS_VALUE_TO_PTR(obj)
+        var objPtr = JS_VALUE_TO_PTR(obj)
         if (ctx.memory.getMTag(objPtr) != JSMTags.JS_MTAG_OBJECT) return
         
         var props = ctx.memory.getJSValue(objPtr + 16)
         if (props == JS_NULL || props == ctx.emptyProps) {
             props = allocProps(4)
+            /* allocProps 的 malloc 可能触发 GC 搬移 obj：从保活列表刷新 obj 地址 */
+            objPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 3])
             ctx.memory.putJSValue(objPtr + 16, props)
         }
         
@@ -940,6 +993,12 @@ class JSRuntime(private val ctx: JSContext) {
             val newSize = size + 3
             val newProps = ctx.malloc(8 + newSize * 8, JSMTags.JS_MTAG_VALUE_ARRAY)
             if (newProps == 0) return
+            
+            /* 扩容的 malloc 可能触发 GC 搬移 obj/props：从保活列表刷新 obj 地址，
+               并重新读取 obj 的 props 槽（GC 已将其更新为搬移后的 props 位置） */
+            objPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 3])
+            props = ctx.memory.getJSValue(objPtr + 16)
+            propsPtr = JS_VALUE_TO_PTR(props)
             
             ctx.memory.putI32(newProps + 4, newSize)
             for (i in 0 until size) {
