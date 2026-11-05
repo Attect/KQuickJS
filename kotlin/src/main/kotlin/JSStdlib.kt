@@ -1036,6 +1036,40 @@ object JSStdlib {
                 toInt(c, rt, args[1]).coerceAtLeast(0)
             } else Int.MAX_VALUE
             if (limit == 0) return@defMethod JS_NewArray(c, 0)
+            /* 正则分隔符：按匹配切分，捕获组按规范插入结果 */
+            if (isRegExp(c, arg(args, 0))) {
+                val info = JS_GetOpaque(c, arg(args, 0)) as? RegexpInfo
+                if (info?.pat == null) return@defMethod JS_NewArray(c, 0)
+                val m = info.pat.matcher(s)
+                val parts = ArrayList<JSValue>()
+                var last = 0
+                var lastMatchNonZero = false
+                while (m.find()) {
+                    val st = m.start(); val en = m.end()
+                    if (st == last && en == last) {
+                        if (en >= s.length) break
+                        continue
+                    }
+                    parts.add(JS_NewString(c, s.substring(last, st)))
+                    for (g in 1..m.groupCount()) {
+                        val gv = if (en == st && st == last) null else m.group(g)
+                        parts.add(if (gv == null) JS_UNDEFINED else JS_NewString(c, gv))
+                    }
+                    last = en
+                    lastMatchNonZero = en > st
+                    if (en == st && en >= s.length) break
+                }
+                if (last < s.length || lastMatchNonZero) {
+                    parts.add(JS_NewString(c, s.substring(last)))
+                }
+                val n = minOf(parts.size, limit)
+                val out = JS_NewArray(c, n)
+                val keep = c.gcKeepAlive.size
+                c.gcKeepAlive.add(out)
+                for (i in 0 until n) rt.setElement(c.gcKeepAlive[keep], JS_NewShortInt(i), parts[i])
+                c.memory.putI32(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 32, n)
+                return@defMethod c.gcKeepAlive[keep]
+            }
             val sep = if (args.isEmpty() || JS_IsUndefined(args[0])) null else rt.toStringValue(args[0])
             var parts: List<String> = if (sep == null) {
                 if (s.isEmpty()) emptyList() else listOf(s)
@@ -1132,7 +1166,7 @@ object JSStdlib {
         defMethod(ctx, rt, proto, "search", 1) { c, thisVal, args ->
             val s = rt.toStringValue(thisVal)
             val re = arg(args, 0)
-            val pat = if (isRegExp(c, re)) JS_GetOpaque(c, re) as? java.util.regex.Pattern
+            val pat = if (isRegExp(c, re)) (JS_GetOpaque(c, re) as? RegexpInfo)?.pat
                       else compileRegexp(rt.toStringValue(re), "")
             if (pat == null) JS_NewShortInt(-1)
             else {
@@ -1272,25 +1306,76 @@ object JSStdlib {
     private fun sanitizePattern(p: String): String {
         val sb = StringBuilder()
         var i = 0
+        var inClass = false
         while (i < p.length) {
             val c = p[i]
-            if (c != '\\' || i + 1 >= p.length) {
-                sb.append(c); i++; continue
-            }
-            val n = p[i + 1]
-            when {
-                n == 'c' && i + 2 < p.length && p[i + 2].isLetter() -> {
-                    sb.append("\\x%02x".format(java.util.Locale.ROOT, p[i + 2].code % 32))
-                    i += 3
+            if (c == '\\' && i + 1 < p.length) {
+                val n = p[i + 1]
+                when {
+                    n == 'c' && i + 2 < p.length && p[i + 2].isLetter() -> {
+                        sb.append("\\x%02x".format(java.util.Locale.ROOT, p[i + 2].code % 32))
+                        i += 3
+                    }
+                    n == 'c' -> { sb.append("\\\\"); i += 1 }   /* \c 后非字母：字面反斜杠 */
+                    /* Java 字符类中的 \b/\B 非法：JS 字符类里 \b 是退格，\B 是字面 B */
+                    n == 'b' && inClass -> { sb.append("\\x08"); i += 2 }
+                    n == 'B' && inClass -> { sb.append('B'); i += 2 }
+                    n in "dDsSwWbBfnrtv0xupP".toSet() || n.isDigit() -> {
+                        sb.append('\\').append(n); i += 2
+                    }
+                    n == '\\' -> { sb.append("\\\\"); i += 2 }
+                    n.isLetter() -> { sb.append(n); i += 2 }   /* 身份转义：去掉反斜杠 */
+                    else -> { sb.append('\\').append(n); i += 2 } /* 标点转义保留（Java 有效） */
                 }
-                n == 'c' -> { sb.append("\\\\"); i += 1 }   /* \c 后非字母：字面反斜杠 */
-                n in "dDsSwWbBfnrtv0xupP".toSet() || n.isDigit() -> {
-                    sb.append('\\').append(n); i += 2
-                }
-                n == '\\' -> { sb.append("\\\\"); i += 2 }
-                n.isLetter() -> { sb.append(n); i += 2 }   /* 身份转义：去掉反斜杠 */
-                else -> { sb.append('\\').append(n); i += 2 } /* 标点转义保留（Java 有效） */
+                continue
             }
+            if (c == '[') inClass = true
+            else if (c == ']') inClass = false
+            sb.append(c)
+            i++
+        }
+        return sb.toString()
+    }
+
+    /* JS 正则允许空分支优先（如 (?:|[\w])+），Java 会因此提前停止；
+     * 把“以空分支开头”的分组改写为“空分支结尾”，保持贪婪匹配行为 */
+    private fun fixEmptyAlternation(p: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i < p.length) {
+            if (p[i] == '\\' && i + 1 < p.length) {
+                sb.append(p[i]).append(p[i + 1]); i += 2; continue
+            }
+            var prefixLen = -1
+            if (p.startsWith("(?:|", i)) prefixLen = 4
+            else if (p.startsWith("(|", i)) prefixLen = 2
+            if (prefixLen >= 0) {
+                var depth = 0
+                var j = i
+                var close = -1
+                while (j < p.length) {
+                    val c = p[j]
+                    if (c == '\\') { j += 2; continue }
+                    if (c == '[') {
+                        j++
+                        while (j < p.length && p[j] != ']') { if (p[j] == '\\') j++; j++ }
+                    } else if (c == '(') depth++
+                    else if (c == ')') {
+                        depth--
+                        if (depth == 0) { close = j; break }
+                    }
+                    j++
+                }
+                if (close > i) {
+                    val headEnd = i + prefixLen
+                    val inner = p.substring(headEnd, close)
+                    val head = if (prefixLen == 4) "(?:" else "("
+                    sb.append(head).append(inner).append("|)")
+                    i = close + 1
+                    continue
+                }
+            }
+            sb.append(p[i]); i++
         }
         return sb.toString()
     }
@@ -1302,11 +1387,39 @@ object JSStdlib {
         if (flags.contains('m')) f = f or java.util.regex.Pattern.MULTILINE
         if (flags.contains('s')) f = f or java.util.regex.Pattern.DOTALL
         if (flags.contains('u')) f = f or java.util.regex.Pattern.UNICODE_CASE
-        return try {
-            java.util.regex.Pattern.compile(sanitizePattern(pattern), f)
+        val src = fixEmptyAlternation(sanitizePattern(pattern))
+        fun tryCompile(s: String): java.util.regex.Pattern? = try {
+            java.util.regex.Pattern.compile(s, f)
         } catch (e: Exception) {
             null
+        } catch (e: StackOverflowError) {
+            null
         }
+        return tryCompile(src) ?: stripRedundantNesting(src)?.let { tryCompile(it) }
+    }
+
+    /* 剥离形如 (?: (?: ... ) ) 的冗余嵌套外壳（Java 深层嵌套会栈溢出） */
+    private fun stripRedundantNesting(p: String): String? {
+        var k = 0
+        while (p.startsWith("(?:", k * 3)) k++
+        if (k == 0 || p.length <= 2 * k) return null
+        for (i in 0 until k) {
+            if (p[p.length - 1 - i] != ')') return null
+        }
+        val inner = p.substring(3 * k, p.length - k)
+        var depth = 0
+        var i = 0
+        while (i < inner.length) {
+            val c = inner[i]
+            if (c == '\\') { i += 2; continue }
+            if (c == '[') {
+                i++
+                while (i < inner.length && inner[i] != ']') { if (inner[i] == '\\') i++; i++ }
+            } else if (c == '(') depth++
+            else if (c == ')') { depth--; if (depth < 0) return null }
+            i++
+        }
+        return if (depth == 0) inner else null
     }
 
     fun newRegExp(ctx: JSContext, pattern: String, flags: String): JSValue {
@@ -1322,7 +1435,9 @@ object JSStdlib {
             rt.setProperty(o, JS_NewString(ctx, "flags"), JS_NewString(ctx, flags))
             rt.setProperty(o, JS_NewString(ctx, "global"), JS_NewBool(flags.contains('g')))
             rt.setProperty(o, JS_NewString(ctx, "lastIndex"), JS_NewShortInt(0))
-            JS_SetOpaque(ctx, ctx.gcKeepAlive[keep], compileRegexp(pattern, flags))
+            JS_SetOpaque(ctx, ctx.gcKeepAlive[keep],
+                         RegexpInfo(compileRegexp(pattern, flags), pattern,
+                                    quantifiedCaptureAncestors(pattern)))
             return ctx.gcKeepAlive[keep]
         } finally {
             while (ctx.gcKeepAlive.size > keep) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
@@ -1334,33 +1449,160 @@ object JSStdlib {
         return if (JS_IsString(ctx, v)) jsGetString(ctx, v) else ""
     }
 
+    class RegexpInfo(val pat: java.util.regex.Pattern?, val source: String,
+                     val quantifiedAncestors: IntArray)
+
+    /* 解析正则结构：返回每个捕获组“最近的被 * / + / {n,} 量词化的捕获祖先”索引。
+     * JS 规范要求量词内未在最后一次迭代参与的捕获组为 undefined，而 Java 会保留
+     * 更早迭代的值；据此在 exec 结果里把过期捕获重置为 undefined。 */
+    private fun quantifiedCaptureAncestors(pattern: String): IntArray {
+        val parents = ArrayList<Int>()
+        val captureIdx = ArrayList<Int>()
+        val quantified = ArrayList<Boolean>()
+        val isAssertion = ArrayList<Boolean>()
+        val quantifiedZero = ArrayList<Boolean>()
+        val stack = ArrayList<Int>()
+        var capCount = 0
+        var i = 0
+        fun newGroup(cap: Boolean, assertion: Boolean = false): Int {
+            val id = parents.size
+            parents.add(stack.lastOrNull() ?: -1)
+            captureIdx.add(if (cap) ++capCount else -1)
+            quantified.add(false)
+            isAssertion.add(assertion)
+            quantifiedZero.add(false)
+            stack.add(id)
+            return id
+        }
+        while (i < pattern.length) {
+            val c = pattern[i]
+            when {
+                c == '\\' -> i += 2
+                c == '[' -> {
+                    i++
+                    while (i < pattern.length && pattern[i] != ']') {
+                        if (pattern[i] == '\\') i++
+                        i++
+                    }
+                    i++
+                }
+                c == '(' -> {
+                    if (i + 1 < pattern.length && pattern[i + 1] == '?') {
+                        val c2 = if (i + 2 < pattern.length) pattern[i + 2] else ' '
+                        if (c2 == '<' && i + 3 < pattern.length &&
+                            (pattern[i + 3] == '=' || pattern[i + 3] == '!')) {
+                            newGroup(false, assertion = true); i += 4
+                        } else if (c2 == '=' || c2 == '!') {
+                            newGroup(false, assertion = true); i += 3
+                        } else if (c2 == '<' || c2 == 'P') {
+                            newGroup(true)
+                            i += if (c2 == 'P') 4 else 3
+                            while (i < pattern.length && pattern[i] != '>') i++
+                            i++
+                        } else {
+                            newGroup(false); i += 3
+                        }
+                    } else {
+                        newGroup(true); i++
+                    }
+                }
+                c == ')' -> {
+                    val id = stack.removeAt(stack.size - 1)
+                    var j = i + 1
+                    var q = false
+                    var qZero = false
+                    if (j < pattern.length) {
+                        when (pattern[j]) {
+                            '*' -> { q = true; qZero = true; j++ }
+                            '+' -> { q = true; j++ }
+                            '?' -> { q = true; qZero = true; j++ }
+                            '{' -> {
+                                val close = pattern.indexOf('}', j)
+                                if (close > j && pattern.substring(j + 1, close).matches(Regex("\\d+(,\\d*)?"))) {
+                                    q = true
+                                    val body = pattern.substring(j + 1, close)
+                                    qZero = body.startsWith("0") && (body.length == 1 || body[1] == ',')
+                                    j = close + 1
+                                }
+                            }
+                        }
+                        if (q && j < pattern.length && pattern[j] == '?') j++ /* 懒惰量词 */
+                    }
+                    quantified[id] = q
+                    quantifiedZero[id] = qZero
+                    i = j
+                }
+                else -> i++
+            }
+        }
+        val anc = IntArray(capCount + 1) { -1 }
+        for (id in parents.indices) {
+            val ci = captureIdx[id]
+            if (ci < 0) continue
+            var p = parents[id]
+            var sawAssertion = false
+            while (p >= 0) {
+                if (isAssertion[p]) sawAssertion = true
+                if (sawAssertion && quantifiedZero[p]) {
+                    anc[ci] = -2   /* 可空量词内的先行/后行断言：捕获一律重置 */
+                    break
+                }
+                if (quantified[p] && captureIdx[p] >= 0) {
+                    anc[ci] = captureIdx[p]; break
+                }
+                p = parents[p]
+            }
+        }
+        return anc
+    }
+
     fun regexpExec(ctx: JSContext, rt: JSRuntime, re: JSValue, str: String): JSValue {
-        val pat = JS_GetOpaque(ctx, re) as? java.util.regex.Pattern
+        val info = JS_GetOpaque(ctx, re) as? RegexpInfo
+        val pat = info?.pat
         if (pat == null) return JS_NULL
-        val global = reFlags(ctx, rt, re).contains('g')
+        val reKeep = ctx.gcKeepAlive.size
+        ctx.gcKeepAlive.add(re)
+        val flags = reFlags(ctx, rt, ctx.gcKeepAlive[reKeep])
+        val global = flags.contains('g')
+        val unicode = flags.contains('u')
         val m = pat.matcher(str)
         var start = 0
         if (global) {
-            val li = rt.getProperty(re, JS_NewString(ctx, "lastIndex"))
+            val li = rt.getProperty(ctx.gcKeepAlive[reKeep], JS_NewString(ctx, "lastIndex"))
             start = if (JS_IsInt(li)) JS_VALUE_GET_INT(li) else 0
+            /* unicode 模式下 lastIndex 落在代理对中间时视为匹配失败并清零 */
+            if (unicode && start > 0 && start < str.length &&
+                Character.isLowSurrogate(str[start]) && Character.isHighSurrogate(str[start - 1])) {
+                rt.setProperty(ctx.gcKeepAlive[reKeep], JS_NewString(ctx, "lastIndex"), JS_NewShortInt(0))
+                return JS_NULL
+            }
             if (start < 0 || start > str.length) {
-                rt.setProperty(re, JS_NewString(ctx, "lastIndex"), JS_NewShortInt(0))
+                rt.setProperty(ctx.gcKeepAlive[reKeep], JS_NewString(ctx, "lastIndex"), JS_NewShortInt(0))
                 return JS_NULL
             }
         }
         val found = if (global) m.find(start) else m.find()
         if (!found) {
-            if (global) rt.setProperty(re, JS_NewString(ctx, "lastIndex"), JS_NewShortInt(0))
+            if (global) rt.setProperty(ctx.gcKeepAlive[reKeep], JS_NewString(ctx, "lastIndex"), JS_NewShortInt(0))
             return JS_NULL
         }
         val n = m.groupCount() + 1
         val arr = JS_NewArray(ctx, n)
         if (JS_IsException(arr)) return JS_NULL
         val keep = ctx.gcKeepAlive.size
-        ctx.gcKeepAlive.add(re)
+        ctx.gcKeepAlive.add(ctx.gcKeepAlive[reKeep])
         ctx.gcKeepAlive.add(arr)
         for (g in 0 until n) {
-            val gv = m.group(g)
+            var gv = m.group(g)
+            /* 量词内、且不属于最后一次迭代的捕获应重置为 undefined */
+            if (gv != null && info != null && g < info.quantifiedAncestors.size) {
+                val a = info.quantifiedAncestors[g]
+                if (a == -2) {
+                    gv = null
+                } else if (a >= 0 && m.start(g) >= 0 && m.start(a) >= 0 && m.start(g) < m.start(a)) {
+                    gv = null
+                }
+            }
             rt.setElement(ctx.gcKeepAlive[keep + 1], JS_NewShortInt(g),
                 if (gv == null) JS_UNDEFINED else JS_NewString(ctx, gv))
         }
@@ -1409,7 +1651,7 @@ object JSStdlib {
 
     private fun regexpReplace(ctx: JSContext, rt: JSRuntime, re: JSValue, s: String,
                               rep: JSValue): JSValue {
-        val pat = JS_GetOpaque(ctx, re) as? java.util.regex.Pattern ?: return JS_NewString(ctx, s)
+        val pat = (JS_GetOpaque(ctx, re) as? RegexpInfo)?.pat ?: return JS_NewString(ctx, s)
         val global = reFlags(ctx, rt, re).contains('g')
         val m = pat.matcher(s)
         val sb = StringBuilder()
@@ -1438,7 +1680,7 @@ object JSStdlib {
     }
 
     private fun regexpMatch(ctx: JSContext, rt: JSRuntime, re: JSValue, s: String): JSValue {
-        val pat = JS_GetOpaque(ctx, re) as? java.util.regex.Pattern ?: return JS_NULL
+        val pat = (JS_GetOpaque(ctx, re) as? RegexpInfo)?.pat ?: return JS_NULL
         val global = reFlags(ctx, rt, re).contains('g')
         if (!global) return regexpExec(ctx, rt, re, s)
         val m = pat.matcher(s)
