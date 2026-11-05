@@ -184,6 +184,13 @@ object JSGC {
                 val extraSize = ctx.memory.getU8(ptr + 3)
                 
                 when (classId) {
+                    JSObjectClassEnum.JS_CLASS_OBJECT.value -> {
+                        /* 普通对象通常 extra_size=0；extra_size=2 的对象是属性
+                         * 访问器描述符（getter/setter），槽位需作为 GC 引用处理 */
+                        for (i in 0 until extraSize) {
+                            gcMark(ctx, markStack, ctx.memory.getJSValue(ptr + 24 + i * 8))
+                        }
+                    }
                     JSObjectClassEnum.JS_CLASS_CLOSURE.value -> {
                         val funcBytecode = ctx.memory.getJSValue(ptr + 24)
                         gcMark(ctx, markStack, funcBytecode)
@@ -240,6 +247,7 @@ object JSGC {
                 val extVars = ctx.memory.getJSValue(ptr + 40)
                 val filename = ctx.memory.getJSValue(ptr + 48)
                 val pc2line = ctx.memory.getJSValue(ptr + 56)
+                val captures = ctx.memory.getJSValue(ptr + 64)
                 
                 gcMark(ctx, markStack, funcName)
                 gcMark(ctx, markStack, byteCode)
@@ -248,6 +256,7 @@ object JSGC {
                 gcMark(ctx, markStack, extVars)
                 gcMark(ctx, markStack, filename)
                 gcMark(ctx, markStack, pc2line)
+                gcMark(ctx, markStack, captures)
             }
         }
     }
@@ -333,6 +342,12 @@ object JSGC {
                 val extraSize = ctx.memory.getU8(ptr + 3)
                 
                 when (classId) {
+                    JSObjectClassEnum.JS_CLASS_OBJECT.value -> {
+                        /* 访问器描述符的 getter/setter 槽 */
+                        for (i in 0 until extraSize) {
+                            remap(ptr + 24 + i * 8)
+                        }
+                    }
                     JSObjectClassEnum.JS_CLASS_CLOSURE.value -> {
                         remap(ptr + 24)
                         for (i in 0 until extraSize - 1) {
@@ -375,7 +390,7 @@ object JSGC {
                 }
             }
             JSMTags.JS_MTAG_FUNCTION_BYTECODE -> {
-                for (off in intArrayOf(8, 16, 24, 32, 40, 48, 56)) {
+                for (off in intArrayOf(8, 16, 24, 32, 40, 48, 56, 64)) {
                     remap(ptr + off)
                 }
             }

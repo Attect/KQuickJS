@@ -141,7 +141,9 @@ enum class OPCodeEnum(val id: Int, val size: Int, val nPop: Int, val nPush: Int,
     /* 全局标识符读写（cpool 存名字，未声明标识符走此路径；对照 C 的
        GLOBAL varref 经 globalObj 属性解析的语义） */
     OP_get_global(126, 3, 0, 1, 7),
-    OP_put_global(127, 3, 1, 0, 7);
+    OP_put_global(127, 3, 1, 0, 7),
+    /* typeof 专用：未声明的全局标识符返回 undefined 而不是抛 ReferenceError */
+    OP_get_global_undef(128, 3, 0, 1, 7);
     
     companion object {
         fun fromId(id: Int): OPCodeEnum? = entries.find { it.id == id }

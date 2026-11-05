@@ -12,11 +12,11 @@ class JSRuntime(private val ctx: JSContext) {
     
     fun run(func: JSValue, thisObj: JSValue): JSValue = run(func, thisObj, emptyList())
     
-    fun run(func: JSValue, thisObj: JSValue, args: List<JSValue>): JSValue {
+    fun run(func: JSValue, thisObj: JSValue, args: List<JSValue>, closure: JSValue = JS_UNDEFINED): JSValue {
         /* 维护 JS 调用栈记录（Kotlin 无 C 的 fp 帧链，用于生成错误对象的 stack 回溯） */
         ctx.jsCallStack.addLast(readFuncName(func))
         try {
-            return runBody(func, thisObj, args)
+            return runBody(func, thisObj, args, closure)
         } finally {
             ctx.jsCallStack.removeLast()
         }
@@ -29,12 +29,15 @@ class JSRuntime(private val ctx: JSContext) {
         return if (JS_IsString(ctx, name)) jsGetString(ctx, name) else "<anonymous>"
     }
     
-    private fun runBody(func: JSValue, thisObj: JSValue, args: List<JSValue>): JSValue {
-        /* func/thisObj/args 元素加入 GC 保活列表：函数体执行期间的分配可能触发
-         * GC 压缩搬移，Kotlin 局部值会过期——执行中通过保活列表读取最新地址 */
+    private fun runBody(func: JSValue, thisObj: JSValue, args: List<JSValue>,
+                        closure: JSValue = JS_UNDEFINED): JSValue {
+        /* func/thisObj/closure/args 加入 GC 保活列表：函数体执行期间的分配可能触发
+         * GC 压缩搬移，Kotlin 局部值会过期——执行中通过保活列表读取最新地址。
+         * 帧布局：keepStart=func, +1=thisObj, +2=closure, +3..=args */
         val keepStart = ctx.gcKeepAlive.size
         ctx.gcKeepAlive.add(func)
         ctx.gcKeepAlive.add(thisObj)
+        ctx.gcKeepAlive.add(closure)
         for (a in args) ctx.gcKeepAlive.add(a)
         
         var funcKept = func
@@ -151,6 +154,17 @@ class JSRuntime(private val ctx: JSContext) {
                     stack.add(v)
                 }
                 
+                OPCodeEnum.OP_get_global_undef.id -> {
+                    /* typeof 操作数：不存在时返回 undefined，不抛异常 */
+                    val idx = readU16(code, pc)
+                    pc += 2
+                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
+                    val name = if (cpool != JS_NULL) {
+                        ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
+                    } else JS_UNDEFINED
+                    stack.add(getProperty(ctx.globalObj, name))
+                }
+                
                 OPCodeEnum.OP_put_global.id -> {
                     val idx = readU16(code, pc)
                     pc += 2
@@ -168,6 +182,8 @@ class JSRuntime(private val ctx: JSContext) {
                 /* 压入当前函数帧的 this（对照 C fp[FRAME_OFFSET_THIS_OBJ]）；
                    从保活列表读取以获取 GC 搬移后的最新地址 */
                 OPCodeEnum.OP_push_this.id -> stack.add(ctx.gcKeepAlive[keepStart + 1])
+                /* 当前闭包对象（具名函数表达式在其内部引用自身） */
+                OPCodeEnum.OP_this_func.id -> stack.add(ctx.gcKeepAlive[keepStart + 2])
                 
                 OPCodeEnum.OP_push_0.id -> stack.add(JS_NewShortInt(0))
                 OPCodeEnum.OP_push_1.id -> stack.add(JS_NewShortInt(1))
@@ -212,12 +228,63 @@ class JSRuntime(private val ctx: JSContext) {
                         ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
                     } else JS_NULL
                     
-                    val closure = JS_NewObjectProtoClass(ctx, JS_NULL,
-                                                         JSObjectClassEnum.JS_CLASS_CLOSURE.value, 1)
-                    if (JS_IsException(closure)) return JS_EXCEPTION
-                    val closurePtr = JS_VALUE_TO_PTR(closure)
-                    ctx.memory.putJSValue(closurePtr + 24, funcBytecode)
-                    stack.add(closure)
+                    /* 分配会触发 GC：函数字节码入保活槽，之后从槽位读取 */
+                    ctx.gcKeepAlive.add(funcBytecode)
+                    try {
+                        val closure = JS_NewObjectProtoClass(ctx, ctx.classProto[JSObjectClassEnum.JS_CLASS_CLOSURE.value],
+                                                             JSObjectClassEnum.JS_CLASS_CLOSURE.value, 1)
+                        if (JS_IsException(closure)) return JS_EXCEPTION
+                        val closurePtr = JS_VALUE_TO_PTR(closure)
+                        ctx.memory.putJSValue(closurePtr + 24, ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                        stack.add(closure)
+                        
+                        /* 捕获变量初始化：把当前帧同名实参/局部的当前值写入 varref 池槽 */
+                        val fb = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
+                        if (JS_IsPtr(fb)) {
+                            val capArr = ctx.memory.getJSValue(JS_VALUE_TO_PTR(fb) + 64)
+                            if (capArr != JS_NULL && !JS_IsException(capArr)) {
+                                val capPtr = JS_VALUE_TO_PTR(capArr)
+                                val capCount = ctx.memory.getI32(capPtr + 4) / 2
+                                val curVarsTab = ctx.memory.getJSValue(iterFuncPtr + 32)
+                                if (curVarsTab != JS_NULL) {
+                                    val tabPtr = JS_VALUE_TO_PTR(curVarsTab)
+                                    val tabLen = ctx.memory.getI32(tabPtr + 4)
+                                    for (ci in 0 until capCount) {
+                                        val name = ctx.memory.getJSValue(capPtr + 8 + 2 * ci * 8)
+                                        val slot = JS_VALUE_GET_INT(ctx.memory.getJSValue(capPtr + 16 + 2 * ci * 8))
+                                        for (j in 0 until minOf(tabLen, vars.size)) {
+                                            val vn = ctx.memory.getJSValue(tabPtr + 8 + j * 8)
+                                            if (vn == name || jsValueEquals(vn, name)) {
+                                                while (ctx.varrefPool.size <= slot) {
+                                                    ctx.varrefPool.add(JS_UNDEFINED)
+                                                }
+                                                ctx.varrefPool[slot] = vars[j]
+                                                break
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        /* 函数对象自动获得 prototype（constructor 指回闭包），
+                         * 供 new F()/instanceof/F.prototype.constructor 使用 */
+                        val protoObj = JS_NewObject(ctx)
+                        if (!JS_IsException(protoObj)) {
+                            ctx.gcKeepAlive.add(protoObj)
+                            try {
+                                /* 闭包在解释器栈顶（GC 根），protoObj 在保活槽 */
+                                val keyCtor = JS_NewString(ctx, "constructor")
+                                setProperty(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1], keyCtor, stack.last())
+                                val keyProto = JS_NewString(ctx, "prototype")
+                                setProperty(stack.last(), keyProto, ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                            } finally {
+                                ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+                            }
+                        }
+                    } finally {
+                        ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+                    }
                 }
                 
                 OPCodeEnum.OP_drop.id -> stack.removeLast()
@@ -269,6 +336,18 @@ class JSRuntime(private val ctx: JSContext) {
                     stack.add(doNeg(a))
                 }
                 
+                OPCodeEnum.OP_plus.id -> {
+                    val a = stack.removeLast()
+                    stack.add(if (JS_IsInt(a) || JS_IsShortFloat(a)) a
+                              else JS_NewFloat64(ctx, toNumber(a)))
+                }
+                
+                OPCodeEnum.OP_pow.id -> {
+                    val b = stack.removeLast()
+                    val a = stack.removeLast()
+                    stack.add(JS_NewFloat64(ctx, Math.pow(toNumber(a), toNumber(b))))
+                }
+                
                 OPCodeEnum.OP_lnot.id -> {
                     val a = stack.removeLast()
                     stack.add(if (toBoolean(a)) JS_FALSE else JS_TRUE)
@@ -313,13 +392,13 @@ class JSRuntime(private val ctx: JSContext) {
                 OPCodeEnum.OP_strict_eq.id -> {
                     val b = stack.removeLast()
                     val a = stack.removeLast()
-                    stack.add(if (a == b) JS_TRUE else JS_FALSE)
+                    stack.add(if (strictEquals(a, b)) JS_TRUE else JS_FALSE)
                 }
                 
                 OPCodeEnum.OP_strict_neq.id -> {
                     val b = stack.removeLast()
                     val a = stack.removeLast()
-                    stack.add(if (a == b) JS_FALSE else JS_TRUE)
+                    stack.add(if (strictEquals(a, b)) JS_FALSE else JS_TRUE)
                 }
                 
                 OPCodeEnum.OP_shl.id -> {
@@ -531,6 +610,169 @@ class JSRuntime(private val ctx: JSContext) {
                     stack.add(getLength(obj))
                 }
                 
+                OPCodeEnum.OP_typeof.id -> {
+                    stack.add(JS_NewString(ctx, jsTypeof(stack.removeLast())))
+                }
+                
+                OPCodeEnum.OP_in.id -> {
+                    val obj = stack.removeLast()
+                    val key = stack.removeLast()
+                    stack.add(JS_NewBool(hasProperty(obj, key)))
+                }
+                
+                OPCodeEnum.OP_instanceof.id -> {
+                    val ctor = stack.removeLast()
+                    val obj = stack.removeLast()
+                    val r = jsInstanceof(obj, ctor)
+                    if (JS_IsException(r)) {
+                        val target = unwindToCatch(stack)
+                        if (target < 0) return JS_EXCEPTION
+                        pc = target
+                    } else {
+                        stack.add(r)
+                    }
+                }
+                
+                OPCodeEnum.OP_delete.id -> {
+                    val key = stack.removeLast()
+                    val obj = stack.removeLast()
+                    deleteProperty(obj, key)
+                    stack.add(JS_TRUE)
+                }
+                
+                OPCodeEnum.OP_arguments.id -> {
+                    /* arguments：把本帧实参复制成数组对象（length/索引均可用）。
+                     * 实参已由 runBody 放入 gcKeepAlive（keepStart+2 起） */
+                    val argc = args.size
+                    val arr = JS_NewArray(ctx, argc)
+                    if (JS_IsException(arr)) return JS_EXCEPTION
+                    ctx.gcKeepAlive.add(arr)
+                    try {
+                        val tab = allocValueArray(argc)
+                        if (!JS_IsNull(tab) && !JS_IsException(tab)) {
+                            val tabPtr = JS_VALUE_TO_PTR(tab)
+                            for (i in 0 until argc) {
+                                ctx.memory.putJSValue(tabPtr + 8 + i * 8,
+                                                      ctx.gcKeepAlive[keepStart + 3 + i])
+                            }
+                            val arrPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                            ctx.memory.putJSValue(arrPtr + 24, tab)
+                            ctx.memory.putI32(arrPtr + 32, argc)
+                        }
+                        stack.add(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                    } finally {
+                        ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+                    }
+                }
+                
+                OPCodeEnum.OP_define_getter.id, OPCodeEnum.OP_define_setter.id -> {
+                    val idx = readU16(code, pc)
+                    pc += 2
+                    val func = stack.removeLast()
+                    val obj = stack.removeLast()
+                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
+                    val key = if (cpool != JS_NULL) {
+                        ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
+                    } else JS_UNDEFINED
+                    defineAccessor(obj, key, func, isGetter = op == OPCodeEnum.OP_define_getter.id)
+                    stack.add(obj)
+                }
+                
+                OPCodeEnum.OP_set_proto.id -> {
+                    val proto = stack.removeLast()
+                    val obj = stack.removeLast()
+                    if (JS_IsPtr(obj)) {
+                        val objPtr = JS_VALUE_TO_PTR(obj)
+                        if (ctx.memory.getMTag(objPtr) == JSMTags.JS_MTAG_OBJECT) {
+                            val newProto = if (JS_IsPtr(proto) &&
+                                ctx.memory.getMTag(JS_VALUE_TO_PTR(proto)) == JSMTags.JS_MTAG_OBJECT) {
+                                proto
+                            } else if (JS_IsNull(proto)) {
+                                JS_NULL
+                            } else {
+                                ctx.memory.getJSValue(objPtr + 8)
+                            }
+                            ctx.memory.putJSValue(objPtr + 8, newProto)
+                        }
+                    }
+                    stack.add(obj)
+                }
+                
+                OPCodeEnum.OP_for_in_start.id -> {
+                    /* obj -> 迭代器（VALUE_ARRAY [keysArray, pos]） */
+                    val obj = stack.removeLast()
+                    val keys = jsObjectKeys(obj)
+                    if (JS_IsException(keys)) {
+                        val target = unwindToCatch(stack)
+                        if (target < 0) return JS_EXCEPTION
+                        pc = target
+                    } else {
+                        ctx.gcKeepAlive.add(keys)
+                        try {
+                            val iter = allocValueArray(2)
+                            if (JS_IsNull(iter) || JS_IsException(iter)) return JS_EXCEPTION
+                            val iterPtr = JS_VALUE_TO_PTR(iter)
+                            ctx.memory.putJSValue(iterPtr + 8, ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                            ctx.memory.putJSValue(iterPtr + 16, JS_NewShortInt(0))
+                            stack.add(iter)
+                        } finally {
+                            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+                        }
+                    }
+                }
+                
+                OPCodeEnum.OP_for_of_start.id -> {
+                    /* for-of：迭代数组元素。迭代器结构同 for-in（[数组对象, pos]） */
+                    val obj = stack.removeLast()
+                    var ok = false
+                    if (JS_IsPtr(obj)) {
+                        val p = JS_VALUE_TO_PTR(obj)
+                        ok = ctx.memory.getMTag(p) == JSMTags.JS_MTAG_OBJECT &&
+                             ctx.memory.getU8(p + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value
+                    }
+                    if (!ok) {
+                        val r = JS_ThrowTypeError(ctx, "unsupported type in for...of")
+                        if (JS_IsException(r)) {
+                            val target = unwindToCatch(stack)
+                            if (target < 0) return JS_EXCEPTION
+                            pc = target
+                        }
+                    } else {
+                        ctx.gcKeepAlive.add(obj)
+                        try {
+                            val iter = allocValueArray(2)
+                            if (JS_IsNull(iter) || JS_IsException(iter)) return JS_EXCEPTION
+                            val iterPtr = JS_VALUE_TO_PTR(iter)
+                            ctx.memory.putJSValue(iterPtr + 8, ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                            ctx.memory.putJSValue(iterPtr + 16, JS_NewShortInt(0))
+                            stack.add(iter)
+                        } finally {
+                            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+                        }
+                    }
+                }
+                
+                OPCodeEnum.OP_for_of_next.id -> {
+                    /* iter -> iter value done（done 在栈顶，供 if_false 消费） */
+                    val iter = stack.last()
+                    val iterPtr = JS_VALUE_TO_PTR(iter)
+                    val keys = ctx.memory.getJSValue(iterPtr + 8)
+                    val pos = JS_VALUE_GET_INT(ctx.memory.getJSValue(iterPtr + 16))
+                    val keyArrPtr = JS_VALUE_TO_PTR(keys)
+                    val len = ctx.memory.getI32(keyArrPtr + 32)
+                    if (pos >= len) {
+                        stack.add(JS_UNDEFINED)
+                        stack.add(JS_TRUE)
+                    } else {
+                        val tab = ctx.memory.getJSValue(keyArrPtr + 24)
+                        val elem = if (tab == JS_NULL) JS_UNDEFINED
+                                   else ctx.memory.getJSValue(JS_VALUE_TO_PTR(tab) + 8 + pos * 8)
+                        stack.add(elem)
+                        stack.add(JS_FALSE)
+                        ctx.memory.putJSValue(iterPtr + 16, JS_NewShortInt(pos + 1))
+                    }
+                }
+                
                 OPCodeEnum.OP_get_loc.id -> {
                     val idx = readU16(code, pc)
                     pc += 2
@@ -696,19 +938,85 @@ class JSRuntime(private val ctx: JSContext) {
                ((code[pc + 3].toInt() and 0xFF) shl 24)
     }
     
-    fun toNumber(v: JSValue): Double {
+    fun toNumber(v0: JSValue): Double {
+        val v = toPrimitive(v0, 1)
         if (JS_IsInt(v)) return JS_VALUE_GET_INT(v).toDouble()
         if (JS_IsShortFloat(v)) return jsGetShortFloat(v)
         if (JS_IsPtr(v)) {
             val ptr = JS_VALUE_TO_PTR(v)
-            if (ctx.memory.getMTag(ptr) == JSMTags.JS_MTAG_FLOAT64) {
-                return ctx.memory.getFloat64(ptr + 8)
+            when (ctx.memory.getMTag(ptr)) {
+                JSMTags.JS_MTAG_FLOAT64 -> return ctx.memory.getFloat64(ptr + 8)
+                JSMTags.JS_MTAG_STRING -> {
+                    val s = jsGetString(ctx, v).trim()
+                    if (s.isEmpty()) return 0.0
+                    val hex = s.startsWith("0x") || s.startsWith("0X")
+                    return try {
+                        if (hex) s.substring(2).toLong(16).toDouble() else s.toDouble()
+                    } catch (e: NumberFormatException) {
+                        Double.NaN
+                    }
+                }
             }
         }
         if (JS_IsNull(v)) return 0.0
         if (JS_IsUndefined(v)) return Double.NaN
         if (JS_IsBool(v)) return if (JS_VALUE_GET_SPECIAL_VALUE(v) != 0) 1.0 else 0.0
         return Double.NaN
+    }
+    
+    /* ToPrimitive：对象先尝试 valueOf/toString（hint：0 default，1 number，2 string） */
+    fun toPrimitive(v: JSValue, hint: Int): JSValue {
+        if (!JS_IsPtr(v)) return v
+        val ptr0 = JS_VALUE_TO_PTR(v)
+        if (ctx.memory.getMTag(ptr0) != JSMTags.JS_MTAG_OBJECT) return v
+        ctx.gcKeepAlive.add(v)
+        try {
+            val order = if (hint == 2) arrayOf("toString", "valueOf") else arrayOf("valueOf", "toString")
+            for (name in order) {
+                val key = JS_NewString(ctx, name)
+                val m = getProperty(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1], key)
+                if (JS_IsFunction(ctx, m)) {
+                    val r = callFunction(m, emptyList(), ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                    if (!JS_IsException(r)) {
+                        val rp = if (JS_IsPtr(r)) JS_VALUE_TO_PTR(r) else -1
+                        if (rp < 0 || ctx.memory.getMTag(rp) != JSMTags.JS_MTAG_OBJECT) {
+                            return r
+                        }
+                    }
+                }
+            }
+            return ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
+    }
+    
+    /* ToString（用于字符串拼接） */
+    fun toStringValue(v0: JSValue): String {
+        val v = if (JS_IsPtr(v0) &&
+                    ctx.memory.getMTag(JS_VALUE_TO_PTR(v0)) == JSMTags.JS_MTAG_OBJECT) {
+            toPrimitive(v0, 2)
+        } else v0
+        return jsGetString(ctx, v)
+    }
+    
+    fun strictEquals(a: JSValue, b: JSValue): Boolean {
+        if (a == b) return true
+        if (JS_IsString(ctx, a) && JS_IsString(ctx, b)) {
+            return jsGetString(ctx, a) == jsGetString(ctx, b)
+        }
+        /* 数值跨表示形式相等：整数 2 与浮点 2.0 是同一个 JS 数值 */
+        if (isNumberValue(a) && isNumberValue(b)) {
+            return toNumber(a) == toNumber(b)
+        }
+        return false
+    }
+    
+    fun isNumberValue(v: JSValue): Boolean {
+        if (JS_IsInt(v) || JS_IsShortFloat(v)) return true
+        if (!JS_IsPtr(v)) return false
+        val p = JS_VALUE_TO_PTR(v)
+        return ctx.memory.getMTag(p) == JSMTags.JS_MTAG_FLOAT64
     }
     
     fun toBoolean(v: JSValue): Boolean {
@@ -730,13 +1038,19 @@ class JSRuntime(private val ctx: JSContext) {
     fun toInt32(v: JSValue): Int {
         val d = toNumber(v)
         if (d.isNaN() || d.isInfinite()) return 0
-        return d.toInt()
+        /* 按 2^32 取模后解释为有符号 32 位（ECMAScript ToInt32），
+         * 不能直接用 Double.toInt()（会饱和到 Int.MAX） */
+        var n = (d % 4294967296.0).toLong()
+        if (n < 0) n += 4294967296L
+        return n.toInt()
     }
     
     fun toUInt32(v: JSValue): Long {
         val d = toNumber(v)
         if (d.isNaN() || d.isInfinite()) return 0
-        return d.toLong() and 0xFFFFFFFFL
+        var n = (d % 4294967296.0).toLong()
+        if (n < 0) n += 4294967296L
+        return n and 0xFFFFFFFFL
     }
     
     fun doAdd(a: JSValue, b: JSValue): JSValue {
@@ -750,15 +1064,14 @@ class JSRuntime(private val ctx: JSContext) {
             return JS_NewFloat64(ctx, r.toDouble())
         }
         
-        if (JS_IsString(ctx, a) || JS_IsString(ctx, b)) {
-            val sa = jsGetString(ctx, a)
-            val sb = jsGetString(ctx, b)
-            return JS_NewString(ctx, sa + sb)
+        /* ToPrimitive 之后再决定字符串拼接还是数值加法 */
+        val pa = toPrimitive(a, 0)
+        val pb = toPrimitive(b, 0)
+        if (JS_IsString(ctx, pa) || JS_IsString(ctx, pb)) {
+            return JS_NewString(ctx, toStringValue(pa) + toStringValue(pb))
         }
         
-        val na = toNumber(a)
-        val nb = toNumber(b)
-        return JS_NewFloat64(ctx, na + nb)
+        return JS_NewFloat64(ctx, toNumber(pa) + toNumber(pb))
     }
     
     fun doSub(a: JSValue, b: JSValue): JSValue {
@@ -778,6 +1091,11 @@ class JSRuntime(private val ctx: JSContext) {
         if (JS_IsInt(a) && JS_IsInt(b)) {
             val ia = JS_VALUE_GET_INT(a)
             val ib = JS_VALUE_GET_INT(b)
+            /* 0 * 负数 = -0（JS 的零符号语义） */
+            if (ia == 0 || ib == 0) {
+                return if ((ia < 0) != (ib < 0)) JS_NewFloat64(ctx, -0.0)
+                       else JS_NewShortInt(0)
+            }
             val r = ia.toLong() * ib.toLong()
             if (r in JS_SHORTINT_MIN.toLong()..JS_SHORTINT_MAX.toLong()) {
                 return JS_NewShortInt(r.toInt())
@@ -804,6 +1122,8 @@ class JSRuntime(private val ctx: JSContext) {
     fun doNeg(a: JSValue): JSValue {
         if (JS_IsInt(a)) {
             val ia = JS_VALUE_GET_INT(a)
+            /* -0 必须是 -0.0（1 / -0 === -Infinity） */
+            if (ia == 0) return JS_NewFloat64(ctx, -0.0)
             if (ia > JS_SHORTINT_MIN) {
                 return JS_NewShortInt(-ia)
             }
@@ -864,17 +1184,21 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun doEq(a: JSValue, b: JSValue): JSValue {
-        if (a == b) return JS_TRUE
+        if (strictEquals(a, b)) return JS_TRUE
         if (JS_IsNull(a) && JS_IsUndefined(b)) return JS_TRUE
         if (JS_IsUndefined(a) && JS_IsNull(b)) return JS_TRUE
         if (JS_IsInt(a) && JS_IsBool(b)) return if (JS_VALUE_GET_INT(a) == JS_VALUE_GET_SPECIAL_VALUE(b)) JS_TRUE else JS_FALSE
         if (JS_IsBool(a) && JS_IsInt(b)) return if (JS_VALUE_GET_SPECIAL_VALUE(a) == JS_VALUE_GET_INT(b)) JS_TRUE else JS_FALSE
+        if (JS_IsString(ctx, a) && JS_IsString(ctx, b)) {
+            return if (jsGetString(ctx, a) == jsGetString(ctx, b)) JS_TRUE else JS_FALSE
+        }
         return if (toNumber(a) == toNumber(b)) JS_TRUE else JS_FALSE
     }
     
     fun jsGetString(ctx: JSContext, v: JSValue): String {
         if (!JS_IsPtr(v)) {
             if (JS_IsInt(v)) return JS_VALUE_GET_INT(v).toString()
+            if (JS_IsShortFloat(v)) return jsNumberToString(jsGetShortFloat(v))
             if (JS_IsNull(v)) return "null"
             if (JS_IsUndefined(v)) return "undefined"
             if (JS_IsBool(v)) return if (JS_VALUE_GET_SPECIAL_VALUE(v) != 0) "true" else "false"
@@ -883,7 +1207,7 @@ class JSRuntime(private val ctx: JSContext) {
         val ptr = JS_VALUE_TO_PTR(v)
         if (ctx.memory.getMTag(ptr) != JSMTags.JS_MTAG_STRING) {
             if (ctx.memory.getMTag(ptr) == JSMTags.JS_MTAG_FLOAT64) {
-                return ctx.memory.getFloat64(ptr + 8).toString()
+                return jsNumberToString(ctx.memory.getFloat64(ptr + 8))
             }
             return "[object]"
         }
@@ -895,8 +1219,29 @@ class JSRuntime(private val ctx: JSContext) {
      * 数组 length 回退：本引擎解析器未实现 OP_get_length 特化（C 引擎的
      * `.length` 走专用字节码），`.length` 会落到普通属性查找并得到 undefined，
      * 在此补齐 ES 数组 length 语义（长度字段存于数组对象头 ptr+32） */
-    fun getProperty(obj: JSValue, key: JSValue): JSValue {
-        if (!JS_IsPtr(obj)) return JS_UNDEFINED
+    fun getProperty(obj: JSValue, key: JSValue, receiver: JSValue = obj): JSValue {
+        /* 原始值属性访问：字符串取 length/索引后走 String.prototype；
+         * 数字/布尔走各自原型（方法调用 this 保持原始值） */
+        if (JS_IsString(ctx, obj)) {
+            if (JS_IsString(ctx, key) && jsGetString(ctx, key) == "length") {
+                return JS_NewShortInt(jsGetString(ctx, obj).length)
+            }
+            if (JS_IsInt(key)) {
+                val s = jsGetString(ctx, obj)
+                val i = JS_VALUE_GET_INT(key)
+                if (i in s.indices) return JS_NewString(ctx, s[i].toString())
+            }
+            return getProperty(ctx.classProto[JSObjectClassEnum.JS_CLASS_STRING.value], key, obj)
+        }
+        if (!JS_IsPtr(obj)) {
+            if (JS_IsInt(obj) || JS_IsShortFloat(obj)) {
+                return getProperty(ctx.classProto[JSObjectClassEnum.JS_CLASS_NUMBER.value], key, obj)
+            }
+            if (JS_IsBool(obj)) {
+                return getProperty(ctx.classProto[JSObjectClassEnum.JS_CLASS_BOOLEAN.value], key, obj)
+            }
+            return JS_UNDEFINED
+        }
         val objPtr = JS_VALUE_TO_PTR(obj)
         if (ctx.memory.getMTag(objPtr) != JSMTags.JS_MTAG_OBJECT) return JS_UNDEFINED
 
@@ -910,7 +1255,16 @@ class JSRuntime(private val ctx: JSContext) {
                 val propPtr = propsPtr + 8 + idx * 8
                 val propKey = ctx.memory.getJSValue(propPtr)
                 if (propKey == key || jsValueEquals(propKey, key)) {
-                    return ctx.memory.getJSValue(propPtr + 8)
+                    val v = ctx.memory.getJSValue(propPtr + 8)
+                    if (isAccessorValue(v)) {
+                        /* 访问器属性：调用 getter（this 为接收者） */
+                        val getter = ctx.memory.getJSValue(JS_VALUE_TO_PTR(v) + 24)
+                        if (JS_IsFunction(ctx, getter)) {
+                            return callFunction(getter, emptyList(), receiver)
+                        }
+                        return JS_UNDEFINED
+                    }
+                    return v
                 }
                 idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propPtr + 16)) shr 1
             }
@@ -925,9 +1279,214 @@ class JSRuntime(private val ctx: JSContext) {
 
         val proto = ctx.memory.getJSValue(objPtr + 8)
         if (proto != JS_NULL) {
-            return getProperty(proto, key)
+            return getProperty(proto, key, receiver)
         }
         return JS_UNDEFINED
+    }
+    
+    /* 自有可枚举属性名 → 新建的数组对象（数组元素为字符串键）。
+     * 与 C 的 for-in 近似语义一致：数组先给 0..len-1 索引键，再给普通属性 */
+    fun jsObjectKeys(obj: JSValue): JSValue {
+        val names = ArrayList<String>()
+        if (JS_IsPtr(obj)) {
+            val p = JS_VALUE_TO_PTR(obj)
+            if (ctx.memory.getMTag(p) == JSMTags.JS_MTAG_OBJECT) {
+                val classId = ctx.memory.getU8(p + 2)
+                if (classId == JSObjectClassEnum.JS_CLASS_ARRAY.value) {
+                    val len = ctx.memory.getI32(p + 32)
+                    for (i in 0 until len) names.add(i.toString())
+                }
+                val props = ctx.memory.getJSValue(p + 16)
+                if (props != JS_NULL && props != ctx.emptyProps) {
+                    val pp = JS_VALUE_TO_PTR(props)
+                    val size = ctx.memory.getI32(pp + 4)
+                    val hashMask = JS_VALUE_GET_INT(ctx.memory.getJSValue(pp + 16))
+                    var idx = 2 + hashMask + 1
+                    while (idx + 3 <= size) {
+                        val k = ctx.memory.getJSValue(pp + 8 + idx * 8)
+                        if (k != JS_UNINITIALIZED && JS_IsString(ctx, k)) {
+                            val s = jsGetString(ctx, k)
+                            if (!names.contains(s)) names.add(s)
+                        }
+                        idx += 3
+                    }
+                }
+            }
+        }
+        
+        val n = names.size
+        val arr = JS_NewArray(ctx, n)
+        if (JS_IsException(arr)) return arr
+        ctx.gcKeepAlive.add(arr)
+        try {
+            if (n > 0) {
+                val tab = allocValueArray(n)
+                if (!JS_IsNull(tab) && !JS_IsException(tab)) {
+                    ctx.gcKeepAlive.add(tab)
+                    try {
+                        for (i in 0 until n) {
+                            val ks = JS_NewString(ctx, names[i])
+                            val tabPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                            ctx.memory.putJSValue(tabPtr + 8 + i * 8, ks)
+                        }
+                        val ap = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 2])
+                        ctx.memory.putJSValue(ap + 24, ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                        ctx.memory.putI32(ap + 32, n)
+                    } finally {
+                        ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+                    }
+                }
+            }
+            return ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
+    }
+    
+    fun jsTypeof(v: JSValue): String {
+        if (JS_IsInt(v) || JS_IsShortFloat(v)) return "number"
+        if (JS_IsBool(v)) return "boolean"
+        if (JS_IsNull(v)) return "object"
+        if (JS_IsUndefined(v)) return "undefined"
+        if (!JS_IsPtr(v)) return "undefined"
+        val ptr = JS_VALUE_TO_PTR(v)
+        when (ctx.memory.getMTag(ptr)) {
+            JSMTags.JS_MTAG_STRING -> return "string"
+            JSMTags.JS_MTAG_FLOAT64 -> return "number"
+            JSMTags.JS_MTAG_OBJECT -> {
+                val classId = ctx.memory.getU8(ptr + 2)
+                if (classId == JSObjectClassEnum.JS_CLASS_CLOSURE.value ||
+                    classId == JSObjectClassEnum.JS_CLASS_C_FUNCTION.value) {
+                    return "function"
+                }
+                return "object"
+            }
+        }
+        return "object"
+    }
+    
+    /* instanceof：沿对象的原型链查找构造器的 prototype */
+    fun jsInstanceof(obj: JSValue, ctor: JSValue): JSValue {
+        if (!JS_IsFunction(ctx, ctor)) return JS_ThrowTypeError(ctx, "invalid 'instanceof' right operand")
+        val protoKey = JS_NewString(ctx, "prototype")
+        ctx.gcKeepAlive.add(protoKey)
+        ctx.gcKeepAlive.add(ctor)
+        try {
+            val target = getProperty(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1],
+                                     ctx.gcKeepAlive[ctx.gcKeepAlive.size - 2])
+            if (!JS_IsPtr(target) ||
+                ctx.memory.getMTag(JS_VALUE_TO_PTR(target)) != JSMTags.JS_MTAG_OBJECT) {
+                return JS_ThrowTypeError(ctx, "invalid 'instanceof' right operand")
+            }
+            if (!JS_IsPtr(obj) ||
+                ctx.memory.getMTag(JS_VALUE_TO_PTR(obj)) != JSMTags.JS_MTAG_OBJECT) {
+                return JS_FALSE
+            }
+            var cur = ctx.memory.getJSValue(JS_VALUE_TO_PTR(obj) + 8)
+            var guard = 0
+            while (JS_IsPtr(cur) && guard++ < 100000) {
+                if (cur == target) return JS_TRUE
+                val p = JS_VALUE_TO_PTR(cur)
+                if (ctx.memory.getMTag(p) != JSMTags.JS_MTAG_OBJECT) break
+                cur = ctx.memory.getJSValue(p + 8)
+            }
+            return JS_FALSE
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
+    }
+    
+    /* 访问器描述符：类为 OBJECT 且 extra_size == 2，槽 0=getting 槽 1=setter。
+     * 普通对象 extra_size 恒为 0，因此可作为可靠标记（无需改动属性表布局） */
+    fun isAccessorValue(v: JSValue): Boolean {
+        if (!JS_IsPtr(v)) return false
+        val p = JS_VALUE_TO_PTR(v)
+        return ctx.memory.getMTag(p) == JSMTags.JS_MTAG_OBJECT &&
+               ctx.memory.getU8(p + 2) == JSObjectClassEnum.JS_CLASS_OBJECT.value &&
+               ctx.memory.getU8(p + 3) == 2
+    }
+    
+    fun JS_NewAccessor(getter: JSValue, setter: JSValue): JSValue {
+        val obj = JS_NewObjectProtoClass(ctx, JS_NULL, JSObjectClassEnum.JS_CLASS_OBJECT.value, 2)
+        if (JS_IsException(obj)) return obj
+        val p = JS_VALUE_TO_PTR(obj)
+        ctx.memory.putJSValue(p + 24, getter)
+        ctx.memory.putJSValue(p + 32, setter)
+        return obj
+    }
+    
+    /* 对象字面量的 get/set：已有同名访问器时合并另一个方向，否则新建 */
+    fun defineAccessor(obj: JSValue, key: JSValue, func: JSValue, isGetter: Boolean) {
+        if (!JS_IsPtr(obj)) return
+        val objPtr = JS_VALUE_TO_PTR(obj)
+        if (ctx.memory.getMTag(objPtr) != JSMTags.JS_MTAG_OBJECT) return
+        
+        /* 查找自有属性值（不触发 getter） */
+        var existing: JSValue? = null
+        val props = ctx.memory.getJSValue(objPtr + 16)
+        if (props != JS_NULL && props != ctx.emptyProps) {
+            val propsPtr = JS_VALUE_TO_PTR(props)
+            val hashMask = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 16))
+            val h = hashProp(key, hashMask)
+            var idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 24 + h * 8)) shr 1
+            while (idx != 0) {
+                val propPtr = propsPtr + 8 + idx * 8
+                val propKey = ctx.memory.getJSValue(propPtr)
+                if (propKey == key || jsValueEquals(propKey, key)) {
+                    existing = ctx.memory.getJSValue(propPtr + 8)
+                    break
+                }
+                idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propPtr + 16)) shr 1
+            }
+        }
+        
+        if (existing != null && isAccessorValue(existing)) {
+            val p = JS_VALUE_TO_PTR(existing)
+            ctx.memory.putJSValue(p + if (isGetter) 24 else 32, func)
+            return
+        }
+        val oldGetter = if (existing != null && isAccessorValue(existing))
+            ctx.memory.getJSValue(JS_VALUE_TO_PTR(existing) + 24) else JS_UNDEFINED
+        val oldSetter = if (existing != null && isAccessorValue(existing))
+            ctx.memory.getJSValue(JS_VALUE_TO_PTR(existing) + 32) else JS_UNDEFINED
+        val desc = JS_NewAccessor(if (isGetter) func else oldGetter,
+                                  if (isGetter) oldSetter else func)
+        if (JS_IsException(desc)) return
+        setProperty(obj, key, desc)
+    }
+    
+    /* 删除自有属性（不处理数组元素与原型） */
+    fun deleteProperty(obj: JSValue, key: JSValue) {
+        if (!JS_IsPtr(obj)) return
+        val objPtr = JS_VALUE_TO_PTR(obj)
+        if (ctx.memory.getMTag(objPtr) != JSMTags.JS_MTAG_OBJECT) return
+        val props = ctx.memory.getJSValue(objPtr + 16)
+        if (props == JS_NULL || props == ctx.emptyProps) return
+        val propsPtr = JS_VALUE_TO_PTR(props)
+        val hashMask = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 16))
+        val h = hashProp(key, hashMask)
+        var prevIdx = 0
+        var idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 24 + h * 8)) shr 1
+        while (idx != 0) {
+            val propPtr = propsPtr + 8 + idx * 8
+            val propKey = ctx.memory.getJSValue(propPtr)
+            if (propKey == key || jsValueEquals(propKey, key)) {
+                val next = JS_VALUE_GET_INT(ctx.memory.getJSValue(propPtr + 16)) shr 1
+                if (prevIdx == 0) {
+                    ctx.memory.putJSValue(propsPtr + 24 + h * 8, JS_NewShortInt(next shl 1))
+                } else {
+                    ctx.memory.putJSValue(propsPtr + 8 + prevIdx * 8 + 16, JS_NewShortInt(next shl 1))
+                }
+                ctx.memory.putJSValue(propPtr, JS_UNINITIALIZED)
+                ctx.memory.putJSValue(propPtr + 8, JS_UNDEFINED)
+                val cnt = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 8)) - 1
+                ctx.memory.putJSValue(propsPtr + 8, JS_NewShortInt(cnt))
+                return
+            }
+            prevIdx = idx
+            idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propPtr + 16)) shr 1
+        }
     }
     
     fun jsValueEquals(a: JSValue, b: JSValue): Boolean {
@@ -1019,6 +1578,17 @@ class JSRuntime(private val ctx: JSContext) {
             val propPtr = propsPtr + 8 + idx * 8
             val propKey = ctx.memory.getJSValue(propPtr)
             if (propKey == key || jsValueEquals(propKey, key)) {
+                val cur = ctx.memory.getJSValue(propPtr + 8)
+                if (isAccessorValue(cur)) {
+                    /* 访问器属性：调用 setter（this 为接收者），无 setter 时忽略赋值 */
+                    val setter = ctx.memory.getJSValue(JS_VALUE_TO_PTR(cur) + 32)
+                    if (JS_IsFunction(ctx, setter)) {
+                        callFunction(setter,
+                            listOf(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]),
+                            ctx.gcKeepAlive[ctx.gcKeepAlive.size - 3])
+                    }
+                    return
+                }
                 ctx.memory.putJSValue(propPtr + 8, val1)
                 return
             }
@@ -1198,7 +1768,7 @@ class JSRuntime(private val ctx: JSContext) {
             if (classId == JSObjectClassEnum.JS_CLASS_CLOSURE.value) {
                 /* 闭包对象：extra 槽 0 存函数字节码 */
                 val funcBytecode = ctx.memory.getJSValue(funcPtr + 24)
-                return run(funcBytecode, thisObj, args)
+                return run(funcBytecode, thisObj, args, func)
             }
         }
         

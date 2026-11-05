@@ -35,6 +35,10 @@ fun JS_NewInt64(ctx: JSContext, v: Long): JSValue {
 fun JS_NewFloat64(ctx: JSContext, d: Double): JSValue {
     val bits = d.toBits()
     if (bits == (-0.0).toBits()) {
+        /* -0 必须用唯一的 float64 对象表示（延迟创建） */
+        if (ctx.minusZero == JS_NULL || ctx.minusZero == 0L) {
+            ctx.minusZero = allocFloat64(ctx, -0.0)
+        }
         return ctx.minusZero
     }
     
