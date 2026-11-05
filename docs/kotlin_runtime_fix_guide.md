@@ -586,14 +586,32 @@ var r = outer();
 - Math（常量、abs/floor/ceil/round/sqrt/exp/log/三角函数/pow/atan2/min/max/random）；
 - JSON（stringify/parse）。
 
-### 剩余缺口（按优先级）
+### 错误回溯与行列号（2026-11 第三期）
 
-1. `test_builtin.js`：仅剩 `test_line_column_numbers`（需要错误栈的行列号信息：
-   解析错误的 `e.stack` 定位、运行时错误 → 字节码 pc → 源码行列映射；
-   计划在函数字节码 +56 槽保存 pc→(line,col) 表，并在 Error 对象上生成 stack 字符串）；
-2. `microbench.js`：已可完整跑完基准序列（TypedArray/正则/BigInt 守卫均已支持），
-   待确认最终退出码；
-3. `Function`/`eval` 已实现全局语义；`bind` 支持 this/偏应用参数。
+- 解析器在发射每条指令时记录源码字节偏移（`JSParseState.posMarks`），函数收尾时
+  转换为 `pc → (line<<16|col)` 稀疏表，存放于 `ctx.pc2lineMap`（Kotlin 侧，
+  GC 压缩时同步更新 key，避免额外堆内存占用）；
+- `Error` 构造与运行时抛错时由 `JSContext.buildBacktrace()` 生成
+  `    at <函数名> (<file>:<line>:<col>)` 形式回溯，写入错误对象 stack 槽；
+- 语法错误返回 `SyntaxError`，stack 指向出错的 token 起始行列；
+- 插值细节：token 记录起始行列、只保留首个解析错误、运算符/调用/成员访问在
+  发射前设置 `curPos`；深层嵌套源码解析栈溢出时改用 64MB 栈线程重试。
+
+### 严格模式语义补齐
+
+- 顶层 `var`/`function` 声明使用新增的 `OP_define_global` 创建全局属性；
+  对未声明标识符的赋值走 `OP_put_global` 并抛 `ReferenceError`（严格模式）；
+- `null`/`undefined` 的属性/索引访问抛 `TypeError`；
+- 运算、`valueOf`、getter/setter 中产生的异常在主循环统一按 catch 目标展开。
+
+### 剩余缺口
+
+1. `microbench.js`：全部基准已可运行（TypedArray/正则/Set 外均支持），
+   最后一次完整运行的退出码待确认；
+2. 极低内存（256KB 堆）下 300+ 全局函数仍可能因属性表分配失败而丢失末尾属性；
+   标准库启用阈值已提高到 512KB（Kotlin 标准库内存占用较大），
+   回归测试维持 300 函数；
+3. `Set`/`BigInt` 未实现（microbench 有 `typeof` 守卫，可跳过 BigInt）。
 
 ## 相关文件
 
@@ -617,3 +635,5 @@ var r = outer();
 - **2024-02-14**：创建 Kotlin 命令行程序，实现与 C 语言版本类似的功能
 - **2024-02-14**：配置 GraalVM Native Image 支持，实现多平台原生二进制构建
 - **2026-11-05**：修复长脚本解析/执行崩溃（常量池计数泄漏、字节码数组块大小、解析期与执行期 GC 根、注释跳过）
+- **2026-11-05**：语言特性与标准库对齐（switch/for-in/标签/提升/访问器/arguments、Array/String/Number/Math/JSON/Error/RegExp/TypedArray、WTF-8 字符串、全局 eval/Function/bind）
+- **2026-11-05**：错误回溯行列号与严格模式语义（pc2line 表、SyntaxError stack、未声明赋值 ReferenceError、null 访问 TypeError、异常统一展开）
