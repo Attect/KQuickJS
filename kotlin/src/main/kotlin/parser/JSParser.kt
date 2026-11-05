@@ -7,6 +7,7 @@ import app.muka.project.kquickjs.JSMTags.JS_MTAG_OBJECT
 import app.muka.project.kquickjs.JSMTags.JS_MTAG_STRING
 import app.muka.project.kquickjs.JSMTags.JS_MTAG_VALUE_ARRAY
 import app.muka.project.kquickjs.memory.getMTag
+import app.muka.project.kquickjs.runtime.JSRuntime
 
 class JSParser(private val s: JSParseState) {
     
@@ -328,6 +329,7 @@ class JSParser(private val s: JSParseState) {
         s.lastOpcodePos = -1
         /* 每个函数独立计数（对照 C reset_parse_state） */
         s.cpoolLen = 0
+        s.posMarks = HashMap()
         s.localVarsLen = 0
         s.evalRetIdx = -1
         s.nextToken()
@@ -351,6 +353,7 @@ class JSParser(private val s: JSParseState) {
         s.byteCode = exactByteCode
         val funcPtr = JS_VALUE_TO_PTR(s.curFunc)
         ctx.memory.putJSValue(funcPtr + 16, s.byteCode)
+        finishPc2line()
         return s.curFunc
     }
     
@@ -530,7 +533,7 @@ class JSParser(private val s: JSParseState) {
                         emitOp(OPCodeEnum.OP_undefined)
                     }
                     val cidx = addConstPool(ctx.gcKeepAlive[nameKeepIdx])
-                    emitOpWithArg(OPCodeEnum.OP_put_global, cidx)
+                    emitOpWithArg(OPCodeEnum.OP_define_global, cidx)
                 } else {
                     // 正常模式：将变量存储到局部变量（顶层脚本亦为顶层函数帧的局部）
                     if (s.token.val1 == '='.code) {
@@ -579,6 +582,7 @@ class JSParser(private val s: JSParseState) {
             val savedLocalVarsLen = s.localVarsLen
             val savedEvalRetIdx = s.evalRetIdx
             val savedCpoolLen = s.cpoolLen
+        val savedPosMarks = s.posMarks
             
             s.curFunc = allocFunctionBytecode()
             if (JS_IsException(s.curFunc)) {
@@ -601,6 +605,7 @@ class JSParser(private val s: JSParseState) {
              * addConstPool 会越界读取外层常量池数组，把堆内任意数据当作 JSValue
              * 解引用（长脚本 IndexOutOfBoundsException 的根因） */
             s.cpoolLen = 0
+        s.posMarks = HashMap()
             s.evalRetIdx = -1
             
             /* 函数编译上下文入栈（闭包捕获的回改作用域）——byteCode 为本层对象，
@@ -632,6 +637,7 @@ class JSParser(private val s: JSParseState) {
                 }
                 val newFuncPtr = JS_VALUE_TO_PTR(s.curFunc)
                 ctx.memory.putJSValue(newFuncPtr + 16, s.byteCode)
+            finishPc2line()
                 storeCaptures()
             } finally {
                 popCompileScope()
@@ -646,6 +652,7 @@ class JSParser(private val s: JSParseState) {
             s.localVarsLen = savedLocalVarsLen
             s.evalRetIdx = savedEvalRetIdx
             s.cpoolLen = savedCpoolLen
+        s.posMarks = savedPosMarks
             
             val cpoolIdx = addConstPool(newFunc)
             emitOpWithArg(OPCodeEnum.OP_fclosure, cpoolIdx)
@@ -654,7 +661,7 @@ class JSParser(private val s: JSParseState) {
             val nameVal = ctx.gcKeepAlive[nameKeepIdx]
             if (compileScopes.size == 1) {
                 val cidx = addConstPool(nameVal)
-                emitOpWithArg(OPCodeEnum.OP_put_global, cidx)
+                emitOpWithArg(OPCodeEnum.OP_define_global, cidx)
             } else {
                 val nameIdx = declareLocal(nameVal)
                 val nameSlot = compileScopes.lastOrNull()?.varrefSlots?.get(jsGetString(ctx, nameVal))
@@ -893,7 +900,7 @@ class JSParser(private val s: JSParseState) {
             /* next: 把栈顶的迭代值写回左值 */
             val nextPos = s.byteCodeLen
             when {
-                varGlobalCidx >= 0 -> emitOpWithArg(OPCodeEnum.OP_put_global, varGlobalCidx)
+                varGlobalCidx >= 0 -> emitOpWithArg(OPCodeEnum.OP_define_global, varGlobalCidx)
                 varIdx >= 0 -> emitOpWithArg(OPCodeEnum.OP_put_loc, varIdx)
                 lvalueOp == OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
                 lvalueOp == OPCodeEnum.OP_get_global.id -> emitOpWithArg(OPCodeEnum.OP_put_global, lvalueArg)
@@ -1371,6 +1378,8 @@ class JSParser(private val s: JSParseState) {
             '='.code -> {
                 val lvalueOp = getLastOp()
                 val lvalueArg = getLastOpArg()
+                val lvaluePos = if (s.lastOpcodePos >= 0)
+                    (s.posMarks[s.lastOpcodePos] ?: s.token.sourcePos) else s.token.sourcePos
                 removeLastOp()
                 
                 s.nextToken()
@@ -1381,7 +1390,7 @@ class JSParser(private val s: JSParseState) {
                 emitOp(OPCodeEnum.OP_dup)
                 val tmpIdx = ensureTmpVar()
                 emitOpWithArg(OPCodeEnum.OP_put_loc, tmpIdx)
-                
+                s.curPos = lvaluePos
                 when (lvalueOp) {
                     OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
                     OPCodeEnum.OP_get_var_ref.id -> emitOpWithArg(OPCodeEnum.OP_put_var_ref, lvalueArg)
@@ -1431,6 +1440,7 @@ class JSParser(private val s: JSParseState) {
     /* 复合赋值（x op= v）：读取旧值 → rhs → 运算 → 复制结果 → 临时槽保存 → 写回 →
        读回临时槽作为表达式值（对照 C put_lvalue 的值语义，规避栈序问题） */
     private fun emitCompoundAssign(binOp: OPCodeEnum): Boolean {
+        val assignPos = s.token.sourcePos
         val lvalueOp = getLastOp()
         val lvalueArg = getLastOpArg()
         removeLastOp()
@@ -1449,6 +1459,7 @@ class JSParser(private val s: JSParseState) {
             emitOp(OPCodeEnum.OP_get_array_el)             /* [old] */
             s.nextToken()
             if (!parseAssignExpr()) return false           /* [old, rhs] */
+            s.curPos = assignPos
             emitOp(binOp)                                  /* [new] */
             emitOpWithArg(OPCodeEnum.OP_put_loc, tmpVal)   /* [] */
             emitOpWithArg(OPCodeEnum.OP_get_loc, tmpObj)
@@ -1464,6 +1475,7 @@ class JSParser(private val s: JSParseState) {
         
         s.nextToken()
         if (!parseAssignExpr()) return false
+        s.curPos = assignPos
         emitOp(binOp)
         
         /* 结果复制后保存到临时槽，写回消费栈上副本，读回作为表达式值 */
@@ -1715,13 +1727,17 @@ class JSParser(private val s: JSParseState) {
         while (true) {
             when (s.token.val1) {
                 '+'.code -> {
+                    val opPos = s.token.sourcePos
                     s.nextToken()
                     if (!parseMultiplicativeExpr()) return false
+                    s.curPos = opPos
                     emitOp(OPCodeEnum.OP_add)
                 }
                 '-'.code -> {
+                    val opPos = s.token.sourcePos
                     s.nextToken()
                     if (!parseMultiplicativeExpr()) return false
+                    s.curPos = opPos
                     emitOp(OPCodeEnum.OP_sub)
                 }
                 else -> break
@@ -1737,8 +1753,10 @@ class JSParser(private val s: JSParseState) {
         while (true) {
             when (s.token.val1) {
                 '*'.code -> {
+                    val opPos = s.token.sourcePos
                     s.nextToken()
                     if (!parseUnaryExpr()) return false
+                    s.curPos = opPos
                     emitOp(OPCodeEnum.OP_mul)
                 }
                 '/'.code -> {
@@ -1752,8 +1770,10 @@ class JSParser(private val s: JSParseState) {
                     emitOp(OPCodeEnum.OP_mod)
                 }
                 JSTokenVal.TOK_POW.value -> {
+                    val opPos = s.token.sourcePos
                     s.nextToken()
                     if (!parseUnaryExpr()) return false
+                    s.curPos = opPos
                     emitOp(OPCodeEnum.OP_pow)
                 }
                 else -> break
@@ -1766,38 +1786,50 @@ class JSParser(private val s: JSParseState) {
     fun parseUnaryExpr(): Boolean {
         when (s.token.val1) {
             '+'.code -> {
+                val opPos = s.token.sourcePos
                 s.nextToken()
                 if (!parseUnaryExpr()) return false
+                s.curPos = opPos
                 emitOp(OPCodeEnum.OP_plus)
                 return true
             }
             '-'.code -> {
+                val opPos = s.token.sourcePos
                 s.nextToken()
                 if (!parseUnaryExpr()) return false
+                s.curPos = opPos
                 emitOp(OPCodeEnum.OP_neg)
                 return true
             }
             '!'.code -> {
+                val opPos = s.token.sourcePos
                 s.nextToken()
                 if (!parseUnaryExpr()) return false
+                s.curPos = opPos
                 emitOp(OPCodeEnum.OP_lnot)
                 return true
             }
             '~'.code -> {
+                val opPos = s.token.sourcePos
                 s.nextToken()
                 if (!parseUnaryExpr()) return false
+                s.curPos = opPos
                 emitOp(OPCodeEnum.OP_not)
                 return true
             }
             JSTokenVal.TOK_INC.value -> {
+                val opPos = s.token.sourcePos
                 s.nextToken()
                 if (!parseUnaryExpr()) return false
+                s.curPos = opPos
                 emitLValueIncDec(inc = true, pre = true)
                 return true
             }
             JSTokenVal.TOK_DEC.value -> {
+                val opPos = s.token.sourcePos
                 s.nextToken()
                 if (!parseUnaryExpr()) return false
+                s.curPos = opPos
                 emitLValueIncDec(inc = false, pre = true)
                 return true
             }
@@ -1867,14 +1899,19 @@ class JSParser(private val s: JSParseState) {
         while (true) {
             when (s.token.val1) {
                 JSTokenVal.TOK_INC.value -> {
+                    val opPos = s.token.sourcePos
                     s.nextToken()
+                    s.curPos = opPos
                     emitLValueIncDec(inc = true, pre = false)
                 }
                 JSTokenVal.TOK_DEC.value -> {
+                    val opPos = s.token.sourcePos
                     s.nextToken()
+                    s.curPos = opPos
                     emitLValueIncDec(inc = false, pre = false)
                 }
                 '('.code -> {
+                    val callPos = s.token.sourcePos
                     s.nextToken()
                     /* 方法调用识别（对照 C js_parse_postfix_expr）：
                      * 前一条指令是 OP_get_field 时，回改为 OP_get_field2（保留 obj 作 this）
@@ -1885,6 +1922,7 @@ class JSParser(private val s: JSParseState) {
                     }
                     val argc = parseArgs()
                     expect(')'.code)
+                    s.curPos = callPos
                     if (isMethodCall) {
                         emitOpWithArg(OPCodeEnum.OP_call_method, argc)
                     } else {
@@ -1892,12 +1930,15 @@ class JSParser(private val s: JSParseState) {
                     }
                 }
                 '['.code -> {
+                    val opPos = s.token.sourcePos
                     s.nextToken()
                     if (!parseExpr()) return false
                     expect(']'.code)
+                    s.curPos = opPos
                     emitOp(OPCodeEnum.OP_get_array_el)
                 }
                 '.'.code -> {
+                    val opPos = s.token.sourcePos
                     s.nextToken()
                     /* 属性名允许关键字（obj.if / obj.in 等） */
                     if (!JS_IsString(ctx, s.token.value)) {
@@ -1908,6 +1949,7 @@ class JSParser(private val s: JSParseState) {
                     val idx = addConstPool(s.token.value)
                     s.nextToken()
                     /* 先按普通属性读取发射（消费 obj），若后续紧跟 ( 再回改为 get_field2 */
+                    s.curPos = opPos
                     emitOpWithArg(OPCodeEnum.OP_get_field, idx)
                 }
                 else -> break
@@ -2124,9 +2166,11 @@ class JSParser(private val s: JSParseState) {
                  * 可能触发 GC：变量名放入保活槽后再消费 token */
                 val nameKeepIdx = ctx.gcKeepAlive.size
                 ctx.gcKeepAlive.add(s.token.value)
+                val identPos = s.token.sourcePos
                 try {
                     s.nextToken()
                     /* 变量访问统一发射：局部 get_loc / 捕获 get_var_ref / 全局 get_global */
+                    s.curPos = identPos
                     emitVarLoad(ctx.gcKeepAlive[nameKeepIdx])
                 } finally {
                     ctx.gcKeepAlive.removeAt(nameKeepIdx)
@@ -2290,6 +2334,7 @@ class JSParser(private val s: JSParseState) {
         val savedLocalVarsLen = s.localVarsLen
         val savedEvalRetIdx = s.evalRetIdx
         val savedCpoolLen = s.cpoolLen
+        val savedPosMarks = s.posMarks
         
         s.curFunc = allocFunctionBytecode()
         if (JS_IsException(s.curFunc)) {
@@ -2307,6 +2352,7 @@ class JSParser(private val s: JSParseState) {
         s.localVarsLen = 0
         /* 常量池长度按函数独立计数（见 parseFunctionDecl 中的说明） */
         s.cpoolLen = 0
+        s.posMarks = HashMap()
         s.evalRetIdx = -1
         
         /* 函数编译上下文入栈（闭包捕获的回改作用域）——byteCode 为本层对象 */
@@ -2347,6 +2393,7 @@ class JSParser(private val s: JSParseState) {
             }
             val newFuncPtr = JS_VALUE_TO_PTR(s.curFunc)
             ctx.memory.putJSValue(newFuncPtr + 16, s.byteCode)
+            finishPc2line()
             storeCaptures()
         } finally {
             popCompileScope()
@@ -2360,6 +2407,7 @@ class JSParser(private val s: JSParseState) {
         s.localVarsLen = savedLocalVarsLen
         s.evalRetIdx = savedEvalRetIdx
         s.cpoolLen = savedCpoolLen
+        s.posMarks = savedPosMarks
         
         val cpoolIdx = addConstPool(newFunc)
         emitOpWithArg(OPCodeEnum.OP_fclosure, cpoolIdx)
@@ -2396,6 +2444,7 @@ class JSParser(private val s: JSParseState) {
         ensureByteCodeSize(1)
         val ptr = JS_VALUE_TO_PTR(s.byteCode)
         s.lastOpcodePos = s.byteCodeLen
+        s.posMarks[s.lastOpcodePos] = if (s.curPos >= 0) s.curPos else s.token.sourcePos
         ctx.memory.putU8(ptr + 8 + s.byteCodeLen, op.id)
         s.byteCodeLen++
         syncScopeLen()
@@ -2405,6 +2454,7 @@ class JSParser(private val s: JSParseState) {
         ensureByteCodeSize(2)
         val ptr = JS_VALUE_TO_PTR(s.byteCode)
         s.lastOpcodePos = s.byteCodeLen
+        s.posMarks[s.lastOpcodePos] = if (s.curPos >= 0) s.curPos else s.token.sourcePos
         ctx.memory.putU8(ptr + 8 + s.byteCodeLen, OPCodeEnum.OP_push_i8.id)
         ctx.memory.putU8(ptr + 8 + s.byteCodeLen + 1, v.toInt())
         s.byteCodeLen += 2
@@ -2414,6 +2464,7 @@ class JSParser(private val s: JSParseState) {
         ensureByteCodeSize(3)
         val ptr = JS_VALUE_TO_PTR(s.byteCode)
         s.lastOpcodePos = s.byteCodeLen
+        s.posMarks[s.lastOpcodePos] = if (s.curPos >= 0) s.curPos else s.token.sourcePos
         ctx.memory.putU8(ptr + 8 + s.byteCodeLen, op.id)
         ctx.memory.putU16(ptr + 8 + s.byteCodeLen + 1, arg)
         s.byteCodeLen += 3
@@ -2426,6 +2477,8 @@ class JSParser(private val s: JSParseState) {
         ctx.memory.putU8(ptr + 8 + s.byteCodeLen, op.id)
         ctx.memory.putU32(ptr + 8 + s.byteCodeLen + 1, 0L)
         val pos = s.byteCodeLen
+        s.lastOpcodePos = pos
+        s.posMarks[pos] = if (s.curPos >= 0) s.curPos else s.token.sourcePos
         s.byteCodeLen += 5
         s.lastOpcodePos = -1
         return pos
@@ -2514,8 +2567,37 @@ class JSParser(private val s: JSParseState) {
         }
     }
     
-    fun allocFunctionBytecode(): JSValue {
-        val ptr = ctx.mallocz(72, JS_MTAG_FUNCTION_BYTECODE)
+    /* 源码字节偏移 → (line<<16 | col)（列按 UTF-8 码点计，对照 C 的 get_line_col） */
+    private fun lineColOf(pos: Int): Int {
+        var line = 1
+        var col = 1
+        var i = 0
+        while (i < pos && i < s.sourceBuf.size) {
+            val c = s.sourceBuf[i].toInt() and 0xFF
+            if (c == '\n'.code) {
+                line++; col = 1
+            } else if (c < 0x80 || c >= 0xC0) {
+                col++
+            }
+            i++
+        }
+        return (line shl 16) or (col and 0xFFFF)
+    }
+    
+    /* 把当前函数的 pc→源码偏移 表转换为 pc→行列 稀疏表（Kotlin 侧，GC 搬移键） */
+    private fun finishPc2line() {
+        if (s.curFunc == JS_NULL) return
+        val marks = s.posMarks
+        val keys = marks.keys.sorted()
+        val arr = IntArray(keys.size * 2)
+        for ((i, k) in keys.withIndex()) {
+            arr[i * 2] = k
+            arr[i * 2 + 1] = lineColOf(marks[k]!!)
+        }
+        ctx.pc2lineMap[JS_VALUE_TO_PTR(s.curFunc)] = arr
+    }
+    
+    fun allocFunctionBytecode(): JSValue {        val ptr = ctx.mallocz(72, JS_MTAG_FUNCTION_BYTECODE)
         if (ptr == 0) return JS_EXCEPTION
         ctx.memory.putJSValue(ptr + 8, JS_NULL)
         ctx.memory.putJSValue(ptr + 16, JS_NULL)

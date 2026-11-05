@@ -80,6 +80,8 @@ class JSRuntime(private val ctx: JSContext) {
             vars[i] = args[i]
         }
         
+        val frame = JSContext.JSFrame(keepStart, 0)
+        ctx.frames.add(frame)
         try {
         while (pc < code.size) {
             
@@ -88,6 +90,7 @@ class JSRuntime(private val ctx: JSContext) {
              * 从保活列表读取 */
             funcKept = ctx.gcKeepAlive[keepStart]
             thisObjKept = ctx.gcKeepAlive[keepStart + 1]
+            frame.pc = pc
             fun funcPtrNow(): Int = JS_VALUE_TO_PTR(ctx.gcKeepAlive[keepStart])
             
             val op = code[pc].toInt() and 0xFF
@@ -149,9 +152,13 @@ class JSRuntime(private val ctx: JSContext) {
                     } else JS_UNDEFINED
                     val v = getProperty(ctx.globalObj, name)
                     if (JS_IsUndefined(v) && !hasProperty(ctx.globalObj, name)) {
-                        return JS_ThrowReferenceError(ctx, "'${jsGetString(ctx, name)}' is not defined")
+                        JS_ThrowReferenceError(ctx, "'" + jsGetString(ctx, name) + "' is not defined")
+                        val target = unwindToCatch(stack)
+                        if (target < 0) return JS_EXCEPTION
+                        pc = target
+                    } else {
+                        stack.add(v)
                     }
-                    stack.add(v)
                 }
                 
                 OPCodeEnum.OP_get_global_undef.id -> {
@@ -166,6 +173,24 @@ class JSRuntime(private val ctx: JSContext) {
                 }
                 
                 OPCodeEnum.OP_put_global.id -> {
+                    val idx = readU16(code, pc)
+                    pc += 2
+                    val v = stack.removeLast()
+                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
+                    val name = if (cpool != JS_NULL) {
+                        ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
+                    } else JS_UNDEFINED
+                    /* 严格模式：给未声明的全局标识符赋值抛 ReferenceError */
+                    if (!hasProperty(ctx.globalObj, name)) {
+                        JS_ThrowReferenceError(ctx, "\"" + jsGetString(ctx, name) + "\" is not defined")
+                        val target = unwindToCatch(stack)
+                        if (target < 0) return JS_EXCEPTION
+                        pc = target
+                    } else {
+                        setProperty(ctx.globalObj, name, v)
+                    }
+                }
+                OPCodeEnum.OP_define_global.id -> {
                     val idx = readU16(code, pc)
                     pc += 2
                     val v = stack.removeLast()
@@ -541,10 +566,13 @@ class JSRuntime(private val ctx: JSContext) {
                         ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
                     } else JS_UNDEFINED
                     val v = getProperty(obj, key)
-                    if (System.getenv("MQJS_TRACE") != null) {
-                        println("TRACE get_field obj=${if (JS_IsPtr(obj)) JS_VALUE_TO_PTR(obj) else obj} key='${jsGetString(ctx, key)}' -> isUnd=${JS_IsUndefined(v)}")
+                    if (JS_HasException(ctx)) {
+                        val target = unwindToCatch(stack)
+                        if (target < 0) return JS_EXCEPTION
+                        pc = target
+                    } else {
+                        stack.add(v)
                     }
-                    stack.add(v)
                 }
                 
                 OPCodeEnum.OP_get_field2.id -> {
@@ -562,7 +590,14 @@ class JSRuntime(private val ctx: JSContext) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
                         ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
                     } else JS_UNDEFINED
-                    stack.add(getProperty(obj, key))
+                    val fv = getProperty(obj, key)
+                    if (JS_HasException(ctx)) {
+                        val target = unwindToCatch(stack)
+                        if (target < 0) return JS_EXCEPTION
+                        pc = target
+                    } else {
+                        stack.add(fv)
+                    }
                 }
                 
                 OPCodeEnum.OP_put_field.id -> {
@@ -618,7 +653,14 @@ class JSRuntime(private val ctx: JSContext) {
                 OPCodeEnum.OP_get_array_el.id -> {
                     val idx = stack.removeLast()
                     val obj = stack.removeLast()
-                    stack.add(getElement(obj, idx))
+                    val ev = getElement(obj, idx)
+                    if (JS_HasException(ctx)) {
+                        val target = unwindToCatch(stack)
+                        if (target < 0) return JS_EXCEPTION
+                        pc = target
+                    } else {
+                        stack.add(ev)
+                    }
                 }
                 
                 OPCodeEnum.OP_get_array_el2.id -> {
@@ -974,9 +1016,19 @@ class JSRuntime(private val ctx: JSContext) {
                     pc = JS_VALUE_GET_INT(ret)
                 }
             }
+            /* 通用异常检查：运算/取值等处理器内部调用（valueOf/toString/getter）
+             * 可能设置异常但未展开，这里统一按 catch 目标展开 */
+            if (JS_HasException(ctx)) {
+                val target = unwindToCatch(stack)
+                if (target < 0) return JS_EXCEPTION
+                pc = target
+            }
         }
         } finally {
             /* 注销本帧的 JVM 侧根与 func/thisObj/args 保活 */
+            if (ctx.frames.isNotEmpty() && ctx.frames.last() === frame) {
+                ctx.frames.removeAt(ctx.frames.size - 1)
+            }
             while (ctx.jvmRoots.size > rootBase) ctx.jvmRoots.removeAt(ctx.jvmRoots.size - 1)
             while (ctx.gcKeepAlive.size > keepStart) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
         }
@@ -1306,6 +1358,13 @@ class JSRuntime(private val ctx: JSContext) {
      * `.length` 走专用字节码），`.length` 会落到普通属性查找并得到 undefined，
      * 在此补齐 ES 数组 length 语义（长度字段存于数组对象头 ptr+32） */
     fun getProperty(obj: JSValue, key: JSValue, receiver: JSValue = obj): JSValue {
+        if (JS_IsNull(obj) || JS_IsUndefined(obj)) {
+            val kn = if (JS_IsString(ctx, key)) jsGetString(ctx, key) else
+                if (JS_IsInt(key)) JS_VALUE_GET_INT(key).toString() else ""
+            JS_ThrowTypeError(ctx, "cannot read property '" + kn + "' of " +
+                (if (JS_IsNull(obj)) "null" else "undefined"))
+            return JS_EXCEPTION
+        }
         /* 原始值属性访问：字符串取 length/索引后走 String.prototype；
          * 数字/布尔走各自原型（方法调用 this 保持原始值） */
         if (JS_IsString(ctx, obj)) {
@@ -1882,6 +1941,8 @@ class JSRuntime(private val ctx: JSContext) {
     fun getElement(obj: JSValue, idx: JSValue): JSValue {
         /* 字符串索引：str[i] 返回单字符 */
         if (JS_IsString(ctx, obj)) return getProperty(obj, idx)
+        /* null/undefined 的属性访问抛 TypeError（对照严格模式语义） */
+        if (JS_IsNull(obj) || JS_IsUndefined(obj)) return getProperty(obj, idx)
         if (!JS_IsPtr(obj)) return JS_UNDEFINED
         val objPtr = JS_VALUE_TO_PTR(obj)
         if (ctx.memory.getMTag(objPtr) != JSMTags.JS_MTAG_OBJECT) return JS_UNDEFINED

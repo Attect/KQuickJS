@@ -129,6 +129,7 @@ object JSGC {
                         }
                         /* 对象已释放，清理宿主 opaque 引用表条目 */
                         ctx.userOpaqueTable.remove(ptr1)
+                        ctx.pc2lineMap.remove(ptr1)
                     }
                     
                     total += size1
@@ -303,6 +304,16 @@ object JSGC {
             }
             ctx.userOpaqueTable.clear()
             ctx.userOpaqueTable.putAll(remapped)
+        }
+        
+        /* 函数 pc2line 表的 key 随函数字节码块搬移更新 */
+        if (ctx.pc2lineMap.isNotEmpty()) {
+            val remapped = HashMap<Int, IntArray>()
+            for ((oldPtr, v) in ctx.pc2lineMap) {
+                remapped[moveMap[oldPtr] ?: oldPtr] = v
+            }
+            ctx.pc2lineMap.clear()
+            ctx.pc2lineMap.putAll(remapped)
         }
         
         /* pass2：搬移存活块 */

@@ -92,6 +92,8 @@ enum class JSTokenVal(val value: Int) {
 data class JSToken(
     var val1: Int = 0,
     var sourcePos: Int = 0,
+    var line: Int = 1,
+    var col: Int = 1,
     var d: Double = 0.0,
     var reFlags: Int = 0,
     var regexpFlags: String = "",
@@ -135,7 +137,17 @@ class JSParseState(
     var lineNum = 1
     var colNum = 1
     
+    /* 当前函数 pc → 源码字节偏移 的位置标记（对照 C 的 pc2line）；
+     * 运行时按"不大于 pc 的最近标记"定位错误行列 */
+    var posMarks: HashMap<Int, Int> = HashMap()
+    /* 当前构造的源码偏移（-1 表示未设置，取 token 起点兜底） */
+    var curPos: Int = -1
+    
     var errorMsg: String? = null
+    /* 语法错误的源码字节偏移（0 表示未知） */
+    var errorPos: Int = 0
+    var errorLine: Int = 1
+    var errorCol: Int = 1
     var hasError = false
     
     var sourceStr: JSValue = JS_NULL
@@ -262,6 +274,10 @@ class JSParseState(
         gotLf = false
         while (true) {
             skipWhitespace()
+            /* 注释起点也要能报错定位：先记录 token 起始行列 */
+            token.sourcePos = bufPos
+            token.line = lineNum
+            token.col = colNum
             /* 注释与空白可交替出现：消费注释后回到循环开头重新跳过空白 */
             if (skipComment()) {
                 if (hasError) return
@@ -269,6 +285,8 @@ class JSParseState(
             }
             
             token.sourcePos = bufPos
+            token.line = lineNum
+            token.col = colNum
             token.value = JS_NULL
             
             val c = peekChar()
@@ -779,7 +797,13 @@ class JSParseState(
     }
     
     fun error(msg: String) {
-        errorMsg = "$filename:$lineNum:$colNum: $msg"
+        /* 只保留第一个错误（后续解析可能继续并覆盖位置，对照 C 的 js_parse_error） */
+        if (hasError) return
+        /* 位置取当前 token 的起始行列（对照 C 的 token.source_pos） */
+        errorLine = token.line
+        errorCol = token.col
+        errorPos = token.sourcePos
+        errorMsg = "$filename:$errorLine:$errorCol: $msg"
         hasError = true
     }
 }

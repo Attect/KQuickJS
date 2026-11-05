@@ -18,7 +18,7 @@ import app.muka.project.kquickjs.runtime.JSRuntime
  */
 object JSStdlib {
 
-    const val MIN_MEM_SIZE = 160 * 1024
+    const val MIN_MEM_SIZE = 512 * 1024
 
     private fun native(ctx: JSContext, length: Int,
                        fn: (JSContext, JSValue, List<JSValue>) -> JSValue): JSValue {
@@ -289,10 +289,14 @@ object JSStdlib {
         ctx.classProto[JSObjectClassEnum.JS_CLASS_ERROR.value] = errorProto
 
         fun errorGlobal(name: String, classEnum: JSObjectClassEnum): JSValue {
-            val proto = makeErrorProto(ctx, rt, errorProto)
+            /* Error.prototype 本身要作为所有错误原型链的根，不能再包一层 */
+            val proto = if (classEnum == JSObjectClassEnum.JS_CLASS_ERROR) errorProto
+                        else makeErrorProto(ctx, rt, errorProto)
             ctx.classProto[classEnum.value] = proto
             val ctor = native(ctx, 1) { c, _, args ->
-                val obj = JS_NewObjectProtoClass(c, proto, JSObjectClassEnum.JS_CLASS_ERROR.value, 2)
+                /* 原型从 classProto 现取：闭包捕获的 JSValue 不会随 GC 搬移更新 */
+                val obj = JS_NewObjectProtoClass(c, c.classProto[classEnum.value],
+                                                 JSObjectClassEnum.JS_CLASS_ERROR.value, 2)
                 if (JS_IsException(obj)) {
                     JS_EXCEPTION
                 } else {
@@ -301,10 +305,17 @@ object JSStdlib {
                     if (JS_IsException(msg)) {
                         JS_EXCEPTION
                     } else {
-                        val ptr = JS_VALUE_TO_PTR(obj)
-                        c.memory.putJSValue(ptr + 24, msg)
-                        c.memory.putJSValue(ptr + 32, JS_NULL)
-                        obj
+                        val keep = c.gcKeepAlive.size
+                        c.gcKeepAlive.add(obj)
+                        c.gcKeepAlive.add(msg)
+                        c.memory.putJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24,
+                                            c.gcKeepAlive[keep + 1])
+                        /* 构造 Error 时记录回溯（对照 C 的 build_backtrace） */
+                        val stackVal = JS_NewString(c, c.buildBacktrace())
+                        val eptr = JS_VALUE_TO_PTR(c.gcKeepAlive[keep])
+                        c.memory.putJSValue(eptr + 32,
+                            if (JS_IsException(stackVal)) JS_NULL else stackVal)
+                        c.gcKeepAlive[keep]
                     }
                 }
             }
@@ -1387,6 +1398,8 @@ object JSStdlib {
         if (flags.contains('m')) f = f or java.util.regex.Pattern.MULTILINE
         if (flags.contains('s')) f = f or java.util.regex.Pattern.DOTALL
         if (flags.contains('u')) f = f or java.util.regex.Pattern.UNICODE_CASE
+        /* u 模式下未匹配的 ']' 是语法错误（Java 会当作字面量接受） */
+        if (flags.contains('u') && hasStrayBracket(pattern)) return null
         val src = fixEmptyAlternation(sanitizePattern(pattern))
         fun tryCompile(s: String): java.util.regex.Pattern? = try {
             java.util.regex.Pattern.compile(s, f)
@@ -1398,6 +1411,21 @@ object JSStdlib {
         return tryCompile(src) ?: stripRedundantNesting(src)?.let { tryCompile(it) }
     }
 
+    /* 检查字符类之外的孤立 ']'（仅 u 模式报错） */
+    private fun hasStrayBracket(p: String): Boolean {
+        var i = 0
+        var inClass = false
+        while (i < p.length) {
+            val c = p[i]
+            if (c == '\\') { i += 2; continue }
+            if (!inClass && c == '[') { inClass = true }
+            else if (inClass && c == ']') { inClass = false }
+            else if (!inClass && c == ']') return true
+            i++
+        }
+        return false
+    }
+    
     /* 剥离形如 (?: (?: ... ) ) 的冗余嵌套外壳（Java 深层嵌套会栈溢出） */
     private fun stripRedundantNesting(p: String): String? {
         var k = 0
@@ -1438,6 +1466,10 @@ object JSStdlib {
             JS_SetOpaque(ctx, ctx.gcKeepAlive[keep],
                          RegexpInfo(compileRegexp(pattern, flags), pattern,
                                     quantifiedCaptureAncestors(pattern)))
+        if (compileRegexp(pattern, flags) == null) {
+            JS_ThrowSyntaxError(ctx, "invalid regular expression")
+            return JS_EXCEPTION
+        }
             return ctx.gcKeepAlive[keep]
         } finally {
             while (ctx.gcKeepAlive.size > keep) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)

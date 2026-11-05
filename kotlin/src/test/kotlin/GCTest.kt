@@ -462,7 +462,7 @@ class GCTest {
     fun testErrorBacktrace() {
         val ctx = createContext()
         /* 解释器内抛 TypeError：jsCallStack 记录生成 stack 槽回溯 */
-        val r = evalExpr(ctx, "function outer() { nosuchfn() }; try { outer() } catch (e) { r = e } r")
+        val r = evalExpr(ctx, "function outer() { nosuchfn() }; var r; try { outer() } catch (e) { r = e } r")
         assertTrue(!JS_IsException(r))
         assertTrue(JS_IsError(ctx, r))
         val rPtr = JS_VALUE_TO_PTR(r)

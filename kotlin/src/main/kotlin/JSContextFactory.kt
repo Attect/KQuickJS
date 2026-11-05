@@ -68,15 +68,49 @@ fun JS_NewContext(mem: ByteArray, memSize: Int, stdlib: JSSTDLibraryDef): JSCont
 }
 
 fun JS_Eval(ctx: JSContext, code: String, filename: String, flags: Int): JSValue {
+    /* 深嵌套源码（如 1000 层括号）会让递归下降解析器耗尽 JVM 栈：
+     * 解析阶段栈溢出时改用大栈线程重试（执行阶段不重试，避免副作用重复） */
+    var phase = 0
+    fun evalImpl(): JSValue = evalBody(ctx, code, filename, flags) { phase = 1 }
+    return try {
+        evalImpl()
+    } catch (e: StackOverflowError) {
+        if (phase != 0) throw e
+        var out: JSValue = JS_EXCEPTION
+        val th = Thread(null, { out = evalImpl() }, "kqjs-eval-big-stack", 64L * 1024 * 1024)
+        th.start()
+        th.join()
+        out
+    }
+}
+
+private fun evalBody(ctx: JSContext, code: String, filename: String, flags: Int,
+                     onExecute: () -> Unit): JSValue {
     val bytes = code.toByteArray()
     val state = JSParseState(ctx, bytes, filename, flags)
     val parser = JSParser(state)
     val result = parser.parse()
-    
+
     if (JS_IsException(result)) {
-        return result
+        /* 语法错误：构造 SyntaxError 并附带 eval 位置的回溯行 */
+        ctx.throwError(JSObjectClassEnum.JS_CLASS_SYNTAX_ERROR,
+                        state.errorMsg ?: "syntax error")
+        val err = ctx.currentException
+        if (!JS_IsException(err)) {
+            val keep = ctx.gcKeepAlive.size
+            ctx.gcKeepAlive.add(err)
+            val stack = JS_NewString(ctx,
+                "    at " + filename + ":" + state.errorLine + ":" + state.errorCol)
+            if (!JS_IsException(stack)) {
+                ctx.memory.putJSValue(JS_VALUE_TO_PTR(ctx.gcKeepAlive[keep]) + 32, stack)
+            }
+            ctx.currentException = ctx.gcKeepAlive[keep]
+            while (ctx.gcKeepAlive.size > keep) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
+        return JS_EXCEPTION
     }
-    
+
+    onExecute()
     val runtime = JSRuntime(ctx)
     return runtime.callFunction(result, emptyList())
 }

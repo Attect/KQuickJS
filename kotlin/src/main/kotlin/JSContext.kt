@@ -69,6 +69,54 @@ class JSContext(
     var cArgBase: Int = -1
     /* 长期 JVM 根（bind 绑定信息等；随上下文存活，不随调用帧弹出） */
     val persistentRoots: MutableList<JSValue> = mutableListOf()
+    
+    /* 解释器调用帧：func 在 gcKeepAlive 的槽位 + 当前字节码 pc（用于错误回溯） */
+    class JSFrame(val keep: Int, var pc: Int)
+    val frames: MutableList<JSFrame> = mutableListOf()
+    /* 函数字节码指针 → pc2line 稀疏表 [pc,packed,...]（GC 搬移时同步更新键） */
+    val pc2lineMap: MutableMap<Int, IntArray> = HashMap()
+    
+    /* 读取函数字节码 +56 的 pc→(line<<16|col) 稀疏表，二分查找不超过 pc 的最近位置 */
+    fun pcToLineCol(funcPtr: Int, pc: Int): Int {
+        val arr = pc2lineMap[funcPtr] ?: return (1 shl 16) or 1
+        val pairs = arr.size / 2
+        var lo = 0
+        var hi = pairs - 1
+        var best = (1 shl 16) or 1
+        while (lo <= hi) {
+            val mid = (lo + hi) ushr 1
+            if (arr[mid * 2] <= pc) {
+                best = arr[mid * 2 + 1]
+                lo = mid + 1
+            } else {
+                hi = mid - 1
+            }
+        }
+        return best
+    }
+    
+    /* 生成错误回溯字符串（对照 C 的 build_backtrace）：最内层帧在前 */
+    fun buildBacktrace(): String {
+        val sb = StringBuilder()
+        for (i in frames.indices.reversed()) {
+            val f = frames[i]
+            if (f.keep < 0 || f.keep >= gcKeepAlive.size) continue
+            val fn = gcKeepAlive[f.keep]
+            if (!JS_IsPtr(fn)) continue
+            val p = JS_VALUE_TO_PTR(fn)
+            if (p < heapBase || p >= memory.size) continue
+            if (memory.getMTag(p) != JSMTags.JS_MTAG_FUNCTION_BYTECODE) continue
+            val nameV = memory.getJSValue(p + 8)
+            val name = if (JS_IsString(this, nameV)) jsGetString(this, nameV) else "<anonymous>"
+            val fileV = memory.getJSValue(p + 48)
+            val file = if (JS_IsString(this, fileV)) jsGetString(this, fileV) else "<eval>"
+            val packed = pcToLineCol(p, f.pc)
+            sb.append("    at ").append(name).append(" (").append(file)
+                .append(':').append(packed ushr 16).append(':').append(packed and 0xFFFF)
+                .append(")\n")
+        }
+        return sb.toString().trimEnd()
+    }
     /* 闭包捕获变量槽池：编译期被内层函数引用的外层局部变量提升为池槽，
      * 外层与内层统一通过槽读写（对照 C JSVarRef 的 detached 近似语义，
      * 槽值生命周期与上下文一致）。JSGC 作为根遍历 */
@@ -215,8 +263,8 @@ class JSContext(
         }
         gcKeepAlive.add(errorObj)
         
-        /* 生成 stack 回溯字符串（build_backtrace 的 Kotlin 等价物，基于 jsCallStack） */
-        val stackStr = jsCallStack.joinToString("\n") { "    at $it" }
+        /* 生成 stack 回溯字符串（对照 C 的 build_backtrace：帧 pc → 源码行列） */
+        val stackStr = buildBacktrace()
         val stackVal = if (stackStr.isEmpty()) JS_NULL else {
             val sv = JS_NewString(this, stackStr)
             if (JS_IsException(sv)) JS_NULL else sv

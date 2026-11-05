@@ -143,7 +143,9 @@ enum class OPCodeEnum(val id: Int, val size: Int, val nPop: Int, val nPush: Int,
     OP_get_global(126, 3, 0, 1, 7),
     OP_put_global(127, 3, 1, 0, 7),
     /* typeof 专用：未声明的全局标识符返回 undefined 而不是抛 ReferenceError */
-    OP_get_global_undef(128, 3, 0, 1, 7);
+    OP_get_global_undef(128, 3, 0, 1, 7),
+    /* 顶层 var/function 声明：总是创建全局属性（赋值走 OP_put_global 的严格检查） */
+    OP_define_global(129, 3, 1, 0, 7);
     
     companion object {
         fun fromId(id: Int): OPCodeEnum? = entries.find { it.id == id }
