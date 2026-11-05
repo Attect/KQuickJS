@@ -1988,24 +1988,36 @@ class JSRuntime(private val ctx: JSContext) {
         }
         if (classId == JSObjectClassEnum.JS_CLASS_ARRAY.value) {
             val i = toInt32(idx)
-            var arrData = ctx.memory.getJSValue(objPtr + 24)
-            if (arrData == JS_NULL) {
-                arrData = allocValueArray(i + 1)
-                ctx.memory.putJSValue(objPtr + 24, arrData)
-            }
-            val arrDataPtr = JS_VALUE_TO_PTR(arrData)
-            var size = ctx.memory.getI32(arrDataPtr + 4)
-            if (i >= size) {
-                arrData = resizeValueArray(arrData, i + 1)
-                ctx.memory.putJSValue(objPtr + 24, arrData)
-                size = i + 1
-            }
-            val finalArrDataPtr = JS_VALUE_TO_PTR(arrData)
-            ctx.memory.putJSValue(finalArrDataPtr + 8 + i * 8, val1)
-            
-            val len = ctx.memory.getI32(objPtr + 32)
-            if (i >= len) {
-                ctx.memory.putI32(objPtr + 32, i + 1)
+            val curData = ctx.memory.getJSValue(objPtr + 24)
+            val curSize = if (curData != JS_NULL) ctx.memory.getI32(JS_VALUE_TO_PTR(curData) + 4) else 0
+            if (curData == JS_NULL || i >= curSize) {
+                /* 扩容会分配并可能触发 GC：obj/val1 入保活，分配后重新取址 */
+                val keep = ctx.gcKeepAlive.size
+                ctx.gcKeepAlive.add(obj)
+                ctx.gcKeepAlive.add(val1)
+                try {
+                    var data = ctx.memory.getJSValue(JS_VALUE_TO_PTR(ctx.gcKeepAlive[keep]) + 24)
+                    if (data == JS_NULL) {
+                        data = allocValueArray(i + 1)
+                        val op = JS_VALUE_TO_PTR(ctx.gcKeepAlive[keep])
+                        ctx.memory.putJSValue(op + 24, data)
+                    }
+                    var size = ctx.memory.getI32(JS_VALUE_TO_PTR(data) + 4)
+                    if (i >= size) {
+                        data = resizeValueArray(data, i + 1)
+                        val op = JS_VALUE_TO_PTR(ctx.gcKeepAlive[keep])
+                        ctx.memory.putJSValue(op + 24, data)
+                    }
+                    ctx.memory.putJSValue(JS_VALUE_TO_PTR(data) + 8 + i * 8,
+                                          ctx.gcKeepAlive[keep + 1])
+                    val op = JS_VALUE_TO_PTR(ctx.gcKeepAlive[keep])
+                    if (i >= ctx.memory.getI32(op + 32)) ctx.memory.putI32(op + 32, i + 1)
+                } finally {
+                    while (ctx.gcKeepAlive.size > keep) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+                }
+            } else {
+                ctx.memory.putJSValue(JS_VALUE_TO_PTR(curData) + 8 + i * 8, val1)
+                if (i >= ctx.memory.getI32(objPtr + 32)) ctx.memory.putI32(objPtr + 32, i + 1)
             }
             return
         }

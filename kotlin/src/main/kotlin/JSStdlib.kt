@@ -737,6 +737,50 @@ object JSStdlib {
         defMethod(ctx, rt, proto, "sort", 1) { c, thisVal, args ->
             val cmp = arg(args, 0)
             val len = arrayLen(c, thisVal)
+            /* 快速路径：无比较函数且元素均为原始值（数值/字符串/undefined）时，
+             * 直接按预先计算的字符串键排序，避免每次比较走 JSValue 槽与 GC 检查 */
+            if (!JS_IsFunction(c, cmp) && JS_IsPtr(thisVal)) {
+                val arrP = JS_VALUE_TO_PTR(thisVal)
+                val dataV = c.memory.getJSValue(arrP + 24)
+                val cap = if (dataV != JS_NULL) c.memory.getI32(JS_VALUE_TO_PTR(dataV) + 4) else 0
+                val dp = if (dataV != JS_NULL) JS_VALUE_TO_PTR(dataV) else 0
+                var allPrimitive = cap >= len
+                var failIdx = -1
+                if (allPrimitive) {
+                    for (i in 0 until len) {
+                        val v = c.memory.getJSValue(dp + 8 + i * 8)
+                        if (!(JS_IsUndefined(v) || JS_IsInt(v) || JS_IsShortFloat(v) ||
+                              (JS_IsPtr(v) && c.memory.getMTag(JS_VALUE_TO_PTR(v)) == JSMTags.JS_MTAG_STRING) ||
+                              (JS_IsPtr(v) && c.memory.getMTag(JS_VALUE_TO_PTR(v)) == JSMTags.JS_MTAG_FLOAT64))) {
+                            allPrimitive = false; failIdx = i; break
+                        }
+                    }
+                }
+
+                if (allPrimitive) {
+
+                    var m = 0
+                    val vals = LongArray(len)
+                    val keys = arrayOfNulls<String>(len)
+                    for (i in 0 until len) {
+                        val v = c.memory.getJSValue(JS_VALUE_TO_PTR(dataV) + 8 + i * 8)
+                        if (JS_IsUndefined(v)) continue
+                        vals[m] = v
+                        keys[m] = rt.toStringValue(v)
+                        m++
+                    }
+                    val order = (0 until m).toMutableList()
+                    order.sortWith { ia, ib -> keys[ia]!!.compareTo(keys[ib]!!) }
+                    for (i in 0 until m) {
+                        c.memory.putJSValue(dp + 8 + i * 8, vals[order[i]])
+                    }
+                    for (i in m until len) {
+                        c.memory.putJSValue(dp + 8 + i * 8, JS_UNDEFINED)
+                    }
+                    c.memory.putI32(arrP + 32, len)
+                    return@defMethod thisVal
+                }
+            }
             val keep = c.gcKeepAlive.size
             c.gcKeepAlive.add(thisVal)          /* 槽 keep */
             c.gcKeepAlive.add(cmp)              /* 槽 keep+1 */
