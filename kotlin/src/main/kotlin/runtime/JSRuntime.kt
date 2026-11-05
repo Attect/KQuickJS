@@ -88,7 +88,7 @@ class JSRuntime(private val ctx: JSContext) {
              * 从保活列表读取 */
             funcKept = ctx.gcKeepAlive[keepStart]
             thisObjKept = ctx.gcKeepAlive[keepStart + 1]
-            val iterFuncPtr = JS_VALUE_TO_PTR(funcKept)
+            fun funcPtrNow(): Int = JS_VALUE_TO_PTR(ctx.gcKeepAlive[keepStart])
             
             val op = code[pc].toInt() and 0xFF
             if (System.getenv("MQJS_TRACE") != null) {
@@ -143,7 +143,7 @@ class JSRuntime(private val ctx: JSContext) {
                 OPCodeEnum.OP_get_global.id -> {
                     val idx = readU16(code, pc)
                     pc += 2
-                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
+                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
                     val name = if (cpool != JS_NULL) {
                         ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
                     } else JS_UNDEFINED
@@ -158,7 +158,7 @@ class JSRuntime(private val ctx: JSContext) {
                     /* typeof 操作数：不存在时返回 undefined，不抛异常 */
                     val idx = readU16(code, pc)
                     pc += 2
-                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
+                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
                     val name = if (cpool != JS_NULL) {
                         ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
                     } else JS_UNDEFINED
@@ -169,7 +169,7 @@ class JSRuntime(private val ctx: JSContext) {
                     val idx = readU16(code, pc)
                     pc += 2
                     val v = stack.removeLast()
-                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
+                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
                     val name = if (cpool != JS_NULL) {
                         ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
                     } else JS_UNDEFINED
@@ -210,7 +210,7 @@ class JSRuntime(private val ctx: JSContext) {
                 OPCodeEnum.OP_push_const.id -> {
                     val idx = (code[pc].toInt() and 0xFF) or ((code[pc + 1].toInt() and 0xFF) shl 8)
                     pc += 2
-                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
+                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
                     if (cpool != JS_NULL) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
                         stack.add(ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8))
@@ -223,7 +223,7 @@ class JSRuntime(private val ctx: JSContext) {
                     /* 从 cpool 的函数字节码创建 JS_CLASS_CLOSURE 对象（extra 槽 0 = funcBytecode） */
                     val idx = readU16(code, pc)
                     pc += 2
-                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
+                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
                     val funcBytecode = if (cpool != JS_NULL) {
                         ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
                     } else JS_NULL
@@ -245,7 +245,7 @@ class JSRuntime(private val ctx: JSContext) {
                             if (capArr != JS_NULL && !JS_IsException(capArr)) {
                                 val capPtr = JS_VALUE_TO_PTR(capArr)
                                 val capCount = ctx.memory.getI32(capPtr + 4) / 2
-                                val curVarsTab = ctx.memory.getJSValue(iterFuncPtr + 32)
+                                val curVarsTab = ctx.memory.getJSValue(funcPtrNow() + 32)
                                 if (curVarsTab != JS_NULL) {
                                     val tabPtr = JS_VALUE_TO_PTR(curVarsTab)
                                     val tabLen = ctx.memory.getI32(tabPtr + 4)
@@ -535,7 +535,7 @@ class JSRuntime(private val ctx: JSContext) {
                     val idx = readU16(code, pc)
                     pc += 2
                     val obj = stack.removeLast()
-                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
+                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
                     val key = if (cpool != JS_NULL) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
                         ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
@@ -557,7 +557,7 @@ class JSRuntime(private val ctx: JSContext) {
                         return JS_EXCEPTION
                     }
                     val obj = stack.last()
-                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
+                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
                     val key = if (cpool != JS_NULL) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
                         ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
@@ -570,7 +570,7 @@ class JSRuntime(private val ctx: JSContext) {
                     pc += 2
                     val val1 = stack.removeLast()
                     val obj = stack.removeLast()
-                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
+                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
                     val key = if (cpool != JS_NULL) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
                         ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
@@ -606,7 +606,7 @@ class JSRuntime(private val ctx: JSContext) {
                     pc += 2
                     val val1 = stack.removeLast()
                     val obj = stack.removeLast()
-                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
+                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
                     val key = if (cpool != JS_NULL) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
                         ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
@@ -725,7 +725,7 @@ class JSRuntime(private val ctx: JSContext) {
                     pc += 2
                     val func = stack.removeLast()
                     val obj = stack.removeLast()
-                    val cpool = ctx.memory.getJSValue(iterFuncPtr + 24)
+                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
                     val key = if (cpool != JS_NULL) {
                         ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
                     } else JS_UNDEFINED
@@ -837,7 +837,7 @@ class JSRuntime(private val ctx: JSContext) {
                         if (vp in ctx.heapBase until ctx.heapFree &&
                             ctx.memory.getMTag(vp) == JSMTags.JS_MTAG_FREE) {
                             var nm = "?"
-                            val vt = ctx.memory.getJSValue(iterFuncPtr + 32)
+                            val vt = ctx.memory.getJSValue(funcPtrNow() + 32)
                             if (vt != JS_NULL) {
                                 val vtp = JS_VALUE_TO_PTR(vt)
                                 val nv = ctx.memory.getJSValue(vtp + 8 + idx * 8)
@@ -857,7 +857,7 @@ class JSRuntime(private val ctx: JSContext) {
                         val vp = JS_VALUE_TO_PTR(val1)
                         if (vp >= ctx.heapFree || (vp >= ctx.heapBase && ctx.memory.getMTag(vp) == JSMTags.JS_MTAG_FREE)) {
                             var nm = "?"
-                            val vt = ctx.memory.getJSValue(iterFuncPtr + 32)
+                            val vt = ctx.memory.getJSValue(funcPtrNow() + 32)
                             if (vt != JS_NULL) {
                                 val vtp = JS_VALUE_TO_PTR(vt)
                                 val nv = ctx.memory.getJSValue(vtp + 8 + idx * 8)
@@ -1710,8 +1710,8 @@ class JSRuntime(private val ctx: JSContext) {
     
     private fun setPropertyInternal() {
         val obj = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 3]
-        val key = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 2]
-        val val1 = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
+        var key = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 2]
+        var val1 = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
         
         if (!JS_IsPtr(obj)) return
         var objPtr = JS_VALUE_TO_PTR(obj)
@@ -1751,8 +1751,10 @@ class JSRuntime(private val ctx: JSContext) {
         var props = ctx.memory.getJSValue(objPtr + 16)
         if (props == JS_NULL || props == ctx.emptyProps) {
             props = allocProps(4)
-            /* allocProps 的 malloc 可能触发 GC 搬移 obj：从保活列表刷新 obj 地址 */
+            /* allocProps 的 malloc 可能触发 GC 搬移 obj/key/value：从保活列表刷新 */
             objPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 3])
+            key = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 2]
+            val1 = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
             ctx.memory.putJSValue(objPtr + 16, props)
         }
         
@@ -1796,6 +1798,8 @@ class JSRuntime(private val ctx: JSContext) {
             /* 扩容的 malloc 可能触发 GC 搬移 obj/props：从保活列表刷新 obj 地址，
                并重新读取 obj 的 props 槽（GC 已将其更新为搬移后的 props 位置） */
             objPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 3])
+            key = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 2]
+            val1 = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
             props = ctx.memory.getJSValue(objPtr + 16)
             propsPtr = JS_VALUE_TO_PTR(props)
             

@@ -588,14 +588,12 @@ var r = outer();
 
 ### 剩余缺口（按优先级）
 
-1. `test_builtin.js`：`test_string2` 之后的补充平面字符拼接、`test_function`
-   的 `Function` 构造器、`test_enum`、`test_array*` 扩展方法、`test_typed_array`、
-   `test_global_eval`（全局 eval）、`test_json` 边界、`test_regexp` 的
-   Annex B/前瞻/反向引用细节、`test_line_column_numbers`；
-2. `microbench.js`：`scriptArgs`、`Int32Array` 等 TypedArray、`Set`、
-   （可选，`typeof BigInt` 检测可跳过）BigInt；
-3. 极低内存（256KB 堆 + 标准库）下 400+ 函数的 GC 压力场景仍存在一处
-   数组/属性底座标失效，需继续定位（当前回归测试规模调整为 300 函数）。
+1. `test_builtin.js`：仅剩 `test_line_column_numbers`（需要错误栈的行列号信息：
+   解析错误的 `e.stack` 定位、运行时错误 → 字节码 pc → 源码行列映射；
+   计划在函数字节码 +56 槽保存 pc→(line,col) 表，并在 Error 对象上生成 stack 字符串）；
+2. `microbench.js`：已可完整跑完基准序列（TypedArray/正则/BigInt 守卫均已支持），
+   待确认最终退出码；
+3. `Function`/`eval` 已实现全局语义；`bind` 支持 this/偏应用参数。
 
 ## 相关文件
 
