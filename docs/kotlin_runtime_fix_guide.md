@@ -604,14 +604,27 @@ var r = outer();
 - `null`/`undefined` 的属性/索引访问抛 `TypeError`；
 - 运算、`valueOf`、getter/setter 中产生的异常在主循环统一按 catch 目标展开。
 
-### 剩余缺口
+### 验收状态
 
-1. `microbench.js`：全部基准已可运行（TypedArray/正则/Set 外均支持），
-   最后一次完整运行的退出码待确认；
-2. 极低内存（256KB 堆）下 300+ 全局函数仍可能因属性表分配失败而丢失末尾属性；
+| 测试 | 结果 |
+|------|------|
+| `tests/test_language.js` | 通过（rc=0） |
+| `tests/test_loop.js` | 通过（rc=0） |
+| `tests/test_closure.js` | 通过（rc=0） |
+| `tests/test_builtin.js` | 通过（rc=0，含错误行列号、正则、TypedArray、JSON、eval/Function 等全部分组） |
+| `tests/microbench.js` | 通过（rc=0，42 行基准输出，含 total 汇总） |
+| `tests/mandelbrot.js` | 通过（rc=0，输出正确图形） |
+| Kotlin 全量测试 | 173 个全部通过 |
+
+### 已知限制
+
+1. 极低内存（256KB 堆）下 300+ 全局函数仍可能因属性表分配失败而丢失末尾属性；
    标准库启用阈值已提高到 512KB（Kotlin 标准库内存占用较大），
    回归测试维持 300 函数；
-3. `Set`/`BigInt` 未实现（microbench 有 `typeof` 守卫，可跳过 BigInt）。
+2. `Set`/`BigInt` 未实现（microbench 有 `typeof` 守卫可跳过 BigInt，
+   `Set` 基准在测试列表中被注释掉）；
+3. 默认 `Array.prototype.sort` 的快速路径仅覆盖原始值元素；含对象元素或自定义
+   比较函数时走通用路径（正确但较慢）。
 
 ## 相关文件
 
@@ -637,3 +650,4 @@ var r = outer();
 - **2026-11-05**：修复长脚本解析/执行崩溃（常量池计数泄漏、字节码数组块大小、解析期与执行期 GC 根、注释跳过）
 - **2026-11-05**：语言特性与标准库对齐（switch/for-in/标签/提升/访问器/arguments、Array/String/Number/Math/JSON/Error/RegExp/TypedArray、WTF-8 字符串、全局 eval/Function/bind）
 - **2026-11-05**：错误回溯行列号与严格模式语义（pc2line 表、SyntaxError stack、未声明赋值 ReferenceError、null 访问 TypeError、异常统一展开）
+- **2026-11-05**：Array 默认排序快速路径、setElement 扩容 GC 保活；五个 JS 测试文件与 Kotlin 全量测试全部通过
