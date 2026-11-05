@@ -94,6 +94,7 @@ data class JSToken(
     var sourcePos: Int = 0,
     var d: Double = 0.0,
     var reFlags: Int = 0,
+    var regexpFlags: String = "",
     var reEndPos: Int = 0,
     var value: JSValue = JS_NULL
 )
@@ -282,7 +283,7 @@ class JSParseState(
                     parseString(c)
                     return
                 }
-                in 'a'.code..'z'.code, in 'A'.code..'Z'.code, '_'.code, '$'.code -> {
+                in 'a'.code..'z'.code, in 'A'.code..'Z'.code, '_'.code, '$'.code, in 128..255 -> {
                     parseIdent()
                     return
                 }
@@ -612,7 +613,7 @@ class JSParseState(
         while (bufPos < bufLen) {
             val c = peekChar()
             if (c in 'a'.code..'z'.code || c in 'A'.code..'Z'.code ||
-                c in '0'.code..'9'.code || c == '_'.code || c == '$'.code) {
+                c in '0'.code..'9'.code || c == '_'.code || c == '$'.code || c >= 128) {
                 advance()
             } else {
                 break
@@ -628,6 +629,64 @@ class JSParseState(
             token.val1 = JSTokenVal.TOK_IDENT.value
             token.value = JS_NewString(ctx, ident)
         }
+    }
+    
+    /* 从 token.sourcePos 处的 '/' 重新扫描正则字面量。
+     * 词法器无法区分除号与正则起始，只有在表达式起始位置的解析器知道，
+     * 因此在 parsePrimaryExpr 里回退到 '/' 位置重新扫描。
+     * pattern 按原始字节收集（保留 UTF-8），'\' 转义原样保留。 */
+    fun parseRegexpLiteral(): Boolean {
+        if (System.getenv("MQJS_TRACE") != null) {
+            println("DBG regexp rescan at sourcePos=${token.sourcePos} bufPos=$bufPos")
+        }
+        val out = java.io.ByteArrayOutputStream()
+        bufPos = token.sourcePos + 1
+        var inClass = false
+        var closed = false
+        while (bufPos < bufLen) {
+            val c = peekChar()
+            if (c == '\\'.code) {
+                out.write(c)
+                advance()
+                if (bufPos < bufLen) {
+                    out.write(peekChar())
+                    advance()
+                }
+                continue
+            }
+            if (c == '['.code) {
+                inClass = true
+            } else if (c == ']'.code) {
+                inClass = false
+            } else if (c == '/'.code && !inClass) {
+                advance()
+                closed = true
+                break
+            } else if (c == '\n'.code) {
+                error("unexpected end of regexp")
+                return false
+            }
+            out.write(c)
+            advance()
+        }
+        if (!closed) {
+            error("unexpected end of regexp")
+            return false
+        }
+        val flags = StringBuilder()
+        while (bufPos < bufLen) {
+            val c = peekChar()
+            if (c in 'a'.code..'z'.code || c in 'A'.code..'Z'.code) {
+                flags.append(c.toChar())
+                advance()
+            } else {
+                break
+            }
+        }
+        token.val1 = JSTokenVal.TOK_REGEXP.value
+        token.regexpFlags = flags.toString()
+        token.value = JS_NewString(ctx, String(out.toByteArray(), Charsets.UTF_8))
+        return true
     }
     
     fun parseNumber() {

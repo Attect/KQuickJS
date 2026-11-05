@@ -467,6 +467,20 @@ class JSRuntime(private val ctx: JSContext) {
                 OPCodeEnum.OP_return.id -> return stack.removeLast()
                 OPCodeEnum.OP_return_undef.id -> return JS_UNDEFINED
                 
+                OPCodeEnum.OP_regexp.id -> {
+                    /* [pattern, flags] -> RegExp 对象 */
+                    val flags = jsGetString(ctx, stack.removeLast())
+                    val pattern = jsGetString(ctx, stack.removeLast())
+                    val re = JSStdlib.newRegExp(ctx, pattern, flags)
+                    if (JS_IsException(re)) {
+                        val target = unwindToCatch(stack)
+                        if (target < 0) return JS_EXCEPTION
+                        pc = target
+                    } else {
+                        stack.add(re)
+                    }
+                }
+                
                 OPCodeEnum.OP_object.id -> {
                     val n = readU16(code, pc)
                     pc += 2
@@ -1212,7 +1226,7 @@ class JSRuntime(private val ctx: JSContext) {
             return "[object]"
         }
         val len = ctx.memory.getI32(ptr + 4)
-        return ctx.memory.getString(ptr + 8, len)
+        return String(ctx.memory.getBytes(ptr + 8, len), Charsets.UTF_8)
     }
     
     /* 读取对象属性：自身属性表 → 数组 length 回退 → 原型链。
@@ -1271,10 +1285,23 @@ class JSRuntime(private val ctx: JSContext) {
         }
 
         val classId = ctx.memory.getU8(objPtr + 2)
-        if (classId == JSObjectClassEnum.JS_CLASS_ARRAY.value &&
-            JS_IsString(ctx, key) && jsGetString(ctx, key) == "length"
-        ) {
-            return JS_NewShortInt(ctx.memory.getI32(objPtr + 32))
+        /* Error 实例的 message/stack 存在 extra 槽（对照 C 的 p->u.error） */
+        if (classId == JSObjectClassEnum.JS_CLASS_ERROR.value && JS_IsString(ctx, key)) {
+            when (jsGetString(ctx, key)) {
+                "message" -> return ctx.memory.getJSValue(objPtr + 24)
+                "stack" -> return ctx.memory.getJSValue(objPtr + 32)
+            }
+        }
+        if (classId == JSObjectClassEnum.JS_CLASS_ARRAY.value && JS_IsString(ctx, key)) {
+            when (jsGetString(ctx, key)) {
+                "length" -> return JS_NewShortInt(ctx.memory.getI32(objPtr + 32))
+            }
+        }
+        if (classId == JSObjectClassEnum.JS_CLASS_ARRAY.value && JS_IsInt(key)) {
+            val i = JS_VALUE_GET_INT(key)
+            if (i >= 0 && i < ctx.memory.getI32(objPtr + 32)) {
+                return getElement(obj, key)
+            }
         }
 
         val proto = ctx.memory.getJSValue(objPtr + 8)
@@ -1523,10 +1550,14 @@ class JSRuntime(private val ctx: JSContext) {
         
         /* 数组 length 回退（与 getProperty 保持一致，见其注释） */
         val classIdHp = ctx.memory.getU8(objPtr + 2)
-        if (classIdHp == JSObjectClassEnum.JS_CLASS_ARRAY.value &&
-            JS_IsString(ctx, key) && jsGetString(ctx, key) == "length"
+        if (classIdHp == JSObjectClassEnum.JS_CLASS_ARRAY.value && JS_IsString(ctx, key) &&
+            jsGetString(ctx, key) == "length"
         ) {
             return true
+        }
+        if (classIdHp == JSObjectClassEnum.JS_CLASS_ARRAY.value && JS_IsInt(key)) {
+            val i = JS_VALUE_GET_INT(key)
+            if (i >= 0 && i < ctx.memory.getI32(objPtr + 32)) return true
         }
 
         val proto = ctx.memory.getJSValue(objPtr + 8)
@@ -1682,6 +1713,8 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun getElement(obj: JSValue, idx: JSValue): JSValue {
+        /* 字符串索引：str[i] 返回单字符 */
+        if (JS_IsString(ctx, obj)) return getProperty(obj, idx)
         if (!JS_IsPtr(obj)) return JS_UNDEFINED
         val objPtr = JS_VALUE_TO_PTR(obj)
         if (ctx.memory.getMTag(objPtr) != JSMTags.JS_MTAG_OBJECT) return JS_UNDEFINED

@@ -88,6 +88,7 @@ object JSStdlib {
             initArray(ctx, rt)
             initString(ctx, rt)
             initNumber(ctx, rt)
+            initRegExp(ctx, rt)
             initMath(ctx, rt)
             initJson(ctx, rt)
         } catch (e: Exception) {
@@ -143,6 +144,23 @@ object JSStdlib {
             println(sb.toString())
             JS_UNDEFINED
         })
+        
+        /* console.log（对照 C 宿主注册的 console 对象） */
+        val consoleObj = JS_NewObject(ctx)
+        val logFn = native(ctx, 1) { c, _, args ->
+            val sb = StringBuilder()
+            for (i in args.indices) {
+                if (i > 0) sb.append(' ')
+                sb.append(toStr(c, rt, args[i]))
+            }
+            println(sb.toString())
+            JS_UNDEFINED
+        }
+        defValue(ctx, rt, consoleObj, "log", logFn)
+        defValue(ctx, rt, consoleObj, "info", logFn)
+        defValue(ctx, rt, consoleObj, "warn", logFn)
+        defValue(ctx, rt, consoleObj, "error", logFn)
+        defGlobal(ctx, rt, "console", consoleObj)
     }
 
     private fun parseIntImpl(ctx: JSContext, v: JSValue, radix: JSValue): JSValue {
@@ -307,13 +325,43 @@ object JSStdlib {
             rt.jsObjectKeys(arg(args, 0))
         }
 
-        defMethod(ctx, rt, proto, "hasOwnProperty", 1) { c, _, args ->
-            JS_NewBool(hasOwn(c, rt, arg(args, 0), arg(args, 1)))
+        defMethod(ctx, rt, proto, "hasOwnProperty", 1) { c, thisVal, args ->
+            JS_NewBool(hasOwn(c, rt, thisVal, arg(args, 0)))
         }
-        defMethod(ctx, rt, proto, "toString", 0) { c, _, _ ->
-            JS_NewString(c, "[object Object]")
+        defMethod(ctx, rt, proto, "toString", 0) { c, thisVal, _ ->
+            /* this 由 call/apply 传入；普通调用时 this 是对象本身 */
+            JS_NewString(c, objectTag(c, rt, thisVal))
         }
         defMethod(ctx, rt, proto, "valueOf", 0) { _, thisVal, _ -> thisVal }
+    }
+    
+    /* Object.prototype.toString 的标签（按 this 的实际类型） */
+    fun objectTag(ctx: JSContext, rt: JSRuntime, v: JSValue): String {
+        if (JS_IsUndefined(v)) return "[object Undefined]"
+        if (JS_IsNull(v)) return "[object Null]"
+        if (JS_IsBool(v)) return "[object Boolean]"
+        if (JS_IsInt(v) || JS_IsShortFloat(v)) return "[object Number]"
+        if (JS_IsString(ctx, v)) return "[object String]"
+        if (JS_IsPtr(v)) {
+            val p = JS_VALUE_TO_PTR(v)
+            when (ctx.memory.getMTag(p)) {
+                JSMTags.JS_MTAG_FLOAT64 -> return "[object Number]"
+                JSMTags.JS_MTAG_STRING -> return "[object String]"
+                JSMTags.JS_MTAG_FUNCTION_BYTECODE -> return "[object Function]"
+                JSMTags.JS_MTAG_OBJECT -> {
+                    return when (ctx.memory.getU8(p + 2)) {
+                        JSObjectClassEnum.JS_CLASS_ARRAY.value -> "[object Array]"
+                        JSObjectClassEnum.JS_CLASS_CLOSURE.value,
+                        JSObjectClassEnum.JS_CLASS_C_FUNCTION.value -> "[object Function]"
+                        JSObjectClassEnum.JS_CLASS_ERROR.value -> "[object Error]"
+                        JSObjectClassEnum.JS_CLASS_DATE.value -> "[object Date]"
+                        JSObjectClassEnum.JS_CLASS_REGEXP.value -> "[object RegExp]"
+                        else -> "[object Object]"
+                    }
+                }
+            }
+        }
+        return "[object Object]"
     }
 
     private fun definePropertyImpl(ctx: JSContext, rt: JSRuntime,
@@ -326,9 +374,14 @@ object JSStdlib {
             if (JS_IsFunction(ctx, setter)) rt.defineAccessor(obj, key, setter, false)
             return
         }
-        val value = rt.getProperty(desc, JS_NewString(ctx, "value"))
-        if (!JS_IsUndefined(value)) {
-            rt.defineProperty(obj, key, value)
+        val valueKey = JS_NewString(ctx, "value")
+        if (hasOwn(ctx, rt, desc, valueKey)) {
+            rt.defineProperty(obj, key, rt.getProperty(desc, valueKey))
+        } else {
+            /* 空描述符：属性已存在则保持原值，否则创建 undefined 属性 */
+            if (!hasOwn(ctx, rt, obj, key)) {
+                rt.defineProperty(obj, key, JS_UNDEFINED)
+            }
         }
     }
 
@@ -336,6 +389,14 @@ object JSStdlib {
         if (!JS_IsPtr(obj)) return false
         val p = JS_VALUE_TO_PTR(obj)
         if (ctx.memory.getMTag(p) != JSMTags.JS_MTAG_OBJECT) return false
+        /* 数组的索引与 length 也是自有属性 */
+        if (ctx.memory.getU8(p + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value) {
+            if (JS_IsString(ctx, key) && jsGetString(ctx, key) == "length") return true
+            if (JS_IsInt(key)) {
+                val i = JS_VALUE_GET_INT(key)
+                if (i >= 0 && i < ctx.memory.getI32(p + 32)) return true
+            }
+        }
         val props = ctx.memory.getJSValue(p + 16)
         if (props == JS_NULL || props == ctx.emptyProps) return false
         val pp = JS_VALUE_TO_PTR(props)
@@ -689,16 +750,41 @@ object JSStdlib {
         }
         defMethod(ctx, rt, proto, "replace", 2) { c, thisVal, args ->
             val s = rt.toStringValue(thisVal)
-            val pat = rt.toStringValue(arg(args, 0))
-            val rep = arg(args, 1)
-            val idx = s.indexOf(pat)
-            if (idx < 0) {
-                JS_NewString(c, s)
+            if (isRegExp(c, arg(args, 0))) {
+                regexpReplace(c, rt, arg(args, 0), s, arg(args, 1))
             } else {
-                val repl = if (JS_IsFunction(c, rep)) {
-                    rt.toStringValue(rt.callFunction(rep, listOf(JS_NewString(c, pat)), JS_UNDEFINED))
-                } else rt.toStringValue(rep)
-                JS_NewString(c, s.substring(0, idx) + repl + s.substring(idx + pat.length))
+                val pat = rt.toStringValue(arg(args, 0))
+                val rep = arg(args, 1)
+                val idx = s.indexOf(pat)
+                if (idx < 0) {
+                    JS_NewString(c, s)
+                } else {
+                    val repl = if (JS_IsFunction(c, rep)) {
+                        rt.toStringValue(rt.callFunction(rep, listOf(JS_NewString(c, pat)), JS_UNDEFINED))
+                    } else rt.toStringValue(rep)
+                    JS_NewString(c, s.substring(0, idx) + repl + s.substring(idx + pat.length))
+                }
+            }
+        }
+        defMethod(ctx, rt, proto, "match", 1) { c, thisVal, args ->
+            val s = rt.toStringValue(thisVal)
+            if (isRegExp(c, arg(args, 0))) {
+                regexpMatch(c, rt, arg(args, 0), s)
+            } else {
+                val pat = rt.toStringValue(arg(args, 0))
+                val re = newRegExp(c, pat, "")
+                regexpMatch(c, rt, re, s)
+            }
+        }
+        defMethod(ctx, rt, proto, "search", 1) { c, thisVal, args ->
+            val s = rt.toStringValue(thisVal)
+            val re = arg(args, 0)
+            val pat = if (isRegExp(c, re)) JS_GetOpaque(c, re) as? java.util.regex.Pattern
+                      else compileRegexp(rt.toStringValue(re), "")
+            if (pat == null) JS_NewShortInt(-1)
+            else {
+                val m = pat.matcher(s)
+                JS_NewShortInt(if (m.find()) m.start() else -1)
             }
         }
         defMethod(ctx, rt, proto, "toString", 0) { c, thisVal, _ ->
@@ -795,7 +881,213 @@ object JSStdlib {
         }
     }
 
-    /* ---------------- JSON ---------------- */
+    /* ---------------- RegExp ---------------- */
+
+    fun isRegExp(ctx: JSContext, v: JSValue): Boolean {
+        if (!JS_IsPtr(v)) return false
+        val p = JS_VALUE_TO_PTR(v)
+        return ctx.memory.getMTag(p) == JSMTags.JS_MTAG_OBJECT &&
+               ctx.memory.getU8(p + 2) == JSObjectClassEnum.JS_CLASS_REGEXP.value
+    }
+
+    /* JS 正则 → Java 正则：处理身份转义（Annex B）与控制字符转义 */
+    private fun sanitizePattern(p: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i < p.length) {
+            val c = p[i]
+            if (c != '\\' || i + 1 >= p.length) {
+                sb.append(c); i++; continue
+            }
+            val n = p[i + 1]
+            when {
+                n == 'c' && i + 2 < p.length -> {
+                    sb.append("\\x%02x".format(java.util.Locale.ROOT, p[i + 2].code % 32))
+                    i += 3
+                }
+                n in "dDsSwWbBfnrtv0xupPkK".toSet() ||
+                    n.isDigit() -> {
+                    sb.append('\\').append(n); i += 2
+                }
+                n == '/' -> { sb.append('/'); i += 2 }
+                else -> { sb.append(n); i += 2 }   /* 身份转义：去掉反斜杠 */
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun compileRegexp(pattern: String, flags: String): java.util.regex.Pattern? {
+        var f = 0
+        if (flags.contains('i')) f = f or java.util.regex.Pattern.CASE_INSENSITIVE or
+                java.util.regex.Pattern.UNICODE_CASE
+        if (flags.contains('m')) f = f or java.util.regex.Pattern.MULTILINE
+        if (flags.contains('s')) f = f or java.util.regex.Pattern.DOTALL
+        if (flags.contains('u')) f = f or java.util.regex.Pattern.UNICODE_CASE
+        return try {
+            java.util.regex.Pattern.compile(sanitizePattern(pattern), f)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun newRegExp(ctx: JSContext, pattern: String, flags: String): JSValue {
+        val rt = JSRuntime(ctx)
+        val obj = JS_NewObjectProtoClass(ctx, ctx.classProto[JSObjectClassEnum.JS_CLASS_REGEXP.value],
+                                          JSObjectClassEnum.JS_CLASS_REGEXP.value, 0)
+        if (JS_IsException(obj)) return obj
+        rt.setProperty(obj, JS_NewString(ctx, "source"), JS_NewString(ctx, pattern))
+        rt.setProperty(obj, JS_NewString(ctx, "flags"), JS_NewString(ctx, flags))
+        rt.setProperty(obj, JS_NewString(ctx, "global"), JS_NewBool(flags.contains('g')))
+        rt.setProperty(obj, JS_NewString(ctx, "lastIndex"), JS_NewShortInt(0))
+        JS_SetOpaque(ctx, obj, compileRegexp(pattern, flags))
+        return obj
+    }
+
+    private fun reFlags(ctx: JSContext, rt: JSRuntime, re: JSValue): String {
+        val v = rt.getProperty(re, JS_NewString(ctx, "flags"))
+        return if (JS_IsString(ctx, v)) jsGetString(ctx, v) else ""
+    }
+
+    fun regexpExec(ctx: JSContext, rt: JSRuntime, re: JSValue, str: String): JSValue {
+        val pat = JS_GetOpaque(ctx, re) as? java.util.regex.Pattern
+        if (pat == null) return JS_NULL
+        val global = reFlags(ctx, rt, re).contains('g')
+        val m = pat.matcher(str)
+        var start = 0
+        if (global) {
+            val li = rt.getProperty(re, JS_NewString(ctx, "lastIndex"))
+            start = if (JS_IsInt(li)) JS_VALUE_GET_INT(li) else 0
+            if (start < 0 || start > str.length) {
+                rt.setProperty(re, JS_NewString(ctx, "lastIndex"), JS_NewShortInt(0))
+                return JS_NULL
+            }
+        }
+        val found = if (global) m.find(start) else m.find()
+        if (!found) {
+            if (global) rt.setProperty(re, JS_NewString(ctx, "lastIndex"), JS_NewShortInt(0))
+            return JS_NULL
+        }
+        val n = m.groupCount() + 1
+        val arr = JS_NewArray(ctx, n)
+        if (JS_IsException(arr)) return JS_NULL
+        for (g in 0 until n) {
+            val gv = m.group(g)
+            rt.setElement(arr, JS_NewShortInt(g),
+                if (gv == null) JS_UNDEFINED else JS_NewString(ctx, gv))
+        }
+        ctx.memory.putI32(JS_VALUE_TO_PTR(arr) + 32, n)
+        rt.setProperty(arr, JS_NewString(ctx, "index"), JS_NewShortInt(m.start()))
+        rt.setProperty(arr, JS_NewString(ctx, "input"), JS_NewString(ctx, str))
+        if (global) rt.setProperty(re, JS_NewString(ctx, "lastIndex"), JS_NewShortInt(m.end()))
+        return arr
+    }
+
+    private fun expandReplacement(rep: String, s: String, m: java.util.regex.Matcher): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i < rep.length) {
+            val c = rep[i]
+            if (c == '$' && i + 1 < rep.length) {
+                when (val n = rep[i + 1]) {
+                    '$' -> { sb.append('$'); i += 2 }
+                    '&' -> { sb.append(m.group()); i += 2 }
+                    '`' -> { sb.append(s, 0, m.start()); i += 2 }
+                    '\'' -> { sb.append(s, m.end(), s.length); i += 2 }
+                    else -> {
+                        if (n.isDigit()) {
+                            var j = i + 1
+                            var num = 0
+                            var cnt = 0
+                            while (j < rep.length && cnt < 2 && rep[j].isDigit()) {
+                                num = num * 10 + (rep[j] - '0'); j++; cnt++
+                            }
+                            if (num in 0..m.groupCount()) {
+                                sb.append(m.group(num) ?: ""); i = j
+                            } else {
+                                sb.append(c); i++
+                            }
+                        } else {
+                            sb.append(c); i++
+                        }
+                    }
+                }
+            } else {
+                sb.append(c); i++
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun regexpReplace(ctx: JSContext, rt: JSRuntime, re: JSValue, s: String,
+                              rep: JSValue): JSValue {
+        val pat = JS_GetOpaque(ctx, re) as? java.util.regex.Pattern ?: return JS_NewString(ctx, s)
+        val global = reFlags(ctx, rt, re).contains('g')
+        val m = pat.matcher(s)
+        val sb = StringBuilder()
+        var last = 0
+        while (m.find()) {
+            sb.append(s, last, m.start())
+            if (JS_IsFunction(ctx, rep)) {
+                val argv = ArrayList<JSValue>()
+                for (g in 0..m.groupCount()) {
+                    val gv = m.group(g)
+                    argv.add(if (gv == null) JS_UNDEFINED else JS_NewString(ctx, gv))
+                }
+                argv.add(JS_NewShortInt(m.start()))
+                argv.add(JS_NewString(ctx, s))
+                val r = rt.callFunction(rep, argv, JS_UNDEFINED)
+                if (JS_IsException(r)) return r
+                sb.append(rt.toStringValue(r))
+            } else {
+                sb.append(expandReplacement(rt.toStringValue(rep), s, m))
+            }
+            last = m.end()
+            if (!global) break
+        }
+        sb.append(s, last, s.length)
+        return JS_NewString(ctx, sb.toString())
+    }
+
+    private fun regexpMatch(ctx: JSContext, rt: JSRuntime, re: JSValue, s: String): JSValue {
+        val pat = JS_GetOpaque(ctx, re) as? java.util.regex.Pattern ?: return JS_NULL
+        val global = reFlags(ctx, rt, re).contains('g')
+        if (!global) return regexpExec(ctx, rt, re, s)
+        val m = pat.matcher(s)
+        val out = JS_NewArray(ctx, 0)
+        var n = 0
+        while (m.find()) {
+            rt.setElement(out, JS_NewShortInt(n++), JS_NewString(ctx, m.group()))
+        }
+        if (n == 0) return JS_NULL
+        ctx.memory.putI32(JS_VALUE_TO_PTR(out) + 32, n)
+        return out
+    }
+
+    private fun initRegExp(ctx: JSContext, rt: JSRuntime) {
+        val proto = JS_NewObject(ctx)
+        ctx.classProto[JSObjectClassEnum.JS_CLASS_REGEXP.value] = proto
+        val ctor = native(ctx, 2) { c, _, args ->
+            val p = if (args.isEmpty()) "" else rt.toStringValue(args[0])
+            val f = if (args.size < 2 || JS_IsUndefined(args[1])) "" else rt.toStringValue(args[1])
+            newRegExp(c, p, f)
+        }
+        rt.setProperty(ctor, JS_NewString(ctx, "prototype"), proto)
+        rt.setProperty(proto, JS_NewString(ctx, "constructor"), ctor)
+        defGlobal(ctx, rt, "RegExp", ctor)
+
+        defMethod(ctx, rt, proto, "exec", 1) { c, thisVal, args ->
+            regexpExec(c, rt, thisVal, rt.toStringValue(arg(args, 0)))
+        }
+        defMethod(ctx, rt, proto, "test", 1) { c, thisVal, args ->
+            val r = regexpExec(c, rt, thisVal, rt.toStringValue(arg(args, 0)))
+            JS_NewBool(!JS_IsNull(r))
+        }
+        defMethod(ctx, rt, proto, "toString", 0) { c, thisVal, _ ->
+            val src = rt.getProperty(thisVal, JS_NewString(c, "source"))
+            val fl = rt.getProperty(thisVal, JS_NewString(c, "flags"))
+            JS_NewString(c, "/" + rt.toStringValue(src) + "/" + rt.toStringValue(fl))
+        }
+    }
 
     private fun initJson(ctx: JSContext, rt: JSRuntime) {
         val json = JS_NewObject(ctx)

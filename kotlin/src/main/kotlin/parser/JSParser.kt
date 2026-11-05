@@ -101,10 +101,37 @@ class JSParser(private val s: JSParseState) {
         return if (idx >= 0) idx else addLocalVar(name)
     }
     
+    /* 词法级跳过表达式时判断 '/' 是否为正则起始（基于前一个 token） */
+    private fun regexCanStart(prev: Int): Boolean {
+        if (prev < 0) return true
+        when (prev) {
+            '('.code, '['.code, '{'.code, ','.code, ';'.code, ':'.code, '?'.code,
+            '='.code, '+'.code, '-'.code, '*'.code, '/'.code, '%'.code, '!'.code,
+            '~'.code, '&'.code, '|'.code, '^'.code, '<'.code, '>'.code,
+            JSTokenVal.TOK_RETURN.value, JSTokenVal.TOK_THROW.value,
+            JSTokenVal.TOK_CASE.value, JSTokenVal.TOK_DELETE.value,
+            JSTokenVal.TOK_VOID.value, JSTokenVal.TOK_TYPEOF.value,
+            JSTokenVal.TOK_NEW.value, JSTokenVal.TOK_IN.value,
+            JSTokenVal.TOK_INSTANCEOF.value, JSTokenVal.TOK_DO.value,
+            JSTokenVal.TOK_ELSE.value, JSTokenVal.TOK_VAR.value,
+            JSTokenVal.TOK_LAND.value, JSTokenVal.TOK_LOR.value,
+            JSTokenVal.TOK_EQ.value, JSTokenVal.TOK_NEQ.value ->
+                return prev != '/'.code
+        }
+        return false
+    }
+    
     /* 跳过 var 初始化表达式，停在深度 0 的 ',' ';' 或声明作用域结束的 '}' */
     private fun skipVarInitializer() {
         var depth = 0
+        var prev = '='.code
         while (s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
+            if (s.token.val1 == '/'.code && regexCanStart(prev)) {
+                if (!s.parseRegexpLiteral()) return
+                prev = JSTokenVal.TOK_REGEXP.value
+                s.nextToken()
+                continue
+            }
             when (s.token.val1) {
                 '('.code, '['.code, '{'.code -> depth++
                 ')'.code, ']'.code -> if (depth > 0) depth--
@@ -114,6 +141,7 @@ class JSParser(private val s: JSParseState) {
                 }
                 ','.code, ';'.code -> if (depth == 0) return
             }
+            prev = s.token.val1
             s.nextToken()
         }
     }
@@ -128,8 +156,17 @@ class JSParser(private val s: JSParseState) {
         val savedLf = s.gotLf
         val savedToken = s.token.copy()
         var braceDepth = 0
+        var prev = -1
         while (s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
-            when (s.token.val1) {
+            /* 提升扫描是词法级的：正则字面量要整体跳过，避免其中的括号影响深度 */
+            if (s.token.val1 == '/'.code && regexCanStart(prev)) {
+                if (!s.parseRegexpLiteral()) break
+                prev = JSTokenVal.TOK_REGEXP.value
+                s.nextToken()
+                continue
+            }
+            val cur = s.token.val1
+            when (cur) {
                 '}'.code -> {
                     if (braceDepth == 0 && !untilEof) break
                     if (braceDepth > 0) braceDepth--
@@ -150,6 +187,7 @@ class JSParser(private val s: JSParseState) {
                         }
                         break
                     }
+                    prev = cur
                     continue
                 }
                 JSTokenVal.TOK_FUNCTION.value -> {
@@ -160,9 +198,11 @@ class JSParser(private val s: JSParseState) {
                     }
                     if (s.token.val1 == '('.code) skipBalancedParens()
                     if (s.token.val1 == '{'.code) skipBalancedBraces()
+                    prev = cur
                     continue
                 }
             }
+            prev = cur
             s.nextToken()
         }
         seekSource(savedBuf, savedLine, savedCol, savedLf, savedToken)
@@ -2023,7 +2063,20 @@ class JSParser(private val s: JSParseState) {
     }
     
     fun parsePrimaryExpr(): Boolean {
+        /* 表达式起始位置的 '/' 是正则字面量（词法器按除号处理，这里回退重扫） */
+        if (s.token.val1 == '/'.code) {
+            if (!s.parseRegexpLiteral()) return false
+        }
         when (s.token.val1) {
+            JSTokenVal.TOK_REGEXP.value -> {
+                val patIdx = addConstPool(s.token.value)
+                val flagsIdx = addConstPool(JS_NewString(ctx, s.token.regexpFlags))
+                emitOpWithArg(OPCodeEnum.OP_push_const, patIdx)
+                emitOpWithArg(OPCodeEnum.OP_push_const, flagsIdx)
+                emitOp(OPCodeEnum.OP_regexp)
+                s.nextToken()
+                return true
+            }
             JSTokenVal.TOK_NUMBER.value -> {
                 val d = s.token.d
                 val i = d.toInt()
