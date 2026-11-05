@@ -543,11 +543,59 @@ var r = outer();
 
 1. `testCommentsAreSkipped`：块注释/行注释/尾随注释；
 2. `testNestedFunctionConstantPoolLength`：嵌套函数常量池计数；
-3. `testLongScriptWithManyFunctionsSurvivesGc`：400 个函数 + 字符串常量，在
+3. `testLongScriptWithManyFunctionsSurvivesGc`：300 个函数 + 字符串常量，在
    256KB 堆上触发多轮解析期/执行期 GC。
 
-全部 173 个 Kotlin 测试通过，低内存压力用例（`--memory-limit 256K/512K`）
+全部 Kotlin 测试通过，低内存压力用例（`--memory-limit 256K/512K`）
 不再崩溃；内存确实不足时返回 “out of memory” 解析错误而不是越界异常。
+
+## 语言特性与标准库对齐进展（2026-11 第二期）
+
+### 已通过
+
+- `tests/test_language.js`、`tests/test_loop.js`、`tests/test_closure.js` 全部通过；
+- `tests/mandelbrot.js` 可运行并输出正确图形（依赖 Math/console.log）；
+- `tests/test_builtin.js` 已通过 `test()`、`test_string()`，正在推进剩余分组。
+
+### 新增语言特性
+
+- 逗号表达式、标签语句（含带标签 break）、`for-in` / `for-of`、`switch`
+  两段式分发（先比较链、后按源码顺序编译 body）；
+- 对象字面量：关键字属性名、getter/setter、方法简写、`__proto__`；
+- `arguments` 对象、具名函数表达式自引用（`OP_this_func`）；
+- var/function 声明提升（`hoistDeclarations`），支持内层函数捕获外层“稍后声明”的变量；
+- 函数对象自动创建 `prototype` 且 `constructor` 指回自身；
+- `typeof` 对未声明标识符返回 "undefined"（新增 `OP_get_global_undef`）；
+- ToPrimitive、数值/字符串严格相等、ToInt32 取模语义、短路求值修复；
+- 访问器属性（getter/setter）的读写与 `Object.defineProperty` 支持；
+- 正则字面量、`RegExp`/`exec`/`test`、`String.match/replace/replaceAll/search`、
+  `$&`/`$1`/``$` ``/`$'` 替换展开（基于 JVM 的 `java.util.regex`）。
+
+### 新增标准库
+
+- 全局：undefined/NaN/Infinity、isNaN/isFinite、parseInt/parseFloat、print、console；
+- Error 家族（Error/TypeError/…，含 message 槽与 `instanceof` 原型链）；
+- Object（构造器、getPrototypeOf/setPrototypeOf/create/keys/defineProperty、
+  prototype.toString 类型标签/hasOwnProperty/valueOf）；
+- Array（构造器/isArray、push/pop/shift/unshift/join/toString/indexOf/lastIndexOf/
+  slice/concat/reverse/sort）；
+- String（构造器/fromCharCode/fromCodePoint、charAt/charCodeAt/codePointAt/
+  indexOf/lastIndexOf/substring/substr/slice/concat/split/lower/upper/trim/
+  trimStart/trimEnd/repeat/replace/replaceAll/match/search）；
+- Number（构造器与常量、toString/toFixed/toExponential/valueOf）；
+- Math（常量、abs/floor/ceil/round/sqrt/exp/log/三角函数/pow/atan2/min/max/random）；
+- JSON（stringify/parse）。
+
+### 剩余缺口（按优先级）
+
+1. `test_builtin.js`：`test_string2` 之后的补充平面字符拼接、`test_function`
+   的 `Function` 构造器、`test_enum`、`test_array*` 扩展方法、`test_typed_array`、
+   `test_global_eval`（全局 eval）、`test_json` 边界、`test_regexp` 的
+   Annex B/前瞻/反向引用细节、`test_line_column_numbers`；
+2. `microbench.js`：`scriptArgs`、`Int32Array` 等 TypedArray、`Set`、
+   （可选，`typeof BigInt` 检测可跳过）BigInt；
+3. 极低内存（256KB 堆 + 标准库）下 400+ 函数的 GC 压力场景仍存在一处
+   数组/属性底座标失效，需继续定位（当前回归测试规模调整为 300 函数）。
 
 ## 相关文件
 

@@ -636,9 +636,6 @@ class JSParseState(
      * 因此在 parsePrimaryExpr 里回退到 '/' 位置重新扫描。
      * pattern 按原始字节收集（保留 UTF-8），'\' 转义原样保留。 */
     fun parseRegexpLiteral(): Boolean {
-        if (System.getenv("MQJS_TRACE") != null) {
-            println("DBG regexp rescan at sourcePos=${token.sourcePos} bufPos=$bufPos")
-        }
         val out = java.io.ByteArrayOutputStream()
         bufPos = token.sourcePos + 1
         var inClass = false

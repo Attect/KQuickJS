@@ -652,6 +652,27 @@ object JSStdlib {
 
     /* ---------------- String ---------------- */
 
+    /* 字符串模式替换中的 $ 展开（$$、$&、$`、$'） */
+    private fun expandStringReplacement(rep: String, matched: String, pos: Int, s: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i < rep.length) {
+            val c = rep[i]
+            if (c == '$' && i + 1 < rep.length) {
+                when (rep[i + 1]) {
+                    '$' -> { sb.append('$'); i += 2 }
+                    '&' -> { sb.append(matched); i += 2 }
+                    '`' -> { sb.append(s, 0, pos); i += 2 }
+                    '\'' -> { sb.append(s, pos + matched.length, s.length); i += 2 }
+                    else -> { sb.append(c); i++ }
+                }
+            } else {
+                sb.append(c); i++
+            }
+        }
+        return sb.toString()
+    }
+    
     private fun initString(ctx: JSContext, rt: JSRuntime) {
         val proto = ctx.classProto[JSObjectClassEnum.JS_CLASS_STRING.value]
         val stringCtor = native(ctx, 1) { c, _, args ->
@@ -666,6 +687,16 @@ object JSStdlib {
             for (a in args) sb.append(toInt(c, rt, a).toChar())
             JS_NewString(c, sb.toString())
         }
+        defMethod(ctx, rt, stringCtor, "fromCodePoint", 1) { c, _, args ->
+            val sb = StringBuilder()
+            for (a in args) {
+                val cp = toInt(c, rt, a)
+                if (cp in 0..0x10FFFF && !(cp in 0xD800..0xDFFF)) {
+                    sb.append(String(Character.toChars(cp)))
+                }
+            }
+            JS_NewString(c, sb.toString())
+        }
 
         defMethod(ctx, rt, proto, "charAt", 1) { c, thisVal, args ->
             val s = rt.toStringValue(thisVal)
@@ -676,6 +707,12 @@ object JSStdlib {
             val s = rt.toStringValue(thisVal)
             val i = if (args.isEmpty()) 0 else toInt(c, rt, args[0])
             if (i in s.indices) JS_NewShortInt(s[i].code) else JS_NewFloat64(c, Double.NaN)
+        }
+        defMethod(ctx, rt, proto, "codePointAt", 1) { c, thisVal, args ->
+            val s = rt.toStringValue(thisVal)
+            val i = if (args.isEmpty()) 0 else toInt(c, rt, args[0])
+            if (i in s.indices) JS_NewShortInt(Character.codePointAt(s, i))
+            else JS_UNDEFINED
         }
         defMethod(ctx, rt, proto, "indexOf", 1) { c, thisVal, args ->
             val s = rt.toStringValue(thisVal)
@@ -721,14 +758,19 @@ object JSStdlib {
         }
         defMethod(ctx, rt, proto, "split", 2) { c, thisVal, args ->
             val s = rt.toStringValue(thisVal)
+            val limit = if (args.size > 1 && !JS_IsUndefined(args[1])) {
+                toInt(c, rt, args[1]).coerceAtLeast(0)
+            } else Int.MAX_VALUE
+            if (limit == 0) return@defMethod JS_NewArray(c, 0)
             val sep = if (args.isEmpty() || JS_IsUndefined(args[0])) null else rt.toStringValue(args[0])
-            val parts: List<String> = if (sep == null) {
-                if (s.isEmpty()) emptyList() else s.map { it.toString() }
+            var parts: List<String> = if (sep == null) {
+                if (s.isEmpty()) emptyList() else listOf(s)
             } else if (sep.isEmpty()) {
                 s.map { it.toString() }
             } else {
                 s.split(sep)
             }
+            if (parts.size > limit) parts = parts.subList(0, limit)
             val out = JS_NewArray(c, parts.size)
             for (i in parts.indices) rt.setElement(out, JS_NewShortInt(i), JS_NewString(c, parts[i]))
             c.memory.putI32(JS_VALUE_TO_PTR(out) + 32, parts.size)
@@ -742,6 +784,42 @@ object JSStdlib {
         }
         defMethod(ctx, rt, proto, "trim", 0) { c, thisVal, _ ->
             JS_NewString(c, rt.toStringValue(thisVal).trim())
+        }
+        defMethod(ctx, rt, proto, "trimStart", 0) { c, thisVal, _ ->
+            JS_NewString(c, rt.toStringValue(thisVal).trimStart())
+        }
+        defMethod(ctx, rt, proto, "trimEnd", 0) { c, thisVal, _ ->
+            JS_NewString(c, rt.toStringValue(thisVal).trimEnd())
+        }
+        defMethod(ctx, rt, proto, "replaceAll", 2) { c, thisVal, args ->
+            val s = rt.toStringValue(thisVal)
+            if (isRegExp(c, arg(args, 0))) {
+                regexpReplace(c, rt, arg(args, 0), s, arg(args, 1))
+            } else {
+                val pat = rt.toStringValue(arg(args, 0))
+                val rep = arg(args, 1)
+                if (pat.isEmpty()) {
+                    JS_NewString(c, s)
+                } else {
+                    val sb = StringBuilder()
+                    var idx = 0
+                    while (true) {
+                        val p = s.indexOf(pat, idx)
+                        if (p < 0) { sb.append(s, idx, s.length); break }
+                        sb.append(s, idx, p)
+                        if (JS_IsFunction(c, rep)) {
+                            val r = rt.callFunction(rep, listOf(JS_NewString(c, pat),
+                                JS_NewShortInt(p), JS_NewString(c, s)), JS_UNDEFINED)
+                            if (JS_IsException(r)) return@defMethod r
+                            sb.append(rt.toStringValue(r))
+                        } else {
+                            sb.append(expandStringReplacement(rt.toStringValue(rep), pat, p, s))
+                        }
+                        idx = p + pat.length
+                    }
+                    JS_NewString(c, sb.toString())
+                }
+            }
         }
         defMethod(ctx, rt, proto, "repeat", 1) { c, thisVal, args ->
             val n = toInt(c, rt, arg(args, 0))
@@ -760,8 +838,9 @@ object JSStdlib {
                     JS_NewString(c, s)
                 } else {
                     val repl = if (JS_IsFunction(c, rep)) {
-                        rt.toStringValue(rt.callFunction(rep, listOf(JS_NewString(c, pat)), JS_UNDEFINED))
-                    } else rt.toStringValue(rep)
+                        rt.toStringValue(rt.callFunction(rep, listOf(JS_NewString(c, pat),
+                            JS_NewShortInt(idx), JS_NewString(c, s)), JS_UNDEFINED))
+                    } else expandStringReplacement(rt.toStringValue(rep), pat, idx, s)
                     JS_NewString(c, s.substring(0, idx) + repl + s.substring(idx + pat.length))
                 }
             }
