@@ -60,6 +60,15 @@ class JSContext(
      * 注意不要用 pushValue/popValue（ctx.sp）保活——解释器运行中 ctx.sp 与
      * 局部缓存的 sp 不同步，会破坏执行栈 */
     val gcKeepAlive: MutableList<JSValue> = mutableListOf()
+    /* Function.prototype.bind 的绑定信息：每项为 gcKeepAlive 槽索引
+     * [target, thisArg, firstBoundArg, boundArgCount]（槽位永久保活并由 GC 更新） */
+    val boundFns: MutableList<IntArray> = mutableListOf()
+    /* 当前 C 函数调用的实参保活基址（-1 表示不在 C 调用中）。
+     * callCFunction 会把 this+args 放入 gcKeepAlive，原生函数通过 ArgsView
+     * 逐次读取最新地址，避免回调内分配触发 GC 后参数悬垂 */
+    var cArgBase: Int = -1
+    /* 长期 JVM 根（bind 绑定信息等；随上下文存活，不随调用帧弹出） */
+    val persistentRoots: MutableList<JSValue> = mutableListOf()
     /* 闭包捕获变量槽池：编译期被内层函数引用的外层局部变量提升为池槽，
      * 外层与内层统一通过槽读写（对照 C JSVarRef 的 detached 近似语义，
      * 槽值生命周期与上下文一致）。JSGC 作为根遍历 */

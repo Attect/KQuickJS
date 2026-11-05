@@ -149,7 +149,7 @@ class JSParser(private val s: JSParseState) {
     /* var/function 声明提升（对照 C 的 define_var/js_parse_local_functions）：
      * 扫描整个函数体（跳过嵌套函数），把所有 var 与函数声明名加入局部变量表。
      * 这样内层函数捕获外层"稍后声明"的变量时也能正确解析为局部/捕获变量。 */
-    private fun hoistDeclarations(untilEof: Boolean) {
+    private fun hoistDeclarations(untilEof: Boolean, topLevel: Boolean = false) {
         val savedBuf = s.bufPos
         val savedLine = s.lineNum
         val savedCol = s.colNum
@@ -175,7 +175,8 @@ class JSParser(private val s: JSParseState) {
                 JSTokenVal.TOK_VAR.value -> {
                     s.nextToken()
                     while (s.token.val1 == JSTokenVal.TOK_IDENT.value) {
-                        declareLocal(s.token.value)
+                        /* 顶层程序按 eval 语义使用全局变量，不建立局部槽 */
+                        if (!topLevel) declareLocal(s.token.value)
                         s.nextToken()
                         if (s.token.val1 == '='.code) {
                             s.nextToken()
@@ -193,7 +194,7 @@ class JSParser(private val s: JSParseState) {
                 JSTokenVal.TOK_FUNCTION.value -> {
                     s.nextToken()
                     if (s.token.val1 == JSTokenVal.TOK_IDENT.value) {
-                        declareLocal(s.token.value)
+                        if (!topLevel) declareLocal(s.token.value)
                         s.nextToken()
                     }
                     if (s.token.val1 == '('.code) skipBalancedParens()
@@ -297,7 +298,7 @@ class JSParser(private val s: JSParseState) {
                     s.evalRetIdx = addLocalVar(JS_NewString(ctx, "_ret_"))
                 }
                 /* 顶层程序同样做 var/function 声明提升 */
-                hoistDeclarations(untilEof = true)
+                hoistDeclarations(untilEof = true, topLevel = true)
                 
                 while (s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
                     if (!parseStatement()) break
@@ -520,6 +521,16 @@ class JSParser(private val s: JSParseState) {
                     
                     val cidx = addConstPool(ctx.gcKeepAlive[nameKeepIdx])
                     emitOpWithArg(OPCodeEnum.OP_put_field, cidx)
+                } else if (compileScopes.size == 1) {
+                    /* 顶层程序（对照 C 的 eval 语义）：var 定义全局变量 */
+                    if (s.token.val1 == '='.code) {
+                        s.nextToken()
+                        if (!parseAssignExpr()) return false
+                    } else {
+                        emitOp(OPCodeEnum.OP_undefined)
+                    }
+                    val cidx = addConstPool(ctx.gcKeepAlive[nameKeepIdx])
+                    emitOpWithArg(OPCodeEnum.OP_put_global, cidx)
                 } else {
                     // 正常模式：将变量存储到局部变量（顶层脚本亦为顶层函数帧的局部）
                     if (s.token.val1 == '='.code) {
@@ -639,14 +650,19 @@ class JSParser(private val s: JSParseState) {
             val cpoolIdx = addConstPool(newFunc)
             emitOpWithArg(OPCodeEnum.OP_fclosure, cpoolIdx)
             
-            /* 函数名绑定：闭包对象存入局部变量（fclosure 压栈后写入，对照 C 的函数声明 hoisting） */
+            /* 函数名绑定：顶层程序定义为全局变量，函数体内为局部（对照 C 的函数声明） */
             val nameVal = ctx.gcKeepAlive[nameKeepIdx]
-            val nameIdx = declareLocal(nameVal)
-            val nameSlot = compileScopes.lastOrNull()?.varrefSlots?.get(jsGetString(ctx, nameVal))
-            if (nameSlot != null) {
-                emitOpWithArg(OPCodeEnum.OP_put_var_ref, nameSlot)
+            if (compileScopes.size == 1) {
+                val cidx = addConstPool(nameVal)
+                emitOpWithArg(OPCodeEnum.OP_put_global, cidx)
             } else {
-                emitOpWithArg(OPCodeEnum.OP_put_loc, nameIdx)
+                val nameIdx = declareLocal(nameVal)
+                val nameSlot = compileScopes.lastOrNull()?.varrefSlots?.get(jsGetString(ctx, nameVal))
+                if (nameSlot != null) {
+                    emitOpWithArg(OPCodeEnum.OP_put_var_ref, nameSlot)
+                } else {
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, nameIdx)
+                }
             }
             
             return !s.hasError
@@ -816,6 +832,7 @@ class JSParser(private val s: JSParseState) {
             var tmpObj = -1
             var tmpIdx = -1
             var forOf = false
+            var varGlobalCidx = -1
             
             if (s.token.val1 == JSTokenVal.TOK_VAR.value) {
                 s.nextToken()
@@ -832,7 +849,11 @@ class JSParser(private val s: JSParseState) {
                         s.error("expected 'in' or 'of'")
                         return false
                     }
-                    varIdx = declareLocal(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                    if (compileScopes.size == 1) {
+                        varGlobalCidx = addConstPool(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                    } else {
+                        varIdx = declareLocal(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                    }
                 } finally {
                     ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
                 }
@@ -872,6 +893,7 @@ class JSParser(private val s: JSParseState) {
             /* next: 把栈顶的迭代值写回左值 */
             val nextPos = s.byteCodeLen
             when {
+                varGlobalCidx >= 0 -> emitOpWithArg(OPCodeEnum.OP_put_global, varGlobalCidx)
                 varIdx >= 0 -> emitOpWithArg(OPCodeEnum.OP_put_loc, varIdx)
                 lvalueOp == OPCodeEnum.OP_get_loc.id -> emitOpWithArg(OPCodeEnum.OP_put_loc, lvalueArg)
                 lvalueOp == OPCodeEnum.OP_get_global.id -> emitOpWithArg(OPCodeEnum.OP_put_global, lvalueArg)

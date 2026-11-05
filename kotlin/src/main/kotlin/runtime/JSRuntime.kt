@@ -269,6 +269,11 @@ class JSRuntime(private val ctx: JSContext) {
                         
                         /* 函数对象自动获得 prototype（constructor 指回闭包），
                          * 供 new F()/instanceof/F.prototype.constructor 使用 */
+                        val fbPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                        val fname = ctx.memory.getJSValue(fbPtr + 8)
+                        if (JS_IsString(ctx, fname)) {
+                            setProperty(stack.last(), JS_NewString(ctx, "name"), fname)
+                        }
                         val protoObj = JS_NewObject(ctx)
                         if (!JS_IsException(protoObj)) {
                             ctx.gcKeepAlive.add(protoObj)
@@ -570,7 +575,27 @@ class JSRuntime(private val ctx: JSContext) {
                         val cpoolPtr = JS_VALUE_TO_PTR(cpool)
                         ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
                     } else JS_UNDEFINED
-                    setProperty(obj, key, val1)
+                    /* 数组只接受 length 与规范索引属性；其他键按 C 版语义抛 TypeError */
+                    var badKey = false
+                    if (JS_IsPtr(obj)) {
+                        val op = JS_VALUE_TO_PTR(obj)
+                        if (ctx.memory.getMTag(op) == JSMTags.JS_MTAG_OBJECT &&
+                            ctx.memory.getU8(op + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value &&
+                            JS_IsString(ctx, key)) {
+                            val ks = jsGetString(ctx, key)
+                            if (ks != "length" && arrayIndexFromString(ks) < 0) {
+                                JS_ThrowTypeError(ctx, "invalid array index")
+                                badKey = true
+                            }
+                        }
+                    }
+                    if (badKey) {
+                        val target = unwindToCatch(stack)
+                        if (target < 0) return JS_EXCEPTION
+                        pc = target
+                    } else {
+                        setProperty(obj, key, val1)
+                    }
                     if (System.getenv("MQJS_TRACE") != null) {
                         println("TRACE put_field obj=${if (JS_IsPtr(obj)) JS_VALUE_TO_PTR(obj) else obj} key='${jsGetString(ctx, key)}' val=${if (JS_IsInt(val1)) JS_VALUE_GET_INT(val1) else -1}")
                     }
@@ -611,7 +636,23 @@ class JSRuntime(private val ctx: JSContext) {
                     val val1 = stack.removeLast()
                     val idx = stack.removeLast()
                     val obj = stack.removeLast()
-                    setElement(obj, idx, val1)
+                    var badIndex = false
+                    if (JS_IsPtr(obj)) {
+                        val op = JS_VALUE_TO_PTR(obj)
+                        if (ctx.memory.getMTag(op) == JSMTags.JS_MTAG_OBJECT &&
+                            ctx.memory.getU8(op + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value &&
+                            !isArrayIndexValue(idx)) {
+                            JS_ThrowTypeError(ctx, "invalid array index")
+                            badIndex = true
+                        }
+                    }
+                    if (badIndex) {
+                        val target = unwindToCatch(stack)
+                        if (target < 0) return JS_EXCEPTION
+                        pc = target
+                    } else {
+                        setElement(obj, idx, val1)
+                    }
                 }
                 
                 OPCodeEnum.OP_get_length.id -> {
@@ -791,6 +832,20 @@ class JSRuntime(private val ctx: JSContext) {
                     val idx = readU16(code, pc)
                     pc += 2
                     val v = vars[idx]
+                    if (System.getenv("MQJS_THROW_TRACE") != null && JS_IsPtr(v)) {
+                        val vp = JS_VALUE_TO_PTR(v)
+                        if (vp in ctx.heapBase until ctx.heapFree &&
+                            ctx.memory.getMTag(vp) == JSMTags.JS_MTAG_FREE) {
+                            var nm = "?"
+                            val vt = ctx.memory.getJSValue(iterFuncPtr + 32)
+                            if (vt != JS_NULL) {
+                                val vtp = JS_VALUE_TO_PTR(vt)
+                                val nv = ctx.memory.getJSValue(vtp + 8 + idx * 8)
+                                if (JS_IsString(ctx, nv)) nm = jsGetString(ctx, nv)
+                            }
+                            System.err.println("STALE_LOC idx=$idx name=$nm val=$v heapFree=${ctx.heapFree}")
+                        }
+                    }
                     stack.add(v)
                 }
                 
@@ -798,6 +853,19 @@ class JSRuntime(private val ctx: JSContext) {
                     val idx = readU16(code, pc)
                     pc += 2
                     val val1 = stack.removeLast()
+                    if (System.getenv("MQJS_THROW_TRACE") != null && JS_IsPtr(val1)) {
+                        val vp = JS_VALUE_TO_PTR(val1)
+                        if (vp >= ctx.heapFree || (vp >= ctx.heapBase && ctx.memory.getMTag(vp) == JSMTags.JS_MTAG_FREE)) {
+                            var nm = "?"
+                            val vt = ctx.memory.getJSValue(iterFuncPtr + 32)
+                            if (vt != JS_NULL) {
+                                val vtp = JS_VALUE_TO_PTR(vt)
+                                val nv = ctx.memory.getJSValue(vtp + 8 + idx * 8)
+                                if (JS_IsString(ctx, nv)) nm = jsGetString(ctx, nv)
+                            }
+                            System.err.println("STALE_PUT idx=$idx name=$nm val=$val1 heapFree=${ctx.heapFree}")
+                        }
+                    }
                     vars[idx] = val1
                 }
                 
@@ -963,9 +1031,13 @@ class JSRuntime(private val ctx: JSContext) {
                 JSMTags.JS_MTAG_STRING -> {
                     val s = jsGetString(ctx, v).trim()
                     if (s.isEmpty()) return 0.0
-                    val hex = s.startsWith("0x") || s.startsWith("0X")
                     return try {
-                        if (hex) s.substring(2).toLong(16).toDouble() else s.toDouble()
+                        when {
+                            s.startsWith("0x") || s.startsWith("0X") -> s.substring(2).toLong(16).toDouble()
+                            s.startsWith("0b") || s.startsWith("0B") -> s.substring(2).toLong(2).toDouble()
+                            s.startsWith("0o") || s.startsWith("0O") -> s.substring(2).toLong(8).toDouble()
+                            else -> s.toDouble()
+                        }
                     } catch (e: NumberFormatException) {
                         Double.NaN
                     }
@@ -1226,7 +1298,7 @@ class JSRuntime(private val ctx: JSContext) {
             return "[object]"
         }
         val len = ctx.memory.getI32(ptr + 4)
-        return String(ctx.memory.getBytes(ptr + 8, len), Charsets.UTF_8)
+        return jsDecodeString(ctx.memory.getBytes(ptr + 8, len))
     }
     
     /* 读取对象属性：自身属性表 → 数组 length 回退 → 原型链。
@@ -1268,7 +1340,7 @@ class JSRuntime(private val ctx: JSContext) {
             while (idx != 0) {
                 val propPtr = propsPtr + 8 + idx * 8
                 val propKey = ctx.memory.getJSValue(propPtr)
-                if (propKey == key || jsValueEquals(propKey, key)) {
+                if (propKey == key || jsPropKeyEquals(propKey, key)) {
                     val v = ctx.memory.getJSValue(propPtr + 8)
                     if (isAccessorValue(v)) {
                         /* 访问器属性：调用 getter（this 为接收者） */
@@ -1306,7 +1378,15 @@ class JSRuntime(private val ctx: JSContext) {
 
         val proto = ctx.memory.getJSValue(objPtr + 8)
         if (proto != JS_NULL) {
-            return getProperty(proto, key, receiver)
+            val r = getProperty(proto, key, receiver)
+            if (JS_IsUndefined(r) && System.getenv("MQJS_THROW_TRACE") != null &&
+                JS_IsString(ctx, key)) {
+                val ks = jsGetString(ctx, key)
+                if (ks == "slice" || ks == "pop" || ks == "push") {
+                    System.err.println("PROP_MISS key=$ks obj=$obj objHeap=${JS_VALUE_TO_PTR(obj)} heapFree=${ctx.heapFree} proto=$proto")
+                }
+            }
+            return r
         }
         return JS_UNDEFINED
     }
@@ -1460,7 +1540,7 @@ class JSRuntime(private val ctx: JSContext) {
             while (idx != 0) {
                 val propPtr = propsPtr + 8 + idx * 8
                 val propKey = ctx.memory.getJSValue(propPtr)
-                if (propKey == key || jsValueEquals(propKey, key)) {
+                if (propKey == key || jsPropKeyEquals(propKey, key)) {
                     existing = ctx.memory.getJSValue(propPtr + 8)
                     break
                 }
@@ -1498,7 +1578,7 @@ class JSRuntime(private val ctx: JSContext) {
         while (idx != 0) {
             val propPtr = propsPtr + 8 + idx * 8
             val propKey = ctx.memory.getJSValue(propPtr)
-            if (propKey == key || jsValueEquals(propKey, key)) {
+            if (propKey == key || jsPropKeyEquals(propKey, key)) {
                 val next = JS_VALUE_GET_INT(ctx.memory.getJSValue(propPtr + 16)) shr 1
                 if (prevIdx == 0) {
                     ctx.memory.putJSValue(propsPtr + 24 + h * 8, JS_NewShortInt(next shl 1))
@@ -1519,9 +1599,25 @@ class JSRuntime(private val ctx: JSContext) {
     fun jsValueEquals(a: JSValue, b: JSValue): Boolean {
         if (a == b) return true
         if (JS_IsString(ctx, a) && JS_IsString(ctx, b)) {
-            val sa = jsGetString(ctx, a)
-            val sb = jsGetString(ctx, b)
-            return sa == sb
+            return jsGetString(ctx, a) == jsGetString(ctx, b)
+        }
+        return false
+    }
+    
+    /* 属性键等价：字符串键与数值键按 ToString 归一（a[1] ≡ a["1"]） */
+    fun jsPropKeyEquals(a: JSValue, b: JSValue): Boolean {
+        if (a == b) return true
+        if (JS_IsString(ctx, a) && JS_IsString(ctx, b)) {
+            return jsGetString(ctx, a) == jsGetString(ctx, b)
+        }
+        if (JS_IsString(ctx, a) && isNumberValue(b)) {
+            return jsGetString(ctx, a) == jsNumberToString(toNumber(b))
+        }
+        if (isNumberValue(a) && JS_IsString(ctx, b)) {
+            return jsNumberToString(toNumber(a)) == jsGetString(ctx, b)
+        }
+        if (isNumberValue(a) && isNumberValue(b)) {
+            return toNumber(a) == toNumber(b)
         }
         return false
     }
@@ -1541,7 +1637,7 @@ class JSRuntime(private val ctx: JSContext) {
             while (idx != 0) {
                 val propPtr = propsPtr + 8 + idx * 8
                 val propKey = ctx.memory.getJSValue(propPtr)
-                if (propKey == key || jsValueEquals(propKey, key)) {
+                if (propKey == key || jsPropKeyEquals(propKey, key)) {
                     return true
                 }
                 idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propPtr + 16)) shr 1
@@ -1563,6 +1659,38 @@ class JSRuntime(private val ctx: JSContext) {
         val proto = ctx.memory.getJSValue(objPtr + 8)
         if (proto != JS_NULL) {
             return hasProperty(proto, key)
+        }
+        return false
+    }
+    
+    /* 规范数组索引字符串（"0"、"12"；不接受 "01"、"1.2"、"-1" 等） */
+    fun arrayIndexFromString(s: String): Int {
+        if (s.isEmpty() || s.length > 10) return -1
+        if (s.length > 1 && s[0] == '0') return -1
+        var v = 0L
+        for (ch in s) {
+            if (ch < '0' || ch > '9') return -1
+            v = v * 10 + (ch - '0')
+            if (v > 0xFFFFFFFEL) return -1
+        }
+        return v.toInt()
+    }
+    
+    fun isArrayIndexValue(idx: JSValue): Boolean {
+        if (JS_IsInt(idx)) return JS_VALUE_GET_INT(idx) >= 0
+        if (JS_IsShortFloat(idx)) {
+            val d = jsGetShortFloat(idx)
+            return d >= 0.0 && d <= 0xFFFFFFFEL.toDouble() && d == Math.floor(d)
+        }
+        if (JS_IsPtr(idx)) {
+            val p = JS_VALUE_TO_PTR(idx)
+            when (ctx.memory.getMTag(p)) {
+                JSMTags.JS_MTAG_FLOAT64 -> {
+                    val d = ctx.memory.getFloat64(p + 8)
+                    return d >= 0.0 && d <= 0xFFFFFFFEL.toDouble() && d == Math.floor(d)
+                }
+                JSMTags.JS_MTAG_STRING -> return arrayIndexFromString(jsGetString(ctx, idx)) >= 0
+            }
         }
         return false
     }
@@ -1589,6 +1717,37 @@ class JSRuntime(private val ctx: JSContext) {
         var objPtr = JS_VALUE_TO_PTR(obj)
         if (ctx.memory.getMTag(objPtr) != JSMTags.JS_MTAG_OBJECT) return
         
+        /* 数组 length 赋值：调整长度并清除被截断的元素（对照 C 的 set_array_length） */
+        if (ctx.memory.getU8(objPtr + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value &&
+            JS_IsString(ctx, key) && jsGetString(ctx, key) == "length") {
+            val newLen = toInt32(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]).coerceAtLeast(0)
+            val oldLen = ctx.memory.getI32(objPtr + 32)
+            if (newLen < oldLen) {
+                val data = ctx.memory.getJSValue(objPtr + 24)
+                if (data != JS_NULL) {
+                    val dataPtr = JS_VALUE_TO_PTR(data)
+                    val cap = ctx.memory.getI32(dataPtr + 4)
+                    for (i in newLen until minOf(oldLen, cap)) {
+                        ctx.memory.putJSValue(dataPtr + 8 + i * 8, JS_UNDEFINED)
+                    }
+                }
+            }
+            ctx.memory.putI32(objPtr + 32, newLen)
+            return
+        }
+        
+        /* 数组的数字/规范索引键写入元素区 */
+        if (ctx.memory.getU8(objPtr + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value) {
+            var aidx = -1
+            if (JS_IsInt(key)) aidx = JS_VALUE_GET_INT(key)
+            else if (JS_IsString(ctx, key)) aidx = arrayIndexFromString(jsGetString(ctx, key))
+            if (aidx >= 0) {
+                setElement(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 3], JS_NewShortInt(aidx),
+                           ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                return
+            }
+        }
+        
         var props = ctx.memory.getJSValue(objPtr + 16)
         if (props == JS_NULL || props == ctx.emptyProps) {
             props = allocProps(4)
@@ -1608,7 +1767,7 @@ class JSRuntime(private val ctx: JSContext) {
         while (idx != 0) {
             val propPtr = propsPtr + 8 + idx * 8
             val propKey = ctx.memory.getJSValue(propPtr)
-            if (propKey == key || jsValueEquals(propKey, key)) {
+            if (propKey == key || jsPropKeyEquals(propKey, key)) {
                 val cur = ctx.memory.getJSValue(propPtr + 8)
                 if (isAccessorValue(cur)) {
                     /* 访问器属性：调用 setter（this 为接收者），无 setter 时忽略赋值 */
@@ -1683,13 +1842,17 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun hashProp(prop: JSValue, hashMask: Int): Int {
-        /* 属性哈希基于 key 内容（字符串逐字符、数值取值本身），与堆地址无关；
-         * hash_next 链存储的也是属性槽的相对索引——因此 GC 压缩搬移对象后
-         * 属性表无需 rehash（对照 C js_rehash_props：C 的哈希基于指针所以需要） */
-        if (JS_IsString(ctx, prop)) {
-            val str = jsGetString(ctx, prop)
+        /* 属性键按字符串语义处理：数值键也要与等价的字符串键同桶 */
+        val keyStr: String? = when {
+            JS_IsString(ctx, prop) -> jsGetString(ctx, prop)
+            JS_IsInt(prop) || JS_IsShortFloat(prop) -> jsNumberToString(toNumber(prop))
+            JS_IsPtr(prop) && ctx.memory.getMTag(JS_VALUE_TO_PTR(prop)) == JSMTags.JS_MTAG_FLOAT64 ->
+                jsNumberToString(toNumber(prop))
+            else -> null
+        }
+        if (keyStr != null) {
             var h = 0
-            for (c in str) {
+            for (c in keyStr) {
                 h = (h * 31 + c.code) and hashMask
             }
             return h
@@ -1720,15 +1883,24 @@ class JSRuntime(private val ctx: JSContext) {
         if (ctx.memory.getMTag(objPtr) != JSMTags.JS_MTAG_OBJECT) return JS_UNDEFINED
         
         val classId = ctx.memory.getU8(objPtr + 2)
+        /* 类型化数组：元素读写走其 ArrayBuffer 存储 */
+        val typedInfo = JS_GetOpaque(ctx, obj)
+        if (typedInfo is JSStdlib.TypedArrayInfo) {
+            val i = toInt32(idx)
+            if (i < 0 || i >= typedInfo.length) return JS_UNDEFINED
+            return JSStdlib.readTyped(ctx, typedInfo, i)
+        }
         if (classId == JSObjectClassEnum.JS_CLASS_ARRAY.value) {
             val i = toInt32(idx)
+            val arrLen = ctx.memory.getI32(objPtr + 32)
             val arrData = ctx.memory.getJSValue(objPtr + 24)
-            if (arrData != JS_NULL) {
+            if (arrData != JS_NULL && i >= 0 && i < arrLen) {
                 val arrDataPtr = JS_VALUE_TO_PTR(arrData)
                 val size = ctx.memory.getI32(arrDataPtr + 4)
-                if (i >= 0 && i < size) {
+                if (i < size) {
                     return ctx.memory.getJSValue(arrDataPtr + 8 + i * 8)
                 }
+                return JS_UNDEFINED
             }
         }
         
@@ -1741,6 +1913,14 @@ class JSRuntime(private val ctx: JSContext) {
         if (ctx.memory.getMTag(objPtr) != JSMTags.JS_MTAG_OBJECT) return
         
         val classId = ctx.memory.getU8(objPtr + 2)
+        val typedInfo = JS_GetOpaque(ctx, obj)
+        if (typedInfo is JSStdlib.TypedArrayInfo) {
+            val i = toInt32(idx)
+            if (i >= 0 && i < typedInfo.length) {
+                JSStdlib.writeTyped(ctx, this, typedInfo, i, val1)
+            }
+            return
+        }
         if (classId == JSObjectClassEnum.JS_CLASS_ARRAY.value) {
             val i = toInt32(idx)
             var arrData = ctx.memory.getJSValue(objPtr + 24)
@@ -1813,6 +1993,12 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun callMethod(func: JSValue, thisObj: JSValue, args: List<JSValue>): JSValue {
+        if (!JS_IsFunction(ctx, func) && System.getenv("MQJS_THROW_TRACE") != null) {
+            val tp = if (JS_IsPtr(thisObj)) JS_VALUE_TO_PTR(thisObj) else -1
+            val mt = if (tp in ctx.heapBase until ctx.memory.size) ctx.memory.getMTag(tp) else -9
+            val proto = if (JS_IsPtr(thisObj) && mt == JSMTags.JS_MTAG_OBJECT) ctx.memory.getJSValue(tp + 8) else -1
+            System.err.println("CALL_METHOD nonfunc func=$func this=$thisObj mtag=$mt heapFree=${ctx.heapFree} proto=$proto stack=${ctx.jsCallStack}")
+        }
         if (!JS_IsPtr(func)) return JS_ThrowTypeError(ctx, "not a function")
         val funcPtr = JS_VALUE_TO_PTR(func)
         
@@ -1894,21 +2080,36 @@ class JSRuntime(private val ctx: JSContext) {
             ctx.extFunctionTable.getOrNull(idx - (base?.size ?: 0))
         } ?: return JS_ThrowTypeError(ctx, "invalid c function index")
         val callArgc = (args.size and FRAME_CF_ARGC_MASK) or callFlags
-        val argv = args.toLongArray()
-        return when (def.defType) {
-            JSCFunctionDefEnum.JS_CFUNC_generic.value,
-            JSCFunctionDefEnum.JS_CFUNC_constructor.value ->
-                def.func?.invoke(ctx, thisObj, callArgc, argv) ?: JS_UNDEFINED
-            JSCFunctionDefEnum.JS_CFUNC_generic_magic.value,
-            JSCFunctionDefEnum.JS_CFUNC_constructor_magic.value ->
-                def.funcMagic?.invoke(ctx, thisObj, callArgc, argv, def.magic) ?: JS_UNDEFINED
-            JSCFunctionDefEnum.JS_CFUNC_generic_params.value ->
-                def.funcParams?.invoke(ctx, thisObj, callArgc, argv, params) ?: JS_UNDEFINED
-            JSCFunctionDefEnum.JS_CFUNC_f_f.value -> {
-                val d = JS_ToNumber(ctx, args.getOrElse(0) { JS_UNDEFINED })
-                JS_NewFloat64(ctx, def.funcFF?.invoke(d) ?: Double.NaN)
+        /* C 函数实参保活：原生函数内部可能分配并触发 GC，参数/this 必须可被
+         * 标记与搬移更新（native() 通过 ArgsView 按槽位读取最新值） */
+        val keep = ctx.gcKeepAlive.size
+        ctx.gcKeepAlive.add(thisObj)
+        for (a in args) ctx.gcKeepAlive.add(a)
+        val savedArgBase = ctx.cArgBase
+        ctx.cArgBase = keep
+        try {
+            val freshThis = ctx.gcKeepAlive[keep]
+            val argv = LongArray(args.size) { ctx.gcKeepAlive[keep + 1 + it] }
+            return when (def.defType) {
+                JSCFunctionDefEnum.JS_CFUNC_generic.value,
+                JSCFunctionDefEnum.JS_CFUNC_constructor.value ->
+                    def.func?.invoke(ctx, freshThis, callArgc, argv) ?: JS_UNDEFINED
+                JSCFunctionDefEnum.JS_CFUNC_generic_magic.value,
+                JSCFunctionDefEnum.JS_CFUNC_constructor_magic.value ->
+                    def.funcMagic?.invoke(ctx, freshThis, callArgc, argv, def.magic) ?: JS_UNDEFINED
+                JSCFunctionDefEnum.JS_CFUNC_generic_params.value ->
+                    def.funcParams?.invoke(ctx, freshThis, callArgc, argv, params) ?: JS_UNDEFINED
+                JSCFunctionDefEnum.JS_CFUNC_f_f.value -> {
+                    val d = JS_ToNumber(ctx, ctx.gcKeepAlive[keep + 1])
+                    JS_NewFloat64(ctx, def.funcFF?.invoke(d) ?: Double.NaN)
+                }
+                else -> JS_UNDEFINED
             }
-            else -> JS_UNDEFINED
+        } finally {
+            ctx.cArgBase = savedArgBase
+            while (ctx.gcKeepAlive.size > keep) {
+                ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+            }
         }
     }
     

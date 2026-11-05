@@ -134,8 +134,72 @@ fun jsGetString(ctx: JSContext, v: JSValue): String {
     if (ctx.memory.getMTag(ptr) != JS_MTAG_STRING) return ""
     
     val len = ctx.memory.getI32(ptr + 4)
-    val buf = ctx.memory.getBytes(ptr + 8, len)
-    return String(buf, Charsets.UTF_8)
+    return jsDecodeString(ctx.memory.getBytes(ptr + 8, len))
+}
+
+/* JS 字符串使用 WTF-8 编码存储：允许孤立代理项（\udbc4 等）原样往返，
+ * 普通 UTF-8 无法表示孤立代理项（会被替换成 '?'），会破坏字符串拼接/切片语义 */
+fun jsEncodeString(str: String): ByteArray {
+    val out = java.io.ByteArrayOutputStream(str.length + 8)
+    var i = 0
+    while (i < str.length) {
+        val c = str[i].code
+        if (c < 0x80) {
+            out.write(c)
+        } else if (c < 0x800) {
+            out.write(0xC0 or (c shr 6))
+            out.write(0x80 or (c and 0x3F))
+        } else if (Character.isHighSurrogate(str[i]) && i + 1 < str.length &&
+                   Character.isLowSurrogate(str[i + 1])) {
+            val cp = Character.toCodePoint(str[i], str[i + 1])
+            out.write(0xF0 or (cp shr 18))
+            out.write(0x80 or ((cp shr 12) and 0x3F))
+            out.write(0x80 or ((cp shr 6) and 0x3F))
+            out.write(0x80 or (cp and 0x3F))
+            i++
+        } else {
+            out.write(0xE0 or (c shr 12))
+            out.write(0x80 or ((c shr 6) and 0x3F))
+            out.write(0x80 or (c and 0x3F))
+        }
+        i++
+    }
+    return out.toByteArray()
+}
+
+fun jsDecodeString(b: ByteArray): String {
+    val sb = StringBuilder(b.size)
+    var i = 0
+    while (i < b.size) {
+        val c = b[i].toInt() and 0xFF
+        when {
+            c < 0x80 -> {
+                sb.append(c.toChar()); i++
+            }
+            (c and 0xE0) == 0xC0 && i + 1 < b.size -> {
+                val cp = ((c and 0x1F) shl 6) or (b[i + 1].toInt() and 0x3F)
+                sb.append(cp.toChar()); i += 2
+            }
+            (c and 0xF0) == 0xE0 && i + 2 < b.size -> {
+                val cp = ((c and 0x0F) shl 12) or
+                         ((b[i + 1].toInt() and 0x3F) shl 6) or
+                         (b[i + 2].toInt() and 0x3F)
+                /* 代理项（0xD800..0xDFFF）也按单个 UTF-16 码元保留 */
+                sb.append(cp.toChar()); i += 3
+            }
+            (c and 0xF8) == 0xF0 && i + 3 < b.size -> {
+                val cp = ((c and 0x07) shl 18) or
+                         ((b[i + 1].toInt() and 0x3F) shl 12) or
+                         ((b[i + 2].toInt() and 0x3F) shl 6) or
+                         (b[i + 3].toInt() and 0x3F)
+                sb.append(String(Character.toChars(cp))); i += 4
+            }
+            else -> {
+                sb.append('\uFFFD'); i++
+            }
+        }
+    }
+    return sb.toString()
 }
 
 fun JS_NewStringLen(ctx: JSContext, buf: ByteArray, bufLen: Int): JSValue {
@@ -153,6 +217,6 @@ fun JS_NewStringLen(ctx: JSContext, buf: ByteArray, bufLen: Int): JSValue {
 }
 
 fun JS_NewString(ctx: JSContext, str: String): JSValue {
-    val bytes = str.toByteArray(Charsets.UTF_8)
+    val bytes = jsEncodeString(str)
     return JS_NewStringLen(ctx, bytes, bytes.size)
 }

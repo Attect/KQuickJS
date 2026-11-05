@@ -188,8 +188,12 @@ fun JS_ThrowUncatchable(ctx: JSContext): JSValue {
 }
 
 /* 错误类便捷包装（对照 C JS_ThrowTypeError/RangeError/ReferenceError/SyntaxError/InternalError） */
-fun JS_ThrowTypeError(ctx: JSContext, message: String): JSValue =
-    ctx.throwError(JSObjectClassEnum.JS_CLASS_TYPE_ERROR, message)
+fun JS_ThrowTypeError(ctx: JSContext, message: String): JSValue {
+    if (System.getenv("MQJS_THROW_TRACE") != null) {
+        System.err.println("THROW TypeError: $message stack=${ctx.jsCallStack}")
+    }
+    return ctx.throwError(JSObjectClassEnum.JS_CLASS_TYPE_ERROR, message)
+}
 
 fun JS_ThrowRangeError(ctx: JSContext, message: String): JSValue =
     ctx.throwError(JSObjectClassEnum.JS_CLASS_RANGE_ERROR, message)

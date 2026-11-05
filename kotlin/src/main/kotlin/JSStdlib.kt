@@ -26,7 +26,18 @@ object JSStdlib {
         val idx = base + ctx.extFunctionTable.size
         ctx.extFunctionTable.add(
             JSCFunctionDef(
-                func = { c, thisVal, _: Int, argv: LongArray -> fn(c, thisVal, argv.toList()) },
+                func = { c, thisVal, argc: Int, argv: LongArray ->
+                    val base = c.cArgBase
+                    val args: List<JSValue> = if (base >= 0) {
+                        object : AbstractList<JSValue>() {
+                            override val size: Int get() = argv.size
+                            override fun get(index: Int): JSValue = c.gcKeepAlive[base + 1 + index]
+                        }
+                    } else {
+                        argv.toList()
+                    }
+                    fn(c, thisVal, args)
+                },
                 defType = JSCFunctionDefEnum.JS_CFUNC_generic.value,
                 argCount = length
             )
@@ -89,6 +100,7 @@ object JSStdlib {
             initString(ctx, rt)
             initNumber(ctx, rt)
             initRegExp(ctx, rt)
+            initTypedArrays(ctx, rt)
             initMath(ctx, rt)
             initJson(ctx, rt)
         } catch (e: Exception) {
@@ -112,9 +124,64 @@ object JSStdlib {
             }
             rt.callFunction(thisVal, list, thisArg)
         }
+        defMethod(ctx, rt, proto, "bind", 1) { c, thisVal, args ->
+            val keep = c.persistentRoots.size
+            c.persistentRoots.add(thisVal)
+            c.persistentRoots.add(arg(args, 0))
+            for (i in 1 until args.size) c.persistentRoots.add(args[i])
+            val info = intArrayOf(keep, keep + 1, keep + 2, args.size - 1)
+            c.boundFns.add(info)
+            val magic = c.boundFns.size - 1
+            val baseIdx = c.cFunctionTable?.size ?: 0
+            val fnIdx = baseIdx + c.extFunctionTable.size
+            c.extFunctionTable.add(JSCFunctionDef(
+                funcMagic = { cc, _, _, argv, m ->
+                    val bi = cc.boundFns[m]
+                    val target = cc.persistentRoots[bi[0]]
+                    val thisArg = cc.persistentRoots[bi[1]]
+                    val list = ArrayList<JSValue>()
+                    for (i in 0 until bi[3]) list.add(cc.persistentRoots[bi[2] + i])
+                    list.addAll(argv.toList())
+                    rt.callFunction(target, list, thisArg)
+                },
+                defType = JSCFunctionDefEnum.JS_CFUNC_generic_magic.value,
+                argCount = 0,
+                magic = magic
+            ))
+            JS_NewCFunctionParams(c, fnIdx, JS_NULL)
+        }
         defMethod(ctx, rt, proto, "toString", 0) { c, _, _ ->
             JS_NewString(c, "function () { [native code] }")
         }
+        
+        /* Function 构造器：把参数名/函数体拼成源码后走 JS_Eval 编译 */
+        val funcCtor = native(ctx, 1) { c, _, args ->
+            if (args.isEmpty()) {
+                JS_NewString(c, "")
+            } else {
+                val names = StringBuilder()
+                for (i in 0 until args.size - 1) {
+                    if (i > 0) names.append(',')
+                    names.append(rt.toStringValue(args[i]))
+                }
+                val body = rt.toStringValue(args[args.size - 1])
+                val src = "(function(" + names + "){" + body + "\n})"
+                val fn = JS_Eval(c, src, "<Function>", JS_EVAL_RETVAL)
+                if (JS_IsException(fn)) JS_EXCEPTION else fn
+            }
+        }
+        rt.setProperty(funcCtor, JS_NewString(ctx, "prototype"), proto)
+        rt.setProperty(proto, JS_NewString(ctx, "constructor"), funcCtor)
+        defGlobal(ctx, rt, "Function", funcCtor)
+        
+        /* 全局 eval（仅间接/全局语义） */
+        defGlobal(ctx, rt, "eval", native(ctx, 1) { c, _, args ->
+            if (args.isEmpty() || !JS_IsString(c, args[0])) {
+                if (args.isEmpty()) JS_UNDEFINED else args[0]
+            } else {
+                JS_Eval(c, jsGetString(c, args[0]), "<eval>", JS_EVAL_RETVAL)
+            }
+        })
     }
 
     private fun initPrimitives(ctx: JSContext, rt: JSRuntime) {
@@ -161,6 +228,9 @@ object JSStdlib {
         defValue(ctx, rt, consoleObj, "warn", logFn)
         defValue(ctx, rt, consoleObj, "error", logFn)
         defGlobal(ctx, rt, "console", consoleObj)
+        
+        /* 宿主脚本参数（命令行测试脚本用；无参数时为空数组） */
+        defGlobal(ctx, rt, "scriptArgs", JS_NewArray(ctx, 0))
     }
 
     private fun parseIntImpl(ctx: JSContext, v: JSValue, radix: JSValue): JSValue {
@@ -185,6 +255,8 @@ object JSStdlib {
 
     private fun parseFloatImpl(ctx: JSContext, s: String): JSValue {
         val str = s.trim()
+        if (str == "Infinity" || str == "+Infinity") return JS_NewFloat64(ctx, Double.POSITIVE_INFINITY)
+        if (str == "-Infinity") return JS_NewFloat64(ctx, Double.NEGATIVE_INFINITY)
         var end = 0
         var seenDot = false
         var seenExp = false
@@ -406,7 +478,7 @@ object JSStdlib {
         while (idx != 0) {
             val propPtr = pp + 8 + idx * 8
             val k = ctx.memory.getJSValue(propPtr)
-            if (k == key || rt.jsValueEquals(k, key)) return true
+            if (k == key || rt.jsPropKeyEquals(k, key)) return true
             idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propPtr + 16)) shr 1
         }
         return false
@@ -476,8 +548,11 @@ object JSStdlib {
             } else args.size
             val arr = JS_NewArray(c, n)
             if (!JS_IsException(arr) && args.size != 1) {
-                for (i in args.indices) rt.setElement(arr, JS_NewShortInt(i), args[i])
-                c.memory.putI32(JS_VALUE_TO_PTR(arr) + 32, args.size)
+                val keep = c.gcKeepAlive.size
+                c.gcKeepAlive.add(arr)
+                for (i in args.indices) rt.setElement(c.gcKeepAlive[keep], JS_NewShortInt(i), args[i])
+                c.memory.putI32(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 32, args.size)
+                return@native c.gcKeepAlive[keep]
             }
             arr
         }
@@ -493,12 +568,14 @@ object JSStdlib {
 
         defMethod(ctx, rt, proto, "push", 1) { c, thisVal, args ->
             var len = arrayLen(c, thisVal)
-            for (a in args) {
-                setArrayLen(c, thisVal, len + 1)
-                rt.setElement(thisVal, JS_NewShortInt(len), a)
+            val keep = c.gcKeepAlive.size
+            c.gcKeepAlive.add(thisVal)
+            for (i in args.indices) {
+                setArrayLen(c, c.gcKeepAlive[keep], len + 1)
+                rt.setElement(c.gcKeepAlive[keep], JS_NewShortInt(len), args[i])
                 len++
             }
-            setArrayLen(c, thisVal, len)
+            setArrayLen(c, c.gcKeepAlive[keep], len)
             JS_NewShortInt(len)
         }
         defMethod(ctx, rt, proto, "pop", 0) { c, thisVal, _ ->
@@ -529,12 +606,16 @@ object JSStdlib {
         defMethod(ctx, rt, proto, "unshift", 1) { c, thisVal, args ->
             val len = arrayLen(c, thisVal)
             val n = args.size
-            setArrayLen(c, thisVal, len + n)
+            val keep = c.gcKeepAlive.size
+            c.gcKeepAlive.add(thisVal)
+            for (i in args.indices) c.gcKeepAlive.add(args[i])
+            setArrayLen(c, c.gcKeepAlive[keep], len + n)
             for (i in len - 1 downTo 0) {
-                rt.setElement(thisVal, JS_NewShortInt(i + n), rt.getElement(thisVal, JS_NewShortInt(i)))
+                rt.setElement(c.gcKeepAlive[keep], JS_NewShortInt(i + n),
+                              rt.getElement(c.gcKeepAlive[keep], JS_NewShortInt(i)))
             }
-            for (i in 0 until n) rt.setElement(thisVal, JS_NewShortInt(i), args[i])
-            c.memory.putI32(JS_VALUE_TO_PTR(thisVal) + 32, len + n)
+            for (i in 0 until n) rt.setElement(c.gcKeepAlive[keep], JS_NewShortInt(i), c.gcKeepAlive[keep + 1 + i])
+            c.memory.putI32(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 32, len + n)
             JS_NewShortInt(len + n)
         }
         defMethod(ctx, rt, proto, "join", 1) { c, thisVal, args ->
@@ -593,30 +674,44 @@ object JSStdlib {
             if (e > len) e = len
             val n = (e - s).coerceAtLeast(0)
             val out = JS_NewArray(c, n)
+            /* 源数组与结果数组都保活：setElement 可能分配并触发 GC 搬移 */
+            val srcKeep = c.gcKeepAlive.size
+            c.gcKeepAlive.add(thisVal)
+            val outKeep = c.gcKeepAlive.size
+            c.gcKeepAlive.add(out)
             for (i in 0 until n) {
-                rt.setElement(out, JS_NewShortInt(i), rt.getElement(thisVal, JS_NewShortInt(s + i)))
+                rt.setElement(c.gcKeepAlive[outKeep], JS_NewShortInt(i),
+                              rt.getElement(c.gcKeepAlive[srcKeep], JS_NewShortInt(s + i)))
             }
-            c.memory.putI32(JS_VALUE_TO_PTR(out) + 32, n)
-            out
+            c.memory.putI32(JS_VALUE_TO_PTR(c.gcKeepAlive[outKeep]) + 32, n)
+            c.gcKeepAlive[outKeep]
         }
         defMethod(ctx, rt, proto, "concat", 1) { c, thisVal, args ->
+            val keep = c.gcKeepAlive.size
+            c.gcKeepAlive.add(thisVal)
             val out = JS_NewArray(c, 0)
+            val outSlot = c.gcKeepAlive.size
+            c.gcKeepAlive.add(out)
+            for (i in args.indices) c.gcKeepAlive.add(args[i])
+            val thisSlot = keep
             var n = 0
-            fun append(v: JSValue) {
-                if (JS_IsPtr(v) && c.memory.getMTag(JS_VALUE_TO_PTR(v)) == JSMTags.JS_MTAG_OBJECT &&
-                    c.memory.getU8(JS_VALUE_TO_PTR(v) + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value) {
-                    val l = arrayLen(c, v)
+            fun appendFrom(slot: Int) {
+                val v0 = c.gcKeepAlive[slot]
+                if (JS_IsPtr(v0) && c.memory.getMTag(JS_VALUE_TO_PTR(v0)) == JSMTags.JS_MTAG_OBJECT &&
+                    c.memory.getU8(JS_VALUE_TO_PTR(v0) + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value) {
+                    val l = arrayLen(c, v0)
                     for (i in 0 until l) {
-                        rt.setElement(out, JS_NewShortInt(n++), rt.getElement(v, JS_NewShortInt(i)))
+                        rt.setElement(c.gcKeepAlive[outSlot], JS_NewShortInt(n++),
+                                      rt.getElement(c.gcKeepAlive[slot], JS_NewShortInt(i)))
                     }
                 } else {
-                    rt.setElement(out, JS_NewShortInt(n++), v)
+                    rt.setElement(c.gcKeepAlive[outSlot], JS_NewShortInt(n++), c.gcKeepAlive[slot])
                 }
             }
-            append(thisVal)
-            for (a in args) append(a)
-            c.memory.putI32(JS_VALUE_TO_PTR(out) + 32, n)
-            out
+            appendFrom(thisSlot)
+            for (i in args.indices) appendFrom(thisSlot + 2 + i)
+            c.memory.putI32(JS_VALUE_TO_PTR(c.gcKeepAlive[outSlot]) + 32, n)
+            c.gcKeepAlive[outSlot]
         }
         defMethod(ctx, rt, proto, "reverse", 0) { c, thisVal, _ ->
             val len = arrayLen(c, thisVal)
@@ -631,23 +726,202 @@ object JSStdlib {
         defMethod(ctx, rt, proto, "sort", 1) { c, thisVal, args ->
             val cmp = arg(args, 0)
             val len = arrayLen(c, thisVal)
-            val items = ArrayList<JSValue>(len)
-            for (i in 0 until len) items.add(rt.getElement(thisVal, JS_NewShortInt(i)))
-            val list = items.toMutableList()
-            val comparator = java.util.Comparator<JSValue> { a, b ->
-                if (JS_IsFunction(c, cmp)) {
-                    val r = rt.callFunction(cmp, listOf(a, b), JS_UNDEFINED)
-                    toNum(c, rt, r).toInt()
+            val keep = c.gcKeepAlive.size
+            c.gcKeepAlive.add(thisVal)          /* 槽 keep */
+            c.gcKeepAlive.add(cmp)              /* 槽 keep+1 */
+            val slots = IntArray(len)
+            var undefCount = 0
+            var m = 0
+            for (i in 0 until len) {
+                val v = rt.getElement(c.gcKeepAlive[keep], JS_NewShortInt(i))
+                if (JS_IsUndefined(v)) {
+                    undefCount++
                 } else {
-                    rt.toStringValue(a).compareTo(rt.toStringValue(b))
+                    slots[m] = c.gcKeepAlive.size
+                    c.gcKeepAlive.add(v)
+                    m++
                 }
             }
-            list.sortWith(comparator)
-            for (i in 0 until len) rt.setElement(thisVal, JS_NewShortInt(i), list[i])
-            thisVal
+            val order = (0 until m).toMutableList()
+            val comparator = java.util.Comparator<Int> { ia, ib ->
+                if (JS_IsFunction(c, c.gcKeepAlive[keep + 1])) {
+                    val r = rt.callFunction(c.gcKeepAlive[keep + 1],
+                        listOf(c.gcKeepAlive[slots[ia]], c.gcKeepAlive[slots[ib]]), JS_UNDEFINED)
+                    toNum(c, rt, r).toInt()
+                } else {
+                    rt.toStringValue(c.gcKeepAlive[slots[ia]])
+                        .compareTo(rt.toStringValue(c.gcKeepAlive[slots[ib]]))
+                }
+            }
+            order.sortWith(comparator)
+            for (i in 0 until m) {
+                rt.setElement(c.gcKeepAlive[keep], JS_NewShortInt(i), c.gcKeepAlive[slots[order[i]]])
+            }
+            for (i in m until len) {
+                rt.setElement(c.gcKeepAlive[keep], JS_NewShortInt(i), JS_UNDEFINED)
+            }
+            c.memory.putI32(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 32, len)
+            c.gcKeepAlive[keep]
+        }
+        
+        /* 数组迭代类方法：this/回调放入保活列表，回调期间的 GC 搬移后仍可用 */
+        fun arrayIterate(name: String, mode: Int) {
+            defMethod(ctx, rt, proto, name, 1) { c, thisVal, args ->
+                val cb = arg(args, 0)
+                if (!JS_IsFunction(c, cb)) {
+                    JS_ThrowTypeError(c, "not a function")
+                } else {
+                    val keep = c.gcKeepAlive.size
+                    c.gcKeepAlive.add(thisVal)
+                    c.gcKeepAlive.add(cb)
+                    try {
+                        val len = arrayLen(c, c.gcKeepAlive[keep])
+                        val hasOut = mode == 1 || mode == 2
+                        val out = if (hasOut) JS_NewArray(c, 0) else JS_NULL
+                        val outSlot = c.gcKeepAlive.size
+                        if (hasOut) c.gcKeepAlive.add(out)
+                        var outN = 0
+                        for (i in 0 until len) {
+                            val arr = c.gcKeepAlive[keep]
+                            val v = rt.getElement(arr, JS_NewShortInt(i))
+                            val r = rt.callFunction(c.gcKeepAlive[keep + 1],
+                                listOf(v, JS_NewShortInt(i), arr), JS_UNDEFINED)
+                            if (JS_IsException(r)) return@defMethod r
+                            when (mode) {
+                                0 -> {}                       /* forEach */
+                                1 -> rt.setElement(c.gcKeepAlive[outSlot], JS_NewShortInt(outN++), r)   /* map */
+                                2 -> if (rt.toBoolean(r)) rt.setElement(c.gcKeepAlive[outSlot], JS_NewShortInt(outN++),
+                                    rt.getElement(c.gcKeepAlive[keep], JS_NewShortInt(i))) /* filter */
+                                3 -> if (rt.toBoolean(r)) return@defMethod JS_TRUE    /* some */
+                                4 -> if (!rt.toBoolean(r)) return@defMethod JS_FALSE  /* every */
+                            }
+                        }
+                        when (mode) {
+                            1, 2 -> {
+                                c.memory.putI32(JS_VALUE_TO_PTR(c.gcKeepAlive[outSlot]) + 32, outN)
+                                c.gcKeepAlive[outSlot]
+                            }
+                            3 -> JS_FALSE
+                            4 -> JS_TRUE
+                            else -> JS_UNDEFINED
+                        }
+                    } finally {
+                        while (c.gcKeepAlive.size > keep) c.gcKeepAlive.removeAt(c.gcKeepAlive.size - 1)
+                    }
+                }
+            }
+        }
+        arrayIterate("forEach", 0)
+        arrayIterate("map", 1)
+        arrayIterate("filter", 2)
+        arrayIterate("some", 3)
+        arrayIterate("every", 4)
+        
+        defMethod(ctx, rt, proto, "reduce", 1) { c, thisVal, args ->
+            reduceImpl(c, rt, thisVal, args, right = false)
+        }
+        defMethod(ctx, rt, proto, "reduceRight", 1) { c, thisVal, args ->
+            reduceImpl(c, rt, thisVal, args, right = true)
+        }
+        defMethod(ctx, rt, proto, "splice", 2) { c, thisVal, args ->
+            spliceImpl(c, rt, thisVal, args)
         }
     }
 
+    private fun reduceImpl(ctx: JSContext, rt: JSRuntime, thisVal: JSValue,
+                           args: List<JSValue>, right: Boolean): JSValue {
+        val cb = arg(args, 0)
+        if (!JS_IsFunction(ctx, cb)) return JS_ThrowTypeError(ctx, "not a function")
+        val keep = ctx.gcKeepAlive.size
+        ctx.gcKeepAlive.add(thisVal)
+        ctx.gcKeepAlive.add(cb)
+        val hasInit = args.size > 1
+        if (hasInit) ctx.gcKeepAlive.add(args[1])
+        try {
+            val len = arrayLen(ctx, ctx.gcKeepAlive[keep])
+            var acc: JSValue
+            var i: Int
+            val end: Int
+            val step: Int
+            if (right) { i = len - 1; end = -1; step = -1 } else { i = 0; end = len; step = 1 }
+            if (hasInit) {
+                acc = ctx.gcKeepAlive[keep + 2]
+            } else {
+                if (len == 0) return JS_ThrowTypeError(ctx, "reduce of empty array with no initial value")
+                acc = rt.getElement(ctx.gcKeepAlive[keep], JS_NewShortInt(i))
+                i += step
+            }
+            while (i != end) {
+                val arr = ctx.gcKeepAlive[keep]
+                val v = rt.getElement(arr, JS_NewShortInt(i))
+                val r = rt.callFunction(ctx.gcKeepAlive[keep + 1],
+                    listOf(acc, v, JS_NewShortInt(i), arr), JS_UNDEFINED)
+                if (JS_IsException(r)) return r
+                acc = r
+                i += step
+            }
+            return acc
+        } finally {
+            while (ctx.gcKeepAlive.size > keep) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
+    }
+    
+    private fun spliceImpl(ctx: JSContext, rt: JSRuntime, thisVal: JSValue,
+                           args: List<JSValue>): JSValue {
+        val keep = ctx.gcKeepAlive.size
+        ctx.gcKeepAlive.add(thisVal)
+        try {
+            val len = arrayLen(ctx, ctx.gcKeepAlive[keep])
+            var start = if (args.isNotEmpty()) toInt(ctx, rt, args[0]) else 0
+            if (start < 0) start = (len + start).coerceAtLeast(0)
+            if (start > len) start = len
+            val del = if (args.size > 1) toInt(ctx, rt, args[1]).coerceIn(0, len - start) else len - start
+            val items = args.drop(2)
+            
+            /* 旧元素与插入项统一放入保活槽，避免后续分配触发搬移 */
+            val oldIdx = IntArray(len)
+            for (i in 0 until len) {
+                oldIdx[i] = ctx.gcKeepAlive.size
+                ctx.gcKeepAlive.add(rt.getElement(ctx.gcKeepAlive[keep], JS_NewShortInt(i)))
+            }
+            val newIdx = IntArray(items.size)
+            for (i in items.indices) {
+                newIdx[i] = ctx.gcKeepAlive.size
+                ctx.gcKeepAlive.add(items[i])
+            }
+            
+            /* 被删除的元素组成返回数组 */
+            val removed = JS_NewArray(ctx, del)
+            val remKeep = ctx.gcKeepAlive.size
+            ctx.gcKeepAlive.add(removed)
+            for (i in 0 until del) {
+                rt.setElement(ctx.gcKeepAlive[remKeep], JS_NewShortInt(i),
+                    ctx.gcKeepAlive[oldIdx[start + i]])
+            }
+            ctx.memory.putI32(JS_VALUE_TO_PTR(ctx.gcKeepAlive[remKeep]) + 32, del)
+            
+            /* 按 “前缀 + 插入项 + 后缀” 重写数组 */
+            val newLen = len - del + items.size
+            var w = 0
+            for (i in 0 until start) {
+                rt.setElement(ctx.gcKeepAlive[keep], JS_NewShortInt(w++), ctx.gcKeepAlive[oldIdx[i]])
+            }
+            for (i in items.indices) {
+                rt.setElement(ctx.gcKeepAlive[keep], JS_NewShortInt(w++), ctx.gcKeepAlive[newIdx[i]])
+            }
+            for (i in start + del until len) {
+                rt.setElement(ctx.gcKeepAlive[keep], JS_NewShortInt(w++), ctx.gcKeepAlive[oldIdx[i]])
+            }
+            for (i in newLen until len) {
+                rt.setElement(ctx.gcKeepAlive[keep], JS_NewShortInt(i), JS_UNDEFINED)
+            }
+            ctx.memory.putI32(JS_VALUE_TO_PTR(ctx.gcKeepAlive[keep]) + 32, newLen)
+            return ctx.gcKeepAlive[remKeep]
+        } finally {
+            while (ctx.gcKeepAlive.size > keep) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
+    }
+    
     private fun strictEq(ctx: JSContext, rt: JSRuntime, a: JSValue, b: JSValue): Boolean = rt.strictEquals(a, b)
 
     /* ---------------- String ---------------- */
@@ -903,9 +1177,18 @@ object JSStdlib {
         }
         defMethod(ctx, rt, proto, "toExponential", 1) { c, thisVal, args ->
             val d = toNum(c, rt, thisVal)
-            val n = if (args.isEmpty() || JS_IsUndefined(args[0])) 6 else toInt(c, rt, args[0])
-            val s = String.format(java.util.Locale.ROOT, "%.${n}e", d)
-            JS_NewString(c, s.replace("e+", "e+").replace("e-0", "e-"))
+            val digits = if (args.isEmpty() || JS_IsUndefined(args[0])) null
+                         else toInt(c, rt, args[0]).coerceIn(0, 100)
+            JS_NewString(c, jsToExponential(d, digits))
+        }
+        defMethod(ctx, rt, proto, "toPrecision", 1) { c, thisVal, args ->
+            val d = toNum(c, rt, thisVal)
+            if (args.isEmpty() || JS_IsUndefined(args[0])) {
+                JS_NewString(c, jsNumberToString(d))
+            } else {
+                val p = toInt(c, rt, args[0]).coerceIn(1, 100)
+                JS_NewString(c, jsToPrecision(d, p))
+            }
         }
         defMethod(ctx, rt, proto, "valueOf", 0) { c, thisVal, _ ->
             JS_NewFloat64(c, toNum(c, rt, thisVal))
@@ -958,6 +1241,22 @@ object JSStdlib {
         defMethod(ctx, rt, math, "random", 0) { c, _, _ ->
             JS_NewFloat64(c, Math.random())
         }
+        defMethod(ctx, rt, math, "imul", 2) { c, _, args ->
+            val a = rt.toInt32(arg(args, 0))
+            val b = rt.toInt32(arg(args, 1))
+            JS_NewShortInt(a * b)
+        }
+        defMethod(ctx, rt, math, "fround", 1) { c, _, args ->
+            JS_NewFloat64(c, toNum(c, rt, arg(args, 0)).toFloat().toDouble())
+        }
+        defMethod(ctx, rt, math, "trunc", 1) { c, _, args ->
+            val d = toNum(c, rt, arg(args, 0))
+            JS_NewFloat64(c, if (d >= 0) Math.floor(d) else Math.ceil(d))
+        }
+        defMethod(ctx, rt, math, "sign", 1) { c, _, args ->
+            val d = toNum(c, rt, arg(args, 0))
+            JS_NewFloat64(c, if (d > 0) 1.0 else if (d < 0) -1.0 else d)
+        }
     }
 
     /* ---------------- RegExp ---------------- */
@@ -980,16 +1279,17 @@ object JSStdlib {
             }
             val n = p[i + 1]
             when {
-                n == 'c' && i + 2 < p.length -> {
+                n == 'c' && i + 2 < p.length && p[i + 2].isLetter() -> {
                     sb.append("\\x%02x".format(java.util.Locale.ROOT, p[i + 2].code % 32))
                     i += 3
                 }
-                n in "dDsSwWbBfnrtv0xupPkK".toSet() ||
-                    n.isDigit() -> {
+                n == 'c' -> { sb.append("\\\\"); i += 1 }   /* \c 后非字母：字面反斜杠 */
+                n in "dDsSwWbBfnrtv0xupP".toSet() || n.isDigit() -> {
                     sb.append('\\').append(n); i += 2
                 }
-                n == '/' -> { sb.append('/'); i += 2 }
-                else -> { sb.append(n); i += 2 }   /* 身份转义：去掉反斜杠 */
+                n == '\\' -> { sb.append("\\\\"); i += 2 }
+                n.isLetter() -> { sb.append(n); i += 2 }   /* 身份转义：去掉反斜杠 */
+                else -> { sb.append('\\').append(n); i += 2 } /* 标点转义保留（Java 有效） */
             }
         }
         return sb.toString()
@@ -1014,12 +1314,19 @@ object JSStdlib {
         val obj = JS_NewObjectProtoClass(ctx, ctx.classProto[JSObjectClassEnum.JS_CLASS_REGEXP.value],
                                           JSObjectClassEnum.JS_CLASS_REGEXP.value, 0)
         if (JS_IsException(obj)) return obj
-        rt.setProperty(obj, JS_NewString(ctx, "source"), JS_NewString(ctx, pattern))
-        rt.setProperty(obj, JS_NewString(ctx, "flags"), JS_NewString(ctx, flags))
-        rt.setProperty(obj, JS_NewString(ctx, "global"), JS_NewBool(flags.contains('g')))
-        rt.setProperty(obj, JS_NewString(ctx, "lastIndex"), JS_NewShortInt(0))
-        JS_SetOpaque(ctx, obj, compileRegexp(pattern, flags))
-        return obj
+        val keep = ctx.gcKeepAlive.size
+        ctx.gcKeepAlive.add(obj)
+        try {
+            val o = ctx.gcKeepAlive[keep]
+            rt.setProperty(o, JS_NewString(ctx, "source"), JS_NewString(ctx, pattern))
+            rt.setProperty(o, JS_NewString(ctx, "flags"), JS_NewString(ctx, flags))
+            rt.setProperty(o, JS_NewString(ctx, "global"), JS_NewBool(flags.contains('g')))
+            rt.setProperty(o, JS_NewString(ctx, "lastIndex"), JS_NewShortInt(0))
+            JS_SetOpaque(ctx, ctx.gcKeepAlive[keep], compileRegexp(pattern, flags))
+            return ctx.gcKeepAlive[keep]
+        } finally {
+            while (ctx.gcKeepAlive.size > keep) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
     }
 
     private fun reFlags(ctx: JSContext, rt: JSRuntime, re: JSValue): String {
@@ -1049,16 +1356,19 @@ object JSStdlib {
         val n = m.groupCount() + 1
         val arr = JS_NewArray(ctx, n)
         if (JS_IsException(arr)) return JS_NULL
+        val keep = ctx.gcKeepAlive.size
+        ctx.gcKeepAlive.add(re)
+        ctx.gcKeepAlive.add(arr)
         for (g in 0 until n) {
             val gv = m.group(g)
-            rt.setElement(arr, JS_NewShortInt(g),
+            rt.setElement(ctx.gcKeepAlive[keep + 1], JS_NewShortInt(g),
                 if (gv == null) JS_UNDEFINED else JS_NewString(ctx, gv))
         }
-        ctx.memory.putI32(JS_VALUE_TO_PTR(arr) + 32, n)
-        rt.setProperty(arr, JS_NewString(ctx, "index"), JS_NewShortInt(m.start()))
-        rt.setProperty(arr, JS_NewString(ctx, "input"), JS_NewString(ctx, str))
-        if (global) rt.setProperty(re, JS_NewString(ctx, "lastIndex"), JS_NewShortInt(m.end()))
-        return arr
+        ctx.memory.putI32(JS_VALUE_TO_PTR(ctx.gcKeepAlive[keep + 1]) + 32, n)
+        rt.setProperty(ctx.gcKeepAlive[keep + 1], JS_NewString(ctx, "index"), JS_NewShortInt(m.start()))
+        rt.setProperty(ctx.gcKeepAlive[keep + 1], JS_NewString(ctx, "input"), JS_NewString(ctx, str))
+        if (global) rt.setProperty(ctx.gcKeepAlive[keep], JS_NewString(ctx, "lastIndex"), JS_NewShortInt(m.end()))
+        return ctx.gcKeepAlive[keep + 1]
     }
 
     private fun expandReplacement(rep: String, s: String, m: java.util.regex.Matcher): String {
@@ -1168,6 +1478,244 @@ object JSStdlib {
         }
     }
 
+    /* ---------------- TypedArray / ArrayBuffer ---------------- */
+
+    class ArrayBufferInfo(val bytes: ByteArray)
+
+    class TypedArrayInfo(val bytes: ByteArray, var offset: Int, var length: Int, val kind: Int)
+
+    private fun readTypedI16(b: ByteArray, o: Int): Int =
+        (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8)
+    private fun writeTypedI16(b: ByteArray, o: Int, v: Long) {
+        b[o] = (v and 0xFF).toByte()
+        b[o + 1] = ((v shr 8) and 0xFF).toByte()
+    }
+    private fun readTypedI32(b: ByteArray, o: Int): Int =
+        (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8) or
+        ((b[o + 2].toInt() and 0xFF) shl 16) or ((b[o + 3].toInt() and 0xFF) shl 24)
+    private fun writeTypedI32(b: ByteArray, o: Int, v: Long) {
+        for (i in 0 until 4) b[o + i] = ((v shr (8 * i)) and 0xFF).toByte()
+    }
+    private fun readTypedF32(b: ByteArray, o: Int): Float = Float.fromBits(readTypedI32(b, o))
+    private fun writeTypedF32(b: ByteArray, o: Int, f: Float) {
+        writeTypedI32(b, o, f.toBits().toLong())
+    }
+    private fun readTypedF64(b: ByteArray, o: Int): Double {
+        var bits = 0L
+        for (i in 0 until 8) bits = bits or ((b[o + i].toLong() and 0xFF) shl (8 * i))
+        return Double.fromBits(bits)
+    }
+    private fun writeTypedF64(b: ByteArray, o: Int, d: Double) {
+        val bits = d.toBits()
+        for (i in 0 until 8) b[o + i] = ((bits shr (8 * i)) and 0xFF).toByte()
+    }
+
+    fun readTyped(ctx: JSContext, ti: TypedArrayInfo, idx: Int): JSValue {
+        val o = ti.offset + idx * typedBpe(ti.kind)
+        return when (ti.kind) {
+            0 -> JS_NewShortInt(ti.bytes[o].toInt() and 0xFF)
+            1 -> JS_NewShortInt(ti.bytes[o].toInt())
+            2 -> JS_NewShortInt(readTypedI16(ti.bytes, o) and 0xFFFF)
+            3 -> JS_NewShortInt(readTypedI16(ti.bytes, o).toShort().toInt())
+            4 -> JS_NewFloat64(ctx, (readTypedI32(ti.bytes, o).toLong() and 0xFFFFFFFFL).toDouble())
+            5 -> JS_NewShortInt(readTypedI32(ti.bytes, o))
+            6 -> JS_NewFloat64(ctx, readTypedF32(ti.bytes, o).toDouble())
+            7 -> JS_NewFloat64(ctx, readTypedF64(ti.bytes, o))
+            else -> JS_NewShortInt(ti.bytes[o].toInt() and 0xFF)
+        }
+    }
+
+    fun writeTyped(ctx: JSContext, rt: JSRuntime, ti: TypedArrayInfo, idx: Int, v: JSValue) {
+        val o = ti.offset + idx * typedBpe(ti.kind)
+        when (ti.kind) {
+            0, 1 -> ti.bytes[o] = (rt.toInt32(v) and 0xFF).toByte()
+            2, 3 -> writeTypedI16(ti.bytes, o, rt.toInt32(v).toLong() and 0xFFFF)
+            4 -> writeTypedI32(ti.bytes, o, rt.toUInt32(v))
+            5 -> writeTypedI32(ti.bytes, o, rt.toInt32(v).toLong())
+            6 -> writeTypedF32(ti.bytes, o, rt.toNumber(v).toFloat())
+            7 -> writeTypedF64(ti.bytes, o, rt.toNumber(v))
+            else -> {
+                val d = rt.toNumber(v)
+                val clamped = when {
+                    d.isNaN() || d <= 0.0 -> 0
+                    d >= 255.0 -> 255
+                    else -> {
+                        val fl = Math.floor(d)
+                        val diff = d - fl
+                        when {
+                            diff < 0.5 -> fl.toInt()
+                            diff > 0.5 -> (fl + 1).toInt()
+                            (fl.toLong() % 2L) == 0L -> fl.toInt()
+                            else -> (fl + 1).toInt()
+                        }
+                    }
+                }
+                ti.bytes[o] = clamped.toByte()
+            }
+        }
+    }
+
+    private fun typedBpe(kind: Int): Int = when (kind) {
+        0, 1, 8 -> 1
+        2, 3 -> 2
+        4, 5, 6 -> 4
+        else -> 8
+    }
+
+    private fun makeArrayBuffer(ctx: JSContext, rt: JSRuntime, len: Int): JSValue {
+        val obj = JS_NewObjectProtoClass(ctx, ctx.classProto[JSObjectClassEnum.JS_CLASS_ARRAY_BUFFER.value],
+                                          JSObjectClassEnum.JS_CLASS_ARRAY_BUFFER.value, 0)
+        if (JS_IsException(obj)) return obj
+        val keep = ctx.gcKeepAlive.size
+        ctx.gcKeepAlive.add(obj)
+        try {
+            rt.setProperty(ctx.gcKeepAlive[keep], JS_NewString(ctx, "byteLength"), JS_NewShortInt(len))
+            JS_SetOpaque(ctx, ctx.gcKeepAlive[keep], ArrayBufferInfo(ByteArray(len.coerceAtLeast(0))))
+            return ctx.gcKeepAlive[keep]
+        } finally {
+            while (ctx.gcKeepAlive.size > keep) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
+    }
+
+    private fun makeTypedArray(ctx: JSContext, rt: JSRuntime, kind: Int, bpe: Int,
+                               bufferObj: JSValue, bufInfo: ArrayBufferInfo,
+                               offset: Int, length: Int): JSValue {
+        val obj = JS_NewArray(ctx, length)
+        if (JS_IsException(obj)) return obj
+        val keep = ctx.gcKeepAlive.size
+        ctx.gcKeepAlive.add(obj)
+        ctx.gcKeepAlive.add(bufferObj)
+        try {
+            val o = ctx.gcKeepAlive[keep]
+            ctx.memory.putI32(JS_VALUE_TO_PTR(o) + 32, length)
+            rt.setProperty(o, JS_NewString(ctx, "BYTES_PER_ELEMENT"), JS_NewShortInt(bpe))
+            rt.setProperty(o, JS_NewString(ctx, "byteOffset"), JS_NewShortInt(offset))
+            rt.setProperty(o, JS_NewString(ctx, "byteLength"), JS_NewShortInt(length * bpe))
+            rt.setProperty(ctx.gcKeepAlive[keep], JS_NewString(ctx, "buffer"), ctx.gcKeepAlive[keep + 1])
+            rt.setProperty(ctx.gcKeepAlive[keep], JS_NewString(ctx, "length"), JS_NewShortInt(length))
+            JS_SetOpaque(ctx, ctx.gcKeepAlive[keep], TypedArrayInfo(bufInfo.bytes, offset, length, kind))
+            return ctx.gcKeepAlive[keep]
+        } finally {
+            while (ctx.gcKeepAlive.size > keep) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
+    }
+
+    private fun initTypedArrays(ctx: JSContext, rt: JSRuntime) {
+        val abProto = JS_NewObject(ctx)
+        ctx.classProto[JSObjectClassEnum.JS_CLASS_ARRAY_BUFFER.value] = abProto
+        val abCtor = native(ctx, 1) { c, _, args ->
+            makeArrayBuffer(c, rt, toInt(c, rt, arg(args, 0)).coerceAtLeast(0))
+        }
+        rt.setProperty(abCtor, JS_NewString(ctx, "prototype"), abProto)
+        rt.setProperty(abProto, JS_NewString(ctx, "constructor"), abCtor)
+        defGlobal(ctx, rt, "ArrayBuffer", abCtor)
+
+        val defs = listOf(
+            Triple("Uint8Array", 1, 0), Triple("Int8Array", 1, 1),
+            Triple("Uint16Array", 2, 2), Triple("Int16Array", 2, 3),
+            Triple("Uint32Array", 4, 4), Triple("Int32Array", 4, 5),
+            Triple("Float32Array", 4, 6), Triple("Float64Array", 8, 7),
+            Triple("Uint8ClampedArray", 1, 8)
+        )
+        for ((name, bpe, kind) in defs) {
+            val proto = JS_NewObject(ctx)
+            val ctor = native(ctx, 1) { c, _, args ->
+                val a0 = arg(args, 0)
+                if (JS_IsPtr(a0) && JS_GetOpaque(c, a0) is ArrayBufferInfo) {
+                    val info = JS_GetOpaque(c, a0) as ArrayBufferInfo
+                    val off = if (args.size > 1) toInt(c, rt, args[1]).coerceAtLeast(0) else 0
+                    val len = if (args.size > 2 && !JS_IsUndefined(args[2]))
+                        toInt(c, rt, args[2]).coerceAtLeast(0)
+                    else ((info.bytes.size - off) / bpe).coerceAtLeast(0)
+                    makeTypedArray(c, rt, kind, bpe, a0, info, off, len)
+                } else if (JS_IsPtr(a0) && c.memory.getMTag(JS_VALUE_TO_PTR(a0)) == JSMTags.JS_MTAG_OBJECT &&
+                           c.memory.getU8(JS_VALUE_TO_PTR(a0) + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value) {
+                    val len = c.memory.getI32(JS_VALUE_TO_PTR(a0) + 32)
+                    val buf = makeArrayBuffer(c, rt, len * bpe)
+                    val info = JS_GetOpaque(c, buf) as ArrayBufferInfo
+                    val ta = makeTypedArray(c, rt, kind, bpe, buf, info, 0, len)
+                    val ti = JS_GetOpaque(c, ta) as TypedArrayInfo
+                    for (i in 0 until len) {
+                        writeTyped(c, rt, ti, i, rt.getElement(a0, JS_NewShortInt(i)))
+                    }
+                    ta
+                } else {
+                    val len = toInt(c, rt, a0).coerceAtLeast(0)
+                    val buf = makeArrayBuffer(c, rt, len * bpe)
+                    val info = JS_GetOpaque(c, buf) as ArrayBufferInfo
+                    makeTypedArray(c, rt, kind, bpe, buf, info, 0, len)
+                }
+            }
+            rt.setProperty(ctor, JS_NewString(ctx, "prototype"), proto)
+            rt.setProperty(proto, JS_NewString(ctx, "constructor"), ctor)
+            defValue(ctx, rt, ctor, "BYTES_PER_ELEMENT", JS_NewShortInt(bpe))
+            defGlobal(ctx, rt, name, ctor)
+            defMethod(ctx, rt, proto, "set", 2) { c, thisVal, args ->
+                val ti = JS_GetOpaque(c, thisVal) as? TypedArrayInfo
+                val src = arg(args, 0)
+                val off = if (args.size > 1) toInt(c, rt, args[1]).coerceAtLeast(0) else 0
+                if (ti != null && JS_IsPtr(src)) {
+                    val n = c.memory.getI32(JS_VALUE_TO_PTR(src) + 32)
+                    for (i in 0 until n) {
+                        if (off + i >= ti.length) break
+                        writeTyped(c, rt, ti, off + i, rt.getElement(src, JS_NewShortInt(i)))
+                    }
+                }
+                JS_UNDEFINED
+            }
+            defMethod(ctx, rt, proto, "subarray", 2) { c, thisVal, args ->
+                val ti = JS_GetOpaque(c, thisVal) as? TypedArrayInfo
+                if (ti == null) JS_UNDEFINED
+                else {
+                    var s = if (args.isNotEmpty()) toInt(c, rt, args[0]) else 0
+                    var e = if (args.size > 1 && !JS_IsUndefined(args[1])) toInt(c, rt, args[1]) else ti.length
+                    if (s < 0) s = (ti.length + s).coerceAtLeast(0)
+                    if (e < 0) e = (ti.length + e).coerceAtLeast(0)
+                    s = s.coerceIn(0, ti.length); e = e.coerceIn(0, ti.length)
+                    if (e < s) e = s
+                    val buf = rt.getProperty(thisVal, JS_NewString(c, "buffer"))
+                    val info = JS_GetOpaque(c, buf) as? ArrayBufferInfo
+                    if (info == null) JS_UNDEFINED
+                    else makeTypedArray(c, rt, ti.kind, typedBpe(ti.kind), buf, info,
+                                        ti.offset + s * typedBpe(ti.kind), e - s)
+                }
+            }
+        }
+    /* 类型化数组实例的原型是 Array.prototype（便于 toString 等），
+         * 因此 set/subarray 也注册在 Array.prototype 上（按 opaque 判定实例类型） */
+        val arrProto = ctx.classProto[JSObjectClassEnum.JS_CLASS_ARRAY.value]
+        defMethod(ctx, rt, arrProto, "set", 2) { c, thisVal, args ->
+            val ti = JS_GetOpaque(c, thisVal) as? TypedArrayInfo
+            val src = arg(args, 0)
+            val off = if (args.size > 1) toInt(c, rt, args[1]).coerceAtLeast(0) else 0
+            if (ti != null && JS_IsPtr(src)) {
+                val n = c.memory.getI32(JS_VALUE_TO_PTR(src) + 32)
+                for (i in 0 until n) {
+                    if (off + i >= ti.length) break
+                    writeTyped(c, rt, ti, off + i, rt.getElement(src, JS_NewShortInt(i)))
+                }
+            }
+            JS_UNDEFINED
+        }
+        defMethod(ctx, rt, arrProto, "subarray", 2) { c, thisVal, args ->
+            val ti = JS_GetOpaque(c, thisVal) as? TypedArrayInfo
+            if (ti == null) JS_UNDEFINED
+            else {
+                var s = if (args.isNotEmpty()) toInt(c, rt, args[0]) else 0
+                var e = if (args.size > 1 && !JS_IsUndefined(args[1])) toInt(c, rt, args[1]) else ti.length
+                if (s < 0) s = (ti.length + s).coerceAtLeast(0)
+                if (e < 0) e = (ti.length + e).coerceAtLeast(0)
+                s = s.coerceIn(0, ti.length); e = e.coerceIn(0, ti.length)
+                if (e < s) e = s
+                val buf = rt.getProperty(thisVal, JS_NewString(c, "buffer"))
+                val info = JS_GetOpaque(c, buf) as? ArrayBufferInfo
+                if (info == null) JS_UNDEFINED
+                else makeTypedArray(c, rt, ti.kind, typedBpe(ti.kind), buf, info,
+                                    ti.offset + s * typedBpe(ti.kind), e - s)
+            }
+        }
+    }
+
     private fun initJson(ctx: JSContext, rt: JSRuntime) {
         val json = JS_NewObject(ctx)
         defGlobal(ctx, rt, "JSON", json)
@@ -1220,12 +1768,16 @@ object JSStdlib {
                         sb.append('{')
                         val keys = rt.jsObjectKeys(v)
                         val n = if (JS_IsPtr(keys)) ctx.memory.getI32(JS_VALUE_TO_PTR(keys) + 32) else 0
+                        var first = true
                         for (i in 0 until n) {
-                            if (i > 0) sb.append(',')
                             val k = rt.getElement(keys, JS_NewShortInt(i))
+                            val pv = rt.getProperty(v, k)
+                            if (JS_IsUndefined(pv)) continue   /* undefined 属性被省略 */
+                            if (!first) sb.append(',')
+                            first = false
                             sb.append(jsonQuote(rt.toStringValue(k)))
                             sb.append(':')
-                            jsonStringify(ctx, rt, rt.getProperty(v, k), sb, seen)
+                            jsonStringify(ctx, rt, pv, sb, seen)
                         }
                         sb.append('}')
                     }
@@ -1350,4 +1902,60 @@ fun jsNumberToString(d: Double): String {
         return d.toLong().toString()
     }
     return d.toString()
+}
+
+/* Number.prototype.toExponential：digits 为 null 时输出最短尾数 */
+fun jsToExponential(d: Double, digits: Int?): String {
+    if (d.isNaN()) return "NaN"
+    if (d == Double.POSITIVE_INFINITY) return "Infinity"
+    if (d == Double.NEGATIVE_INFINITY) return "-Infinity"
+    val sign = if (d < 0 || (d == 0.0 && 1.0 / d < 0)) "-" else ""
+    val a = Math.abs(d)
+    var bd = java.math.BigDecimal(a).stripTrailingZeros()
+    if (bd.signum() == 0) {
+        val mant = if (digits == null || digits == 0) "0" else "0." + "0".repeat(digits)
+        return "$sign${mant}e+0"
+    }
+    if (digits != null) {
+        bd = bd.round(java.math.MathContext(digits + 1, java.math.RoundingMode.HALF_UP))
+            .stripTrailingZeros()
+        if (bd.signum() == 0) {
+            val mant = if (digits == 0) "0" else "0." + "0".repeat(digits)
+            return "$sign${mant}e+0"
+        }
+    }
+    var unscaled = bd.unscaledValue().abs().toString()
+    val exp = unscaled.length - 1 - bd.scale()
+    val mant: String = if (digits == null) {
+        if (unscaled.length == 1) unscaled else unscaled[0] + "." + unscaled.substring(1)
+    } else {
+        if (unscaled.length < digits + 1) unscaled = unscaled + "0".repeat(digits + 1 - unscaled.length)
+        if (digits == 0) unscaled.substring(0, 1) else unscaled[0] + "." + unscaled.substring(1, digits + 1)
+    }
+    val esign = if (exp >= 0) "+" else "-"
+    return sign + mant + "e" + esign + Math.abs(exp)
+}
+
+fun jsToPrecision(d: Double, p: Int): String {
+    if (d.isNaN() || d == Double.POSITIVE_INFINITY || d == Double.NEGATIVE_INFINITY || d == 0.0) {
+        return jsNumberToString(d)
+    }
+    val a = Math.abs(d)
+    val bd0 = java.math.BigDecimal(a).stripTrailingZeros()
+    val exp = bd0.unscaledValue().abs().toString().length - 1 - bd0.scale()
+    if (exp < -6 || exp >= p) return jsToExponential(d, p - 1)
+    val sign = if (d < 0) "-" else ""
+    val bd = bd0.round(java.math.MathContext(p, java.math.RoundingMode.HALF_UP))
+    var s = bd.toPlainString()
+    val digitsBefore = if (exp >= 0) exp + 1 else 1
+    val frac = (p - digitsBefore).coerceAtLeast(0)
+    if (frac == 0) {
+        s = s.substringBefore('.')
+    } else {
+        val dot = s.indexOf('.')
+        val cur = if (dot < 0) 0 else s.length - dot - 1
+        if (cur < frac) s = (if (dot < 0) "$s." else s) + "0".repeat(frac - cur)
+        else if (cur > frac) s = s.substring(0, dot + 1 + frac)
+    }
+    return sign + s
 }

@@ -58,6 +58,9 @@ fun JS_NewContext(mem: ByteArray, memSize: Int, stdlib: JSSTDLibraryDef): JSCont
     // -0 的唯一表示（JS_NewFloat64 依赖；延迟创建会与 GC 保活交叉，提前分配）
     ctx.minusZero = allocFloat64(ctx, -0.0)
     
+    /* 长期 JVM 根列表（bind 等）始终参与 GC 标记与搬移 */
+    ctx.jvmRoots.add(ctx.persistentRoots)
+    
     // 标准库引导（对照 C 的 mqjs_stdlib.c；堆过小时跳过）
     JSStdlib.init(ctx, JSRuntime(ctx))
     
