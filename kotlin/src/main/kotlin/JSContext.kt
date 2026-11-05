@@ -64,6 +64,10 @@ class JSContext(
      * 外层与内层统一通过槽读写（对照 C JSVarRef 的 detached 近似语义，
      * 槽值生命周期与上下文一致）。JSGC 作为根遍历 */
     val varrefPool: MutableList<JSValue> = mutableListOf()
+    /* 解释器 JVM 侧根：runBody 的操作数栈与局部变量表是 Kotlin 集合，GC 无法
+     * 自动发现其中的 JSValue；由 runBody 注册后，JSGC 负责标记这些值，并在
+     * 压缩搬移时就地改写集合元素（否则执行期触发 GC 会留下悬垂地址） */
+    val jvmRoots: MutableList<MutableList<JSValue>> = mutableListOf()
     var randomState: Long = 1
     
     var parseState: JSParseState? = null

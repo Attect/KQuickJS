@@ -13,10 +13,13 @@ class JSParser(private val s: JSParseState) {
     private val ctx = s.ctx
     
     /* 函数编译上下文（嵌套栈）：记录已发射的 loc 指令（供闭包捕获时回改）与
-     * 已提升的捕获槽映射。顶层上下文在 parse() 入口压入 */
+     * 已提升的捕获槽映射。顶层上下文在 parse() 入口压入。
+     * curFunc/byteCode 不缓存在字段中，而是固定在 ctx.gcKeepAlive 的槽位里：
+     * 解析期间的分配可能触发 GC 压缩搬移，槽位内容会随搬移更新，字段缓存
+     * 则会变成悬垂地址（长脚本解析崩溃的根因之一） */
     private class LocEmit(val name: String, val byteCode: JSValue, val pos: Int, val isPut: Boolean)
     
-    private class FuncCompileScope(val curFunc: JSValue, val byteCode: JSValue) {
+    private class FuncCompileScope(val keepBase: Int) {
         var localVarsLen = 0                                   /* 本层局部变量数（参数+声明） */
         var byteCodeLen = 0                                    /* 本层已发射长度（emitOp 同步，供捕获回改扫描） */
         val varrefSlots = HashMap<String, Int>()               /* 被内层捕获的局部 var → varref 池槽 */
@@ -25,26 +28,60 @@ class JSParser(private val s: JSParseState) {
     
     private val compileScopes = ArrayDeque<FuncCompileScope>()
     
+    /* 编译作用域入栈：当前函数对象与字节码放入 GC 保活列表（槽位固定），
+     * 作用域存续期间一律通过 scopeCurFunc/scopeByteCode 读取最新地址 */
+    private fun pushCompileScope() {
+        val keepBase = ctx.gcKeepAlive.size
+        ctx.gcKeepAlive.add(s.curFunc)
+        ctx.gcKeepAlive.add(s.byteCode)
+        compileScopes.addLast(FuncCompileScope(keepBase))
+    }
+    
+    private fun popCompileScope() {
+        val scope = compileScopes.removeLast()
+        /* 作用域存续期间的临时保活均已配对弹出，尾部两项必是本作用域的槽 */
+        ctx.gcKeepAlive.removeAt(scope.keepBase + 1)
+        ctx.gcKeepAlive.removeAt(scope.keepBase)
+    }
+    
+    private fun scopeCurFunc(scope: FuncCompileScope): JSValue = ctx.gcKeepAlive[scope.keepBase]
+    
+    private fun scopeByteCode(scope: FuncCompileScope): JSValue = ctx.gcKeepAlive[scope.keepBase + 1]
+    
+    private fun updateScopeByteCode(scope: FuncCompileScope, byteCode: JSValue) {
+        ctx.gcKeepAlive[scope.keepBase + 1] = byteCode
+    }
+    
     fun parse(): JSValue {
-        if (!initFunction()) return JS_EXCEPTION
-        
-        compileScopes.addLast(FuncCompileScope(s.curFunc, s.byteCode))
-        
-        if (s.hasRetval) {
-            s.evalRetIdx = addLocalVar(JS_NewString(ctx, "_ret_"))
+        /* 解析期间把解析状态挂到 ctx：GC 依据它保活并搬移 curFunc/byteCode/token
+         * （对照 C 的 ctx->parse_state），否则长脚本解析中触发的 GC 会让解析器
+         * 持有的 JSValue 变成悬垂地址 */
+        val savedParseState = ctx.parseState
+        ctx.parseState = s
+        try {
+            if (!initFunction()) return JS_EXCEPTION
+            
+            pushCompileScope()
+            try {
+                if (s.hasRetval) {
+                    s.evalRetIdx = addLocalVar(JS_NewString(ctx, "_ret_"))
+                }
+                
+                while (s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
+                    if (!parseStatement()) break
+                }
+            } finally {
+                popCompileScope()
+            }
+            
+            if (s.hasError) {
+                return JS_EXCEPTION
+            }
+            
+            return finalizeFunction()
+        } finally {
+            ctx.parseState = savedParseState
         }
-        
-        while (s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
-            if (!parseStatement()) break
-        }
-        
-        compileScopes.removeLast()
-        
-        if (s.hasError) {
-            return JS_EXCEPTION
-        }
-        
-        return finalizeFunction()
     }
     
     fun initFunction(): Boolean {
@@ -55,6 +92,11 @@ class JSParser(private val s: JSParseState) {
         if (JS_IsException(s.byteCode)) return false
         
         s.byteCodeLen = 0
+        s.lastOpcodePos = -1
+        /* 每个函数独立计数（对照 C reset_parse_state） */
+        s.cpoolLen = 0
+        s.localVarsLen = 0
+        s.evalRetIdx = -1
         s.nextToken()
         return true
     }
@@ -66,10 +108,16 @@ class JSParser(private val s: JSParseState) {
         } else {
             emitOp(OPCodeEnum.OP_return_undef)
         }
+        /* 收缩到精确长度后再挂到函数对象上：块大小由 +4 的长度字段推导，
+         * 容量与长度不一致会让 GC 堆遍历错位（见 shrinkByteArray 注释） */
+        val exactByteCode = shrinkByteArray(s.byteCode, s.byteCodeLen)
+        if (JS_IsException(exactByteCode)) {
+            s.error("out of memory")
+            return JS_EXCEPTION
+        }
+        s.byteCode = exactByteCode
         val funcPtr = JS_VALUE_TO_PTR(s.curFunc)
         ctx.memory.putJSValue(funcPtr + 16, s.byteCode)
-        val byteCodePtr = JS_VALUE_TO_PTR(s.byteCode)
-        ctx.memory.putI32(byteCodePtr + 4, s.byteCodeLen)
         return s.curFunc
     }
     
@@ -176,34 +224,41 @@ class JSParser(private val s: JSParseState) {
                 s.error("expected identifier")
                 return false
             }
-            val name = s.token.value
-            s.nextToken()
-            
-            if (s.isRepl) {
-                // REPL 模式：将变量存储到全局对象
-                // 栈顺序需要是 [obj, val]
-                emitOp(OPCodeEnum.OP_push_this)  // 先压入全局对象
+            /* 变量名要跨初始化表达式使用：初始化里的字符串常量等分配可能触发
+             * GC 搬移，故放入保活槽，之后一律从槽位读取最新地址 */
+            val nameKeepIdx = ctx.gcKeepAlive.size
+            ctx.gcKeepAlive.add(s.token.value)
+            try {
+                s.nextToken()
                 
-                if (s.token.val1 == '='.code) {
-                    s.nextToken()
-                    if (!parseAssignExpr()) return false
+                if (s.isRepl) {
+                    // REPL 模式：将变量存储到全局对象
+                    // 栈顺序需要是 [obj, val]
+                    emitOp(OPCodeEnum.OP_push_this)  // 先压入全局对象
+                    
+                    if (s.token.val1 == '='.code) {
+                        s.nextToken()
+                        if (!parseAssignExpr()) return false
+                    } else {
+                        emitOp(OPCodeEnum.OP_undefined)
+                    }
+                    
+                    val cidx = addConstPool(ctx.gcKeepAlive[nameKeepIdx])
+                    emitOpWithArg(OPCodeEnum.OP_put_field, cidx)
                 } else {
-                    emitOp(OPCodeEnum.OP_undefined)
+                    // 正常模式：将变量存储到局部变量（顶层脚本亦为顶层函数帧的局部）
+                    if (s.token.val1 == '='.code) {
+                        s.nextToken()
+                        if (!parseAssignExpr()) return false
+                    } else {
+                        emitOp(OPCodeEnum.OP_undefined)
+                    }
+                    
+                    val idx = addLocalVar(ctx.gcKeepAlive[nameKeepIdx])
+                    emitOpWithArg(OPCodeEnum.OP_put_loc, idx)
                 }
-                
-                val cidx = addConstPool(name)
-                emitOpWithArg(OPCodeEnum.OP_put_field, cidx)
-            } else {
-                // 正常模式：将变量存储到局部变量（顶层脚本亦为顶层函数帧的局部）
-                if (s.token.val1 == '='.code) {
-                    s.nextToken()
-                    if (!parseAssignExpr()) return false
-                } else {
-                    emitOp(OPCodeEnum.OP_undefined)
-                }
-                
-                val idx = addLocalVar(name)
-                emitOpWithArg(OPCodeEnum.OP_put_loc, idx)
+            } finally {
+                ctx.gcKeepAlive.removeAt(nameKeepIdx)
             }
             
         } while (s.token.val1 == ','.code && run { s.nextToken(); true })
@@ -219,67 +274,94 @@ class JSParser(private val s: JSParseState) {
             s.error("expected function name")
             return false
         }
-        val funcName = s.token.value
-        s.nextToken()
-        
-        val savedFunc = s.curFunc
-        val savedByteCode = s.byteCode
-        val savedByteCodeLen = s.byteCodeLen
-        val savedLocalVarsLen = s.localVarsLen
-        val savedEvalRetIdx = s.evalRetIdx
-        
-        s.curFunc = allocFunctionBytecode()
-        if (JS_IsException(s.curFunc)) {
-            s.curFunc = savedFunc
-            return false
+        /* 函数名要跨整个函数体编译使用：入 GC 保活列表，后续分配触发搬移时
+         * 仍从槽位读取最新地址 */
+        val nameKeepIdx = ctx.gcKeepAlive.size
+        ctx.gcKeepAlive.add(s.token.value)
+        try {
+            s.nextToken()
+            
+            val savedByteCodeLen = s.byteCodeLen
+            val savedLocalVarsLen = s.localVarsLen
+            val savedEvalRetIdx = s.evalRetIdx
+            val savedCpoolLen = s.cpoolLen
+            
+            s.curFunc = allocFunctionBytecode()
+            if (JS_IsException(s.curFunc)) {
+                s.curFunc = scopeCurFunc(compileScopes.last())
+                return false
+            }
+            
+            setFunctionName(s.curFunc, ctx.gcKeepAlive[nameKeepIdx])
+            
+            s.byteCode = allocByteArray(256)
+            if (JS_IsException(s.byteCode)) {
+                s.curFunc = scopeCurFunc(compileScopes.last())
+                s.byteCode = scopeByteCode(compileScopes.last())
+                return false
+            }
+            s.byteCodeLen = 0
+            s.localVarsLen = 0
+            /* 常量池长度按函数独立计数（对照 C reset_parse_state 的 s->cpool_len = 0）：
+             * 若沿用外层计数，内层函数的大量常量会把计数器撑大，回到外层后
+             * addConstPool 会越界读取外层常量池数组，把堆内任意数据当作 JSValue
+             * 解引用（长脚本 IndexOutOfBoundsException 的根因） */
+            s.cpoolLen = 0
+            s.evalRetIdx = -1
+            
+            /* 函数编译上下文入栈（闭包捕获的回改作用域）——byteCode 为本层对象，
+               内层捕获本层变量时据此回改本层已发射的 get_loc/put_loc */
+            pushCompileScope()
+            try {
+                expect('('.code)
+                val argCount = parseParams()
+                expect(')'.code)
+                
+                setArgCount(s.curFunc, argCount)
+                
+                expect('{'.code)
+                while (s.token.val1 != '}'.code && s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
+                    if (!parseStatement()) break
+                }
+                expect('}'.code)
+                
+                emitOp(OPCodeEnum.OP_return_undef)
+                
+                /* 收缩到精确长度：块大小按 +4 长度字段推导，容量大于长度会使
+                 * GC 堆遍历错位并破坏堆（对照 C 的 js_shrink_byte_array） */
+                val exactByteCode = shrinkByteArray(s.byteCode, s.byteCodeLen)
+                if (JS_IsException(exactByteCode)) {
+                    s.error("out of memory")
+                } else {
+                    s.byteCode = exactByteCode
+                }
+                val newFuncPtr = JS_VALUE_TO_PTR(s.curFunc)
+                ctx.memory.putJSValue(newFuncPtr + 16, s.byteCode)
+            } finally {
+                popCompileScope()
+            }
+            
+            val newFunc = s.curFunc
+            /* 恢复外层编译状态：curFunc/byteCode 从外层作用域的保活槽读取，
+             * 避免使用编译内层期间可能已被 GC 搬移的旧地址 */
+            s.curFunc = scopeCurFunc(compileScopes.last())
+            s.byteCode = scopeByteCode(compileScopes.last())
+            s.byteCodeLen = savedByteCodeLen
+            s.localVarsLen = savedLocalVarsLen
+            s.evalRetIdx = savedEvalRetIdx
+            s.cpoolLen = savedCpoolLen
+            
+            val cpoolIdx = addConstPool(newFunc)
+            emitOpWithArg(OPCodeEnum.OP_fclosure, cpoolIdx)
+            
+            /* 函数名绑定：闭包对象存入局部变量（fclosure 压栈后写入，对照 C 的函数声明 hoisting） */
+            val nameIdx = addLocalVar(ctx.gcKeepAlive[nameKeepIdx])
+            emitOpWithArg(OPCodeEnum.OP_put_loc, nameIdx)
+            
+            return !s.hasError
+        } finally {
+            ctx.gcKeepAlive.removeAt(nameKeepIdx)
         }
-        
-        setFunctionName(s.curFunc, funcName)
-        
-        s.byteCode = allocByteArray(256)
-        s.byteCodeLen = 0
-        s.localVarsLen = 0
-        s.evalRetIdx = -1
-        
-        /* 函数编译上下文入栈（闭包捕获的回改作用域）——byteCode 为本层对象，
-           内层捕获本层变量时据此回改本层已发射的 get_loc/put_loc */
-        compileScopes.addLast(FuncCompileScope(s.curFunc, s.byteCode))
-        
-        expect('('.code)
-        val argCount = parseParams()
-        expect(')'.code)
-        
-        setArgCount(s.curFunc, argCount)
-        
-        expect('{'.code)
-        while (s.token.val1 != '}'.code && s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
-            if (!parseStatement()) break
-        }
-        expect('}'.code)
-        
-        emitOp(OPCodeEnum.OP_return_undef)
-        
-        val newFuncPtr = JS_VALUE_TO_PTR(s.curFunc)
-        ctx.memory.putJSValue(newFuncPtr + 16, s.byteCode)
-        val byteCodePtr = JS_VALUE_TO_PTR(s.byteCode)
-        ctx.memory.putI32(byteCodePtr + 4, s.byteCodeLen)
-        
-        val newFunc = s.curFunc
-        s.curFunc = savedFunc
-        s.byteCode = savedByteCode
-        s.byteCodeLen = savedByteCodeLen
-        s.localVarsLen = savedLocalVarsLen
-        s.evalRetIdx = savedEvalRetIdx
-        compileScopes.removeLast()
-        
-        val cpoolIdx = addConstPool(newFunc)
-        emitOpWithArg(OPCodeEnum.OP_fclosure, cpoolIdx)
-        
-        /* 函数名绑定：闭包对象存入局部变量（fclosure 压栈后写入，对照 C 的函数声明 hoisting） */
-        val nameIdx = addLocalVar(funcName)
-        emitOpWithArg(OPCodeEnum.OP_put_loc, nameIdx)
-        
-        return !s.hasError
     }
     
     fun parseParams(): Int {
@@ -1186,10 +1268,10 @@ class JSParser(private val s: JSParseState) {
                         s.error("expected identifier after '.'")
                         return false
                     }
-                    val name = s.token.value
+                    /* 属性名在消费 token 前先入常量池：后续词法分析可能触发 GC */
+                    val idx = addConstPool(s.token.value)
                     s.nextToken()
                     /* 先按普通属性读取发射（消费 obj），若后续紧跟 ( 再回改为 get_field2 */
-                    val idx = addConstPool(name)
                     emitOpWithArg(OPCodeEnum.OP_get_field, idx)
                 }
                 else -> break
@@ -1348,10 +1430,17 @@ class JSParser(private val s: JSParseState) {
                 return true
             }
             JSTokenVal.TOK_IDENT.value -> {
-                val name = s.token.value
-                s.nextToken()
-                /* 变量访问统一发射：局部 get_loc / 捕获 get_var_ref / 全局 get_global */
-                emitVarLoad(name)
+                /* 后续 token 的词法分析（如关键字 in/instanceof）也会分配字符串并
+                 * 可能触发 GC：变量名放入保活槽后再消费 token */
+                val nameKeepIdx = ctx.gcKeepAlive.size
+                ctx.gcKeepAlive.add(s.token.value)
+                try {
+                    s.nextToken()
+                    /* 变量访问统一发射：局部 get_loc / 捕获 get_var_ref / 全局 get_global */
+                    emitVarLoad(ctx.gcKeepAlive[nameKeepIdx])
+                } finally {
+                    ctx.gcKeepAlive.removeAt(nameKeepIdx)
+                }
                 return true
             }
             JSTokenVal.TOK_NULL.value -> {
@@ -1401,23 +1490,13 @@ class JSParser(private val s: JSParseState) {
         emitOpWithArg(OPCodeEnum.OP_object, 0)
         
         while (s.token.val1 != '}'.code && s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
-            val key: JSValue
-            when (s.token.val1) {
-                JSTokenVal.TOK_IDENT.value -> {
-                    key = s.token.value
-                    s.nextToken()
-                }
-                JSTokenVal.TOK_STRING.value -> {
-                    key = s.token.value
-                    s.nextToken()
-                }
-                else -> {
-                    s.error("expected property name")
-                    return false
-                }
+            if (s.token.val1 != JSTokenVal.TOK_IDENT.value && s.token.val1 != JSTokenVal.TOK_STRING.value) {
+                s.error("expected property name")
+                return false
             }
-            
-            val keyIdx = addConstPool(key)
+            /* 属性名在消费 token 前先入常量池：后续词法分析可能触发 GC 搬移 */
+            val keyIdx = addConstPool(s.token.value)
+            s.nextToken()
             
             if (s.token.val1 == ':'.code) {
                 s.nextToken()
@@ -1456,57 +1535,72 @@ class JSParser(private val s: JSParseState) {
     fun parseFunctionExpr(): Boolean {
         s.nextToken()
         
-        val savedFunc = s.curFunc
-        val savedByteCode = s.byteCode
         val savedByteCodeLen = s.byteCodeLen
         val savedLocalVarsLen = s.localVarsLen
         val savedEvalRetIdx = s.evalRetIdx
+        val savedCpoolLen = s.cpoolLen
         
         s.curFunc = allocFunctionBytecode()
         if (JS_IsException(s.curFunc)) {
-            s.curFunc = savedFunc
+            s.curFunc = scopeCurFunc(compileScopes.last())
             return false
         }
         
         s.byteCode = allocByteArray(256)
+        if (JS_IsException(s.byteCode)) {
+            s.curFunc = scopeCurFunc(compileScopes.last())
+            s.byteCode = scopeByteCode(compileScopes.last())
+            return false
+        }
         s.byteCodeLen = 0
         s.localVarsLen = 0
+        /* 常量池长度按函数独立计数（见 parseFunctionDecl 中的说明） */
+        s.cpoolLen = 0
         s.evalRetIdx = -1
         
         /* 函数编译上下文入栈（闭包捕获的回改作用域）——byteCode 为本层对象 */
-        compileScopes.addLast(FuncCompileScope(s.curFunc, s.byteCode))
-        
-        if (s.token.val1 == JSTokenVal.TOK_IDENT.value) {
-            setFunctionName(s.curFunc, s.token.value)
-            s.nextToken()
+        pushCompileScope()
+        try {
+            if (s.token.val1 == JSTokenVal.TOK_IDENT.value) {
+                setFunctionName(s.curFunc, s.token.value)
+                s.nextToken()
+            }
+            
+            expect('('.code)
+            val argCount = parseParams()
+            expect(')'.code)
+            
+            setArgCount(s.curFunc, argCount)
+            
+            expect('{'.code)
+            while (s.token.val1 != '}'.code && s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
+                if (!parseStatement()) break
+            }
+            expect('}'.code)
+            
+            emitOp(OPCodeEnum.OP_return_undef)
+            
+            /* 收缩到精确长度（同 parseFunctionDecl 的说明） */
+            val exactByteCode = shrinkByteArray(s.byteCode, s.byteCodeLen)
+            if (JS_IsException(exactByteCode)) {
+                s.error("out of memory")
+            } else {
+                s.byteCode = exactByteCode
+            }
+            val newFuncPtr = JS_VALUE_TO_PTR(s.curFunc)
+            ctx.memory.putJSValue(newFuncPtr + 16, s.byteCode)
+        } finally {
+            popCompileScope()
         }
-        
-        expect('('.code)
-        val argCount = parseParams()
-        expect(')'.code)
-        
-        setArgCount(s.curFunc, argCount)
-        
-        expect('{'.code)
-        while (s.token.val1 != '}'.code && s.token.val1 != JSTokenVal.TOK_EOF.value && !s.hasError) {
-            if (!parseStatement()) break
-        }
-        expect('}'.code)
-        
-        emitOp(OPCodeEnum.OP_return_undef)
-        
-        val newFuncPtr = JS_VALUE_TO_PTR(s.curFunc)
-        ctx.memory.putJSValue(newFuncPtr + 16, s.byteCode)
-        val byteCodePtr = JS_VALUE_TO_PTR(s.byteCode)
-        ctx.memory.putI32(byteCodePtr + 4, s.byteCodeLen)
         
         val newFunc = s.curFunc
-        s.curFunc = savedFunc
-        s.byteCode = savedByteCode
+        /* 恢复外层编译状态：从外层作用域的保活槽读取最新地址 */
+        s.curFunc = scopeCurFunc(compileScopes.last())
+        s.byteCode = scopeByteCode(compileScopes.last())
         s.byteCodeLen = savedByteCodeLen
         s.localVarsLen = savedLocalVarsLen
         s.evalRetIdx = savedEvalRetIdx
-        compileScopes.removeLast()
+        s.cpoolLen = savedCpoolLen
         
         val cpoolIdx = addConstPool(newFunc)
         emitOpWithArg(OPCodeEnum.OP_fclosure, cpoolIdx)
@@ -1605,7 +1699,14 @@ class JSParser(private val s: JSParseState) {
         val size = ctx.memory.getI32(ptr + 4)
         if (s.byteCodeLen + n > size) {
             val newSize = maxOf(size * 2, s.byteCodeLen + n)
-            s.byteCode = resizeByteArray(s.byteCode, newSize)
+            val newByteCode = resizeByteArray(s.byteCode, newSize)
+            if (JS_IsException(newByteCode)) {
+                s.error("out of memory")
+                return
+            }
+            s.byteCode = newByteCode
+            /* 当前作用域保存的捕获回改目标必须同步到新对象（旧数组已被替换） */
+            compileScopes.lastOrNull()?.let { updateScopeByteCode(it, newByteCode) }
         }
     }
     
@@ -1616,14 +1717,42 @@ class JSParser(private val s: JSParseState) {
         return JS_VALUE_FROM_PTR(ptr)
     }
     
+    /* 扩容字节码数组。
+     * malloc 可能触发 GC 压缩搬移，val1 在搬移后必须从保活槽重读，
+     * 否则会从旧地址拷贝数据（长脚本解析期内存搬移导致的悬垂引用） */
     fun resizeByteArray(val1: JSValue, newSize: Int): JSValue {
-        val oldPtr = JS_VALUE_TO_PTR(val1)
-        val oldSize = ctx.memory.getI32(oldPtr + 4)
-        val newPtr = ctx.malloc(8 + newSize, JS_MTAG_BYTE_ARRAY)
-        if (newPtr == 0) return JS_EXCEPTION
-        ctx.memory.putI32(newPtr + 4, newSize)
-        ctx.memory.copy(oldPtr + 8, newPtr + 8, minOf(oldSize, newSize))
-        return JS_VALUE_FROM_PTR(newPtr)
+        ctx.gcKeepAlive.add(val1)
+        try {
+            val oldPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            val oldSize = ctx.memory.getI32(oldPtr + 4)
+            val newPtr = ctx.malloc(8 + newSize, JS_MTAG_BYTE_ARRAY)
+            if (newPtr == 0) return JS_EXCEPTION
+            ctx.memory.putI32(newPtr + 4, newSize)
+            val srcPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            ctx.memory.copy(srcPtr + 8, newPtr + 8, minOf(oldSize, newSize))
+            return JS_VALUE_FROM_PTR(newPtr)
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
+    }
+    
+    /* 把字节码数组收缩到精确长度（对照 C js_shrink_byte_array）。
+     * 关键：内存层的块大小是按 BYTE_ARRAY 的 +4 长度字段推导的。编译期数组
+     * 分配的是容量（如 256），若只把 +4 改成已用长度而不收缩块，GC 遍历堆时
+     * 会按较小长度计算块大小并错位，把后续堆块当成别的对象，最终读写越界
+     * ——长脚本在解析后触发 GC 时崩溃的根因之一 */
+    fun shrinkByteArray(val1: JSValue, newSize: Int): JSValue {
+        ctx.gcKeepAlive.add(val1)
+        try {
+            val newPtr = ctx.malloc(8 + newSize, JS_MTAG_BYTE_ARRAY)
+            if (newPtr == 0) return JS_EXCEPTION
+            ctx.memory.putI32(newPtr + 4, newSize)
+            val srcPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            ctx.memory.copy(srcPtr + 8, newPtr + 8, newSize)
+            return JS_VALUE_FROM_PTR(newPtr)
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
     }
     
     fun allocFunctionBytecode(): JSValue {
@@ -1650,34 +1779,62 @@ class JSParser(private val s: JSParseState) {
     }
     
     fun addConstPool(val1: JSValue): Int {
-        val ptr = JS_VALUE_TO_PTR(s.curFunc)
-        var cpool = ctx.memory.getJSValue(ptr + 24)
-        
-        if (JS_IsNull(cpool)) {
-            cpool = allocValueArray(16)
-            ctx.memory.putJSValue(ptr + 24, cpool)
+        /* 常量索引以 u16 编码（OP_push_const/OP_*_field 的操作数），与 C 一致
+         * 在超限时报错，避免索引被截断后指向错误常量 */
+        if (s.cpoolLen > 0xFFFF) {
+            s.error("too many constants")
+            return 0
         }
         
-        val cpoolPtr = JS_VALUE_TO_PTR(cpool)
-        
-        for (i in 0 until s.cpoolLen) {
-            val existing = ctx.memory.getJSValue(cpoolPtr + 8 + i * 8)
-            if (jsValueEquals(ctx, existing, val1)) return i
+        /* 分配可能触发 GC 压缩搬移：val1 入保活列表，之后一律从槽位读取最新地址 */
+        ctx.gcKeepAlive.add(val1)
+        try {
+            var cpool = ctx.memory.getJSValue(JS_VALUE_TO_PTR(s.curFunc) + 24)
+            
+            if (JS_IsNull(cpool)) {
+                cpool = allocValueArray(16)
+                if (JS_IsException(cpool)) {
+                    s.error("out of memory")
+                    return 0
+                }
+                ctx.memory.putJSValue(JS_VALUE_TO_PTR(s.curFunc) + 24, cpool)
+            }
+            
+            var cpoolPtr = JS_VALUE_TO_PTR(cpool)
+            val capacity = ctx.memory.getI32(cpoolPtr + 4)
+            val value = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
+            
+            /* 只在数组容量内比较。cpoolLen 若因缺陷大于容量，旧实现会把堆内
+             * 任意 8 字节当作 JSValue 解引用（长脚本 IndexOutOfBoundsException
+             * 的直接触发点），这里做防御性截断 */
+            val scanLen = minOf(s.cpoolLen, capacity)
+            for (i in 0 until scanLen) {
+                val existing = ctx.memory.getJSValue(cpoolPtr + 8 + i * 8)
+                if (jsValueEquals(ctx, existing, value)) return i
+            }
+            
+            val idx = s.cpoolLen
+            if (idx >= capacity) {
+                /* 容量至少覆盖 idx+1：常量池计数跨函数泄漏时 size*2 仍可能不足，
+                 * 会越界写入相邻堆块 */
+                val newSize = maxOf(capacity * 2, idx + 1)
+                cpool = resizeValueArray(cpool, newSize)
+                if (JS_IsException(cpool)) {
+                    s.error("out of memory")
+                    return 0
+                }
+                ctx.memory.putJSValue(JS_VALUE_TO_PTR(s.curFunc) + 24, cpool)
+                cpoolPtr = JS_VALUE_TO_PTR(cpool)
+            }
+            
+            val writeVal = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
+            ctx.memory.putJSValue(cpoolPtr + 8 + idx * 8, writeVal)
+            s.cpoolLen++
+            
+            return idx
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
         }
-        
-        val size = ctx.memory.getI32(cpoolPtr + 4)
-        val idx = s.cpoolLen
-        
-        if (idx >= size) {
-            cpool = resizeValueArray(cpool, size * 2)
-            ctx.memory.putJSValue(ptr + 24, cpool)
-        }
-        
-        val newCpoolPtr = JS_VALUE_TO_PTR(cpool)
-        ctx.memory.putJSValue(newCpoolPtr + 8 + idx * 8, val1)
-        s.cpoolLen++
-        
-        return idx
     }
     
     fun jsValueEquals(ctx: JSContext, a: JSValue, b: JSValue): Boolean {
@@ -1694,45 +1851,82 @@ class JSParser(private val s: JSParseState) {
         val ptr = ctx.malloc(8 + size * 8, JS_MTAG_VALUE_ARRAY)
         if (ptr == 0) return JS_EXCEPTION
         ctx.memory.putI32(ptr + 4, size)
+        /* 新槽位初始化为 undefined（对照 C js_alloc_value_array）：未初始化槽
+         * 里的任意堆数据被当作 JSValue 解引用会造成越界访问 */
+        for (i in 0 until size) {
+            ctx.memory.putJSValue(ptr + 8 + i * 8, JS_UNDEFINED)
+        }
         return JS_VALUE_FROM_PTR(ptr)
     }
     
+    /* 扩容值数组。malloc 可能触发 GC 压缩搬移，val1 必须经保活槽在搬移后
+     * 重新取址，否则会从旧地址拷贝数据 */
     fun resizeValueArray(val1: JSValue, newSize: Int): JSValue {
-        val oldPtr = JS_VALUE_TO_PTR(val1)
-        val oldSize = ctx.memory.getI32(oldPtr + 4)
-        val newPtr = ctx.malloc(8 + newSize * 8, JS_MTAG_VALUE_ARRAY)
-        if (newPtr == 0) return JS_EXCEPTION
-        ctx.memory.putI32(newPtr + 4, newSize)
-        for (i in 0 until minOf(oldSize, newSize)) {
-            ctx.memory.putJSValue(newPtr + 8 + i * 8, ctx.memory.getJSValue(oldPtr + 8 + i * 8))
+        ctx.gcKeepAlive.add(val1)
+        try {
+            val oldPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            val oldSize = ctx.memory.getI32(oldPtr + 4)
+            val newPtr = ctx.malloc(8 + newSize * 8, JS_MTAG_VALUE_ARRAY)
+            if (newPtr == 0) return JS_EXCEPTION
+            ctx.memory.putI32(newPtr + 4, newSize)
+            val srcPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            val copyLen = minOf(oldSize, newSize)
+            for (i in 0 until copyLen) {
+                ctx.memory.putJSValue(newPtr + 8 + i * 8, ctx.memory.getJSValue(srcPtr + 8 + i * 8))
+            }
+            /* 剩余槽位初始化为 undefined（对照 C js_alloc_value_array 的 init_base） */
+            for (i in copyLen until newSize) {
+                ctx.memory.putJSValue(newPtr + 8 + i * 8, JS_UNDEFINED)
+            }
+            return JS_VALUE_FROM_PTR(newPtr)
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
         }
-        return JS_VALUE_FROM_PTR(newPtr)
     }
     
     fun addLocalVar(name: JSValue): Int {
-        val ptr = JS_VALUE_TO_PTR(s.curFunc)
-        var vars = ctx.memory.getJSValue(ptr + 32)
-        
-        if (JS_IsNull(vars)) {
-            vars = allocValueArray(16)
-            ctx.memory.putJSValue(ptr + 32, vars)
+        if (s.localVarsLen >= JS_MAX_LOCAL_VARS) {
+            s.error("too many local variables")
+            return 0
         }
         
-        val varsPtr = JS_VALUE_TO_PTR(vars)
-        val size = ctx.memory.getI32(varsPtr + 4)
-        val idx = s.localVarsLen
-        
-        if (idx >= size) {
-            vars = resizeValueArray(vars, size * 2)
-            ctx.memory.putJSValue(ptr + 32, vars)
+        /* 分配可能触发 GC 搬移：name 入保活列表，写入时取最新地址 */
+        ctx.gcKeepAlive.add(name)
+        try {
+            var vars = ctx.memory.getJSValue(JS_VALUE_TO_PTR(s.curFunc) + 32)
+            
+            if (JS_IsNull(vars)) {
+                vars = allocValueArray(16)
+                if (JS_IsException(vars)) {
+                    s.error("out of memory")
+                    return 0
+                }
+                ctx.memory.putJSValue(JS_VALUE_TO_PTR(s.curFunc) + 32, vars)
+            }
+            
+            var varsPtr = JS_VALUE_TO_PTR(vars)
+            val capacity = ctx.memory.getI32(varsPtr + 4)
+            val idx = s.localVarsLen
+            
+            if (idx >= capacity) {
+                val newSize = maxOf(capacity * 2, idx + 1)
+                vars = resizeValueArray(vars, newSize)
+                if (JS_IsException(vars)) {
+                    s.error("out of memory")
+                    return 0
+                }
+                ctx.memory.putJSValue(JS_VALUE_TO_PTR(s.curFunc) + 32, vars)
+                varsPtr = JS_VALUE_TO_PTR(vars)
+            }
+            
+            ctx.memory.putJSValue(varsPtr + 8 + idx * 8, ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            s.localVarsLen++
+            compileScopes.lastOrNull()?.localVarsLen = s.localVarsLen
+            
+            return idx
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
         }
-        
-        val newVarsPtr = JS_VALUE_TO_PTR(vars)
-        ctx.memory.putJSValue(newVarsPtr + 8 + idx * 8, name)
-        s.localVarsLen++
-        compileScopes.lastOrNull()?.localVarsLen = s.localVarsLen
-        
-        return idx
     }
     
     fun findLocalVar(name: JSValue): Int {
@@ -1741,7 +1935,8 @@ class JSParser(private val s: JSParseState) {
         if (JS_IsNull(vars)) return -1
         
         val varsPtr = JS_VALUE_TO_PTR(vars)
-        for (i in 0 until s.localVarsLen) {
+        val capacity = ctx.memory.getI32(varsPtr + 4)
+        for (i in 0 until minOf(s.localVarsLen, capacity)) {
             val v = ctx.memory.getJSValue(varsPtr + 8 + i * 8)
             if (jsStringEquals(ctx, v, name)) return i
         }
@@ -1755,7 +1950,8 @@ class JSParser(private val s: JSParseState) {
         if (JS_IsNull(vars)) return -1
         
         val varsPtr = JS_VALUE_TO_PTR(vars)
-        for (i in 0 until count) {
+        val capacity = ctx.memory.getI32(varsPtr + 4)
+        for (i in 0 until minOf(count, capacity)) {
             val v = ctx.memory.getJSValue(varsPtr + 8 + i * 8)
             if (jsStringEquals(ctx, v, name)) return i
         }
@@ -1765,65 +1961,76 @@ class JSParser(private val s: JSParseState) {
     /* 标识符变量读取的统一发射：局部 → get_loc；已捕获/可捕获的外层变量 → get_var_ref；
      * 未声明 → get_global（未找到属性时运行时抛 ReferenceError） */
     private fun emitVarLoad(name: JSValue): Boolean {
-        val nameStr = jsGetString(ctx, name)
-        
-        val localIdx = findLocalVar(name)
-        if (localIdx >= 0) {
-            /* 本层变量若已被提升（内层捕获）则走 varref 槽 */
-            val scope = compileScopes.lastOrNull()
-            val slot = scope?.varrefSlots?.get(nameStr)
-            if (slot != null) {
-                emitOpWithArg(OPCodeEnum.OP_get_var_ref, slot)
-            } else {
-                emitOpWithArg(OPCodeEnum.OP_get_loc, localIdx)
+        /* 查找捕获变量时可能分配字符串并触发 GC：名字入保活槽，统一从槽位读取 */
+        ctx.gcKeepAlive.add(name)
+        try {
+            val nameStr = jsGetString(ctx, ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            
+            val localIdx = findLocalVar(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            if (localIdx >= 0) {
+                /* 本层变量若已被提升（内层捕获）则走 varref 槽 */
+                val scope = compileScopes.lastOrNull()
+                val slot = scope?.varrefSlots?.get(nameStr)
+                if (slot != null) {
+                    emitOpWithArg(OPCodeEnum.OP_get_var_ref, slot)
+                } else {
+                    emitOpWithArg(OPCodeEnum.OP_get_loc, localIdx)
+                }
+                if (System.getenv("MQJS_TRACE") != null) {
+                    println("DBG load '$nameStr' local=$localIdx slot=$slot scopes=${compileScopes.size}")
+                }
+                return true
             }
+            
+            /* 沿函数编译栈向外查找可捕获的外层局部变量 */
+            val captured = tryCaptureOuterVar(nameStr)
+            if (captured >= 0) {
+                emitOpWithArg(OPCodeEnum.OP_get_var_ref, captured)
+                if (System.getenv("MQJS_TRACE") != null) {
+                    println("DBG load '$nameStr' captured=$captured scopes=${compileScopes.size}")
+                }
+                return true
+            }
+            
+            /* 未声明的全局标识符 */
+            val cidx = addConstPool(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            emitOpWithArg(OPCodeEnum.OP_get_global, cidx)
             if (System.getenv("MQJS_TRACE") != null) {
-                println("DBG load '$nameStr' local=$localIdx slot=$slot scopes=${compileScopes.size}")
+                println("DBG load '$nameStr' global=$cidx scopes=${compileScopes.size}")
             }
             return true
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
         }
-        
-        /* 沿函数编译栈向外查找可捕获的外层局部变量 */
-        val captured = tryCaptureOuterVar(nameStr)
-        if (captured >= 0) {
-            emitOpWithArg(OPCodeEnum.OP_get_var_ref, captured)
-            if (System.getenv("MQJS_TRACE") != null) {
-                println("DBG load '$nameStr' captured=$captured scopes=${compileScopes.size}")
-            }
-            return true
-        }
-        
-        /* 未声明的全局标识符 */
-        val cidx = addConstPool(name)
-        emitOpWithArg(OPCodeEnum.OP_get_global, cidx)
-        if (System.getenv("MQJS_TRACE") != null) {
-            println("DBG load '$nameStr' global=$cidx scopes=${compileScopes.size}")
-        }
-        return true
     }
     
     /* 标识符变量写入的统一发射：局部 → put_loc；捕获槽 → put_var_ref；全局 → put_global */
     private fun emitVarStore(name: JSValue, valueLoaded: Boolean): Boolean {
-        val nameStr = jsGetString(ctx, name)
-        
-        val localIdx = findLocalVar(name)
-        if (localIdx >= 0) {
+        ctx.gcKeepAlive.add(name)
+        try {
+            val nameStr = jsGetString(ctx, ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            
+            val localIdx = findLocalVar(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            if (localIdx >= 0) {
+                if (!valueLoaded) emitOp(OPCodeEnum.OP_dup)
+                emitOpWithArg(OPCodeEnum.OP_put_loc, localIdx)
+                return true
+            }
+            
+            val captured = tryCaptureOuterVar(nameStr)
+            if (captured >= 0) {
+                if (!valueLoaded) emitOp(OPCodeEnum.OP_dup)
+                emitOpWithArg(OPCodeEnum.OP_put_var_ref, captured)
+                return true
+            }
+            
             if (!valueLoaded) emitOp(OPCodeEnum.OP_dup)
-            emitOpWithArg(OPCodeEnum.OP_put_loc, localIdx)
+            val cidx = addConstPool(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            emitOpWithArg(OPCodeEnum.OP_put_global, cidx)
             return true
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
         }
-        
-        val captured = tryCaptureOuterVar(nameStr)
-        if (captured >= 0) {
-            if (!valueLoaded) emitOp(OPCodeEnum.OP_dup)
-            emitOpWithArg(OPCodeEnum.OP_put_var_ref, captured)
-            return true
-        }
-        
-        if (!valueLoaded) emitOp(OPCodeEnum.OP_dup)
-        val cidx = addConstPool(name)
-        emitOpWithArg(OPCodeEnum.OP_put_global, cidx)
-        return true
     }
     
     /* 内层引用外层局部变量：分配捕获槽并回改外层已发射的 loc 指令（对照 C
@@ -1836,12 +2043,15 @@ class JSParser(private val s: JSParseState) {
             val existing = scope.varrefSlots[nameStr]
             if (existing != null) return existing
             
+            /* JS_NewString 可能触发 GC 搬移：作用域内函数/字节码地址在分配后
+             * 从保活槽重新读取 */
             val name = JS_NewString(ctx, nameStr)
-            val localIdx = findLocalVarIn(scope.curFunc, scope.localVarsLen, name)
+            if (JS_IsException(name)) return -1
+            val localIdx = findLocalVarIn(scopeCurFunc(scope), scope.localVarsLen, name)
             if (localIdx >= 0) {
                 val slot = ctx.varrefPool.size.also { ctx.varrefPool.add(JS_UNDEFINED) }
                 scope.varrefSlots[nameStr] = slot
-                rewriteLocToVarRef(scope.byteCode, scope.byteCodeLen, localIdx, slot)
+                rewriteLocToVarRef(scopeByteCode(scope), scope.byteCodeLen, localIdx, slot)
                 return slot
             }
         }

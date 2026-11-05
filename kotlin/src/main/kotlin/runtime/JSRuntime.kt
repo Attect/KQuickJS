@@ -65,21 +65,20 @@ class JSRuntime(private val ctx: JSContext) {
         var pc = 0
         val stack = mutableListOf<JSValue>()
         val vars = MutableList(varsSize) { JS_UNDEFINED }
+        /* 操作数栈与局部变量表是 JVM 集合，GC 无法自动发现其中的值：
+         * 注册为根，压缩搬移时由 JSGC 就地改写（否则执行期触发 GC 后
+         * 集合里会残留悬垂地址，表现为 "not a function"、越界访问等） */
+        val rootBase = ctx.jvmRoots.size
+        ctx.jvmRoots.add(stack)
+        ctx.jvmRoots.add(vars)
         /* 函数参数填入 vars 前段（bytecode 头 u16 的高位存 argCount） */
         val argCount = ctx.memory.getU16(funcPtr) shr 4
         for (i in 0 until minOf(args.size, argCount, varsSize)) {
             vars[i] = args[i]
         }
-        var loopCount = 0
-        val maxLoopCount = 100000
         
         try {
         while (pc < code.size) {
-            loopCount++
-            if (loopCount > maxLoopCount) {
-                println("Error: Infinite loop detected, pc=$pc, op=${code[pc].toInt() and 0xFF}")
-                return JS_EXCEPTION
-            }
             
             /* GC 可能在上一条指令的分配中触发并搬移对象：从保活列表刷新
              * func 的最新地址（funcPtr 随之重算）；thisObj 由 OP_push_this
@@ -653,7 +652,8 @@ class JSRuntime(private val ctx: JSContext) {
             }
         }
         } finally {
-            /* 移除本层的 func/thisObj/args 保活（递归时每层有自己的 keepStart 区间） */
+            /* 注销本帧的 JVM 侧根与 func/thisObj/args 保活 */
+            while (ctx.jvmRoots.size > rootBase) ctx.jvmRoots.removeAt(ctx.jvmRoots.size - 1)
             while (ctx.gcKeepAlive.size > keepStart) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
         }
         

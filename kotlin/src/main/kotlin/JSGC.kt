@@ -40,6 +40,13 @@ object JSGC {
             gcMark(ctx, markStack, v)
         }
         
+        /* 解释器 JVM 侧根：调用帧的操作数栈与局部变量表 */
+        for (roots in ctx.jvmRoots) {
+            for (v in roots) {
+                gcMark(ctx, markStack, v)
+            }
+        }
+        
         for (i in ctx.classProto.indices) {
             gcMark(ctx, markStack, ctx.classProto[i])
             gcMark(ctx, markStack, ctx.classObj[i])
@@ -72,7 +79,10 @@ object JSGC {
             val ps = ctx.parseState!!
             gcMark(ctx, markStack, ps.sourceStr)
             gcMark(ctx, markStack, ps.filenameStr)
-            gcMark(ctx, markStack, ps.tokenValue)
+            /* 当前 token 的值（对照 C：gc_mark_root(s, ps->token.value)）——
+             * 词法分析分配新 token 字符串时可能触发 GC，旧 token 值仍被解析器
+             * 局部变量引用，必须作为根保活并随压缩搬移更新 */
+            gcMark(ctx, markStack, ps.token.value)
             gcMark(ctx, markStack, ps.curFunc)
             gcMark(ctx, markStack, ps.byteCode)
         }
@@ -400,6 +410,14 @@ object JSGC {
             ctx.varrefPool[i] = remapValue(ctx.varrefPool[i])
         }
         
+        /* 解释器调用帧的操作数栈/局部变量表就地更新（Kotlin 集合无法参与
+         * C 版根区域遍历，必须逐元素改写） */
+        for (roots in ctx.jvmRoots) {
+            for (i in roots.indices) {
+                roots[i] = remapValue(roots[i])
+            }
+        }
+        
         for (i in ctx.classProto.indices) {
             ctx.classProto[i] = remapValue(ctx.classProto[i])
             ctx.classObj[i] = remapValue(ctx.classObj[i])
@@ -434,7 +452,7 @@ object JSGC {
             val ps = ctx.parseState!!
             ps.sourceStr = remapValue(ps.sourceStr)
             ps.filenameStr = remapValue(ps.filenameStr)
-            ps.tokenValue = remapValue(ps.tokenValue)
+            ps.token.value = remapValue(ps.token.value)
             ps.curFunc = remapValue(ps.curFunc)
             ps.byteCode = remapValue(ps.byteCode)
         }

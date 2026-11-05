@@ -462,6 +462,93 @@ GraalVM Native Image 相关配置文件位于 `src/main/resources/META-INF/nativ
 | `native-image.properties` | 构建参数 |
 | `proxy-config.json` | 动态代理配置 |
 
+## 长脚本 `IndexOutOfBoundsException` 修复（2026-11）
+
+### 现象
+
+执行“长”JavaScript 脚本（数千字符、含多个函数与字符串常量）时，解析阶段崩溃：
+
+```
+IndexOutOfBoundsException
+  at Memory.getU8 (Memory.kt:15)
+  at MemoryBlock.getMTag (MemoryBlock.kt:24)
+  at JSObject.JS_IsString (JSObject.kt:144)
+  at JSParser.jsValueEquals (JSParser.kt)
+  at JSParser.addConstPool (JSParser.kt)
+  at JSParser.parseFunctionDecl/parsePostfixExpr ...
+```
+
+短脚本正常，脚本越长越容易触发；与宿主调用方式无关。
+
+### 复现用例
+
+外层函数含 1 个字符串常量，内层函数含 60 个字符串常量，内层结束后外层再取 1 个常量：
+
+```js
+function outer() {
+  var a = "outerA";
+  function inner() {
+    var x0 = "inner_const_0";
+    // ... x1 ~ x59
+    return x59;
+  }
+  var b = "outerB";
+  return inner() + b;
+}
+var r = outer();
+```
+
+修复前在 `addConstPool` 的常量查重循环中稳定抛 `IndexOutOfBoundsException`。
+
+### 根因
+
+1. **常量池计数跨函数泄漏（直接触发点）**
+   `JSParseState.cpoolLen` 是全局字段，编译内层函数时没有保存/清零/恢复
+   （C 的 `reset_parse_state` 会置 `cpool_len = 0`）。内层函数的大量常量把
+   计数器撑大后回到外层，`addConstPool` 的查重循环按错误的长度读取外层常量池
+   数组，把堆内任意 8 字节当作 `JSValue` 解引用；其 tag 位恰好像指针时即越界
+   访问内存（`getMTag` 传入超大/负偏移）。
+2. **常量池扩容不足**
+   扩容使用 `size * 2`，当计数已远超容量时仍不足以覆盖 `idx + 1`，会越界写入
+   相邻堆块。C 的实现每次保证容量至少为 `cpool_len + 1`。
+3. **字节码数组长度与块容量不一致（堆错位）**
+   编译期字节码数组按容量分配（如 256），结束时只把数组的 `+4` 字段改成“已用
+   长度”而不收缩块。Kotlin 内存层按该字段推导块大小，GC 遍历堆时按较小长度
+   计算块大小并错位，把后续堆块当成别的对象，最终导致 GC 标记/压缩读写越界。
+   C 通过 `js_shrink_byte_array` 真正收缩块，Kotlin 版缺少该步骤。
+4. **GC 根缺失**
+   解析器的 `curFunc`/`byteCode`/`token.value` 与解释器的操作数栈、局部变量表
+   都存放在 JVM 对象/集合中，GC 无法自动发现。长脚本解析/执行期间一旦触发 GC
+   压缩搬移，这些位置会残留悬垂地址。
+5. **词法器不跳过注释后的空白**
+   `nextToken` 消费注释后没有回到“跳过空白”的循环开头，注释后的空白/换行被
+   当成独立 token，导致任何含注释的脚本解析失败（长脚本通常都带注释）。
+
+### 修复内容
+
+| 文件 | 修复 |
+|------|------|
+| `parser/JSParser.kt` | 每个函数独立保存/清零/恢复 `cpoolLen`、`localVarsLen`、`evalRetIdx`（对照 C `reset_parse_state`） |
+| `parser/JSParser.kt` | `addConstPool`：按容量截断查重、扩容到 `max(capacity*2, idx+1)`、超过 65535 报 “too many constants”、分配期间用保活槽刷新值 |
+| `parser/JSParser.kt` | 新增 `shrinkByteArray`：函数编译结束时把字节码数组收缩到精确长度（对照 `js_shrink_byte_array`），保证块大小与长度字段一致 |
+| `parser/JSParser.kt` | 解析期间设置 `ctx.parseState`；`FuncCompileScope` 用固定保活槽保存 `curFunc`/`byteCode`；变量名/属性名/函数名跨分配使用保活槽 |
+| `parser/JSLexer.kt` | `skipComment` 返回“是否消费了注释”，`nextToken` 消费注释后重新跳过空白；块注释内换行同步 `gotLf` |
+| `JSGC.kt` | 解析根改为标记 `ps.token.value`（对照 C）；新增 `ctx.jvmRoots` 的标记与搬移改写 |
+| `JSContext.kt` | 新增 `jvmRoots`：解释器 JVM 侧根列表 |
+| `runtime/JSRuntime.kt` | `runBody` 把操作数栈与局部变量表注册为 GC 根；移除 100000 条指令的调试上限（长脚本会被误判为死循环） |
+
+### 回归测试
+
+新增 `kotlin/src/test/kotlin/MQuickJSParserRegressionTest.kt`：
+
+1. `testCommentsAreSkipped`：块注释/行注释/尾随注释；
+2. `testNestedFunctionConstantPoolLength`：嵌套函数常量池计数；
+3. `testLongScriptWithManyFunctionsSurvivesGc`：400 个函数 + 字符串常量，在
+   256KB 堆上触发多轮解析期/执行期 GC。
+
+全部 173 个 Kotlin 测试通过，低内存压力用例（`--memory-limit 256K/512K`）
+不再崩溃；内存确实不足时返回 “out of memory” 解析错误而不是越界异常。
+
 ## 相关文件
 
 - `kotlin/src/main/kotlin/runtime/JSRuntime.kt` - Kotlin 运行时实现
@@ -473,6 +560,7 @@ GraalVM Native Image 相关配置文件位于 `src/main/resources/META-INF/nativ
 - `kotlin/src/test/kotlin/MQuickJSClosureTest.kt` - 闭包测试用例
 - `kotlin/src/test/kotlin/MQuickJSBuiltinTest.kt` - 内置函数测试用例
 - `kotlin/src/test/kotlin/MQuickJSFileTest.kt` - JS文件执行测试用例
+- `kotlin/src/test/kotlin/MQuickJSParserRegressionTest.kt` - 长脚本/GC 回归测试
 - `mquickjs.c` - C 语言原始实现（参考）
 
 ## 更新历史
@@ -482,3 +570,4 @@ GraalVM Native Image 相关配置文件位于 `src/main/resources/META-INF/nativ
 - **2024-02-13**：创建完整的测试套件，包含 124 个测试用例
 - **2024-02-14**：创建 Kotlin 命令行程序，实现与 C 语言版本类似的功能
 - **2024-02-14**：配置 GraalVM Native Image 支持，实现多平台原生二进制构建
+- **2026-11-05**：修复长脚本解析/执行崩溃（常量池计数泄漏、字节码数组块大小、解析期与执行期 GC 根、注释跳过）

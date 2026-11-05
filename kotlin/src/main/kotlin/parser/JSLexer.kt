@@ -139,7 +139,6 @@ class JSParseState(
     
     var sourceStr: JSValue = JS_NULL
     var filenameStr: JSValue = JS_NULL
-    var tokenValue: JSValue = JS_NULL
     
     val keywords = mapOf(
         "null" to JSTokenVal.TOK_NULL,
@@ -219,6 +218,9 @@ class JSParseState(
         }
     }
     
+    /* 跳过（并消费）一个注释。返回是否消费了注释：
+     * 调用方在消费注释后必须重新跳过空白并重新取 token，否则会把注释后的
+     * 空白/换行当成一个独立 token（此前任何含注释的脚本都会解析失败） */
     fun skipComment(): Boolean {
         if (peekChar() == '/'.code) {
             when (peekChar(1)) {
@@ -230,6 +232,10 @@ class JSParseState(
                             advance()
                             advance()
                             return true
+                        }
+                        /* 块注释内的换行同样影响自动分号插入的 gotLf 语义 */
+                        if (peekChar() == '\n'.code) {
+                            gotLf = true
                         }
                         advance()
                     }
@@ -246,7 +252,7 @@ class JSParseState(
                 }
             }
         }
-        return true
+        return false
     }
     
     fun nextToken() {
@@ -255,7 +261,11 @@ class JSParseState(
         gotLf = false
         while (true) {
             skipWhitespace()
-            if (!skipComment()) return
+            /* 注释与空白可交替出现：消费注释后回到循环开头重新跳过空白 */
+            if (skipComment()) {
+                if (hasError) return
+                continue
+            }
             
             token.sourcePos = bufPos
             token.value = JS_NULL
