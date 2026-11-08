@@ -648,8 +648,8 @@ var r = outer();
 | 字符串 1M 次 | 18.5s | 10.7s |
 | 合计 | 342.8s | 95~100s（约 3.4~3.6 倍；JVM/JIT 波动约 ±5%） |
 
-完整 `microbench.js` 在本轮优化后运行通过：退出码 0，耗时约 393s，
-末行 `total 529025.50`；包含新增的 bigint64_arith / bigint256_arith 基准
+完整 `microbench.js` 在本轮优化后运行通过：退出码 0，耗时约 383s，
+末行 `total 508200.70`；包含 bigint64_arith / bigint256_arith 基准
 （sort_bench 已正常收尾）。
 
 ### 可配置栈与调用深度（2026-11 第六期）
