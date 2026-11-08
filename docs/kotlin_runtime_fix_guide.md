@@ -651,16 +651,30 @@ var r = outer();
 完整 `microbench.js` 在本轮优化后运行通过：退出码 0，耗时约 368s，
 末行 `total 472425.60`（其中 sort_bench 已正常收尾）。
 
+### Set 与 BigInt（2026-11 第五期）
+
+- **Set**：新增 `JS_CLASS_SET`（class id 28，`JS_CLASS_USER` 顺延为 29），
+  内部用隐藏数组保存元素（+24 槽，GC 标记/搬移）；实现
+  `add/has/delete/clear/forEach/values/keys/entries/size`，构造器可接受数组；
+  SameValueZero 语义（NaN 视为相同）。
+- **BigInt**：支持十/十六/二/八进制 `n` 字面量、`BigInt()` 转换、
+  `+ - * / % ** << >> & | ^ ~`、关系/相等比较、`typeof "bigint"`、
+  `toString(radix)/valueOf/toLocaleString`、`BigInt.asIntN/asUintN`；
+  与 Number 混用抛 TypeError，除法/取模按向零截断。
+  受 3 位块头 mtag 限制，BigInt 值用 **detached VARREF 块 + 魔数** 承载，
+  `BigInteger` 本体存于 `userOpaqueTable`（GC 释放清理、搬移更新 key）。
+- `microbench.js` 的 `bigint64_arith`/`bigint256_arith` 基准已可运行并通过。
+
 ### 已知限制
 
-1. 256KB 堆下 600 个全局函数（含标准库）仍会 OOM；800 个在解析期即 OOM。
-   回归测试使用 400 函数；
-2. `Set`/`BigInt` 未实现（microbench 有 `typeof` 守卫可跳过 BigInt，
-   `Set` 基准在测试列表中被注释掉）；
-3. 默认 `Array.prototype.sort` 的快速路径仅覆盖原始值元素；含对象元素或自定义
+1. 小堆回归场景改为 **512KB 堆 + 1000 个全局函数**（通过）；更大规模（1500+）
+   仍会 OOM；
+2. 默认 `Array.prototype.sort` 的快速路径仅覆盖原始值元素；含对象元素或自定义
    比较函数时走通用路径（正确但较慢）；
-4. 解释器仍是逐指令分发的 Kotlin 循环，虽经超级指令优化，单条指令成本仍显著高于
-   C 版；如需进一步接近 C 性能，需要更彻底的分发/代码生成改造。
+3. 解释器仍是逐指令分发的 Kotlin 循环，虽经超级指令优化，单条指令成本仍显著高于
+   C 版；如需进一步接近 C 性能，需要更彻底的分发/代码生成改造；
+4. BigInt 移位/指数计数需落在 Int 范围内（超大计数报 RangeError），
+   且当前 `>>>`、JSON 序列化 BigInt 等边缘语义未覆盖。
 
 ## 相关文件
 
@@ -688,3 +702,4 @@ var r = outer();
 - **2026-11-05**：错误回溯行列号与严格模式语义（pc2line 表、SyntaxError stack、未声明赋值 ReferenceError、null 访问 TypeError、异常统一展开）
 - **2026-11-05**：Array 默认排序快速路径、setElement 扩容 GC 保活；五个 JS 测试文件与 Kotlin 全量测试全部通过
 - **2026-11-08**：内存/性能对齐（惰性闭包原型、标准库阈值 160KB、数组几何扩容、原生执行栈与帧栈、字节码缓存、peephole 超级指令；bench 约 3.5 倍提升）
+- **2026-11-08**：实现 Set 与 BigInt；小堆回归扩大到 512KB/1000 函数；microbench bigint 基准可运行
