@@ -1888,7 +1888,7 @@ class JSParser(private val s: JSParseState) {
                 } else {
                     emitOpWithArg(OPCodeEnum.OP_call_constructor, 0)
                 }
-                return true
+                return parseSuffixes()
             }
         }
         
@@ -1897,7 +1897,11 @@ class JSParser(private val s: JSParseState) {
     
     fun parsePostfixExpr(): Boolean {
         if (!parseMemberExpr()) return false
-        
+        return parseSuffixes()
+    }
+    
+    /* 后缀链：属性/索引/调用/自增。new 表达式之后也要继续解析（new F().x） */
+    private fun parseSuffixes(): Boolean {
         while (true) {
             when (s.token.val1) {
                 JSTokenVal.TOK_INC.value -> {
@@ -1957,7 +1961,6 @@ class JSParser(private val s: JSParseState) {
                 else -> break
             }
         }
-        
         return true
     }
     

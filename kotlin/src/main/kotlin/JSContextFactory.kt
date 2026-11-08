@@ -67,6 +67,14 @@ fun JS_NewContext(mem: ByteArray, memSize: Int, stdlib: JSSTDLibraryDef): JSCont
     return ctx
 }
 
+/* 全局可配置限制（CLI --stack-size / --max-call-depth，或环境变量） */
+object KQuickJSOptions {
+    var evalStackSizeBytes: Long =
+        System.getenv("KQJS_STACK_SIZE")?.toLongOrNull()?.coerceAtLeast(256L * 1024)
+            ?: (64L * 1024 * 1024)
+    var maxCallDepth: Int =
+        System.getenv("KQJS_MAX_CALL_DEPTH")?.toIntOrNull()?.coerceAtLeast(16) ?: 1000
+}
 fun JS_Eval(ctx: JSContext, code: String, filename: String, flags: Int): JSValue {
     /* 深嵌套源码（如 1000 层括号）会让递归下降解析器耗尽 JVM 栈：
      * 解析阶段栈溢出时改用大栈线程重试（执行阶段不重试，避免副作用重复） */
@@ -77,7 +85,7 @@ fun JS_Eval(ctx: JSContext, code: String, filename: String, flags: Int): JSValue
     } catch (e: StackOverflowError) {
         if (phase != 0) throw e
         var out: JSValue = JS_EXCEPTION
-        val th = Thread(null, { out = evalImpl() }, "kqjs-eval-big-stack", 64L * 1024 * 1024)
+        val th = Thread(null, { out = evalImpl() }, "kqjs-eval-big-stack", KQuickJSOptions.evalStackSizeBytes)
         th.start()
         th.join()
         out

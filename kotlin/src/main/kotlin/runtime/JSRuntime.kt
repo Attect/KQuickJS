@@ -33,9 +33,18 @@ class JSRuntime(private val ctx: JSContext) {
     fun run(func: JSValue, thisObj: JSValue): JSValue = run(func, thisObj, emptyList())
     
     fun run(func: JSValue, thisObj: JSValue, args: List<JSValue>, closure: JSValue = JS_UNDEFINED): JSValue {
-        /* 调用帧信息由 runBody 的 ctx.frames 维护；错误回溯时再解码函数名/行号，
-         * 避免每次函数调用都分配 Kotlin 字符串（热路径开销） */
-        return runBody(func, thisObj, args, closure)
+        /* 可配置的最大调用深度：超过时抛 RangeError（避免 JVM StackOverflow） */
+        if (++ctx.callDepth > KQuickJSOptions.maxCallDepth) {
+            ctx.callDepth--
+            return JS_ThrowRangeError(ctx, "maximum call stack size exceeded")
+        }
+        try {
+            /* 调用帧信息由 runBody 的 ctx.frames 维护；错误回溯时再解码函数名/行号，
+             * 避免每次函数调用都分配 Kotlin 字符串（热路径开销） */
+            return runBody(func, thisObj, args, closure)
+        } finally {
+            ctx.callDepth--
+        }
     }
     
     private fun runBody(func: JSValue, thisObj: JSValue, args: List<JSValue>,
@@ -818,10 +827,22 @@ class JSRuntime(private val ctx: JSContext) {
                     /* for-of：迭代数组元素。迭代器结构同 for-in（[数组对象, pos]） */
                     val obj = stack.pop()
                     var ok = false
+                    var iterSource = obj
                     if (JS_IsPtr(obj)) {
                         val p = JS_VALUE_TO_PTR(obj)
-                        ok = ctx.memory.getMTag(p) == JSMTags.JS_MTAG_OBJECT &&
-                             ctx.memory.getU8(p + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value
+                        if (ctx.memory.getMTag(p) == JSMTags.JS_MTAG_OBJECT) {
+                            val cid = ctx.memory.getU8(p + 2)
+                            if (cid == JSObjectClassEnum.JS_CLASS_ARRAY.value) {
+                                ok = true
+                            } else if (cid == JSObjectClassEnum.JS_CLASS_SET.value) {
+                                /* for-of Set：迭代其内部数组快照 */
+                                val inner = ctx.memory.getJSValue(p + 24)
+                                if (JS_IsPtr(inner)) {
+                                    ok = true
+                                    iterSource = inner
+                                }
+                            }
+                        }
                     }
                     if (!ok) {
                         val r = JS_ThrowTypeError(ctx, "unsupported type in for...of")
@@ -831,7 +852,7 @@ class JSRuntime(private val ctx: JSContext) {
                             pc = target
                         }
                     } else {
-                        ctx.gcKeepAlive.add(obj)
+                        ctx.gcKeepAlive.add(iterSource)
                         try {
                             val iter = allocValueArray(2)
                             if (JS_IsNull(iter) || JS_IsException(iter)) return JS_EXCEPTION
@@ -1429,6 +1450,9 @@ class JSRuntime(private val ctx: JSContext) {
     fun doBinOp(kind: Int, a: JSValue, b: JSValue): JSValue {
         if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) {
             if (kind == OPCodeEnum.OP_add.id) return doAdd(a, b)
+            if (kind == OPCodeEnum.OP_shr.id) {
+                return JS_ThrowTypeError(ctx, "BigInts have no unsigned right shift, use >> instead")
+            }
             val op = OPCodeEnum.entries.find { it.id == kind } ?: return JS_UNDEFINED
             return bigIntBinary(op, a, b)
         }
@@ -1524,7 +1548,9 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun doShr(a: JSValue, b: JSValue): JSValue {
-        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) return bigIntBinary(OPCodeEnum.OP_shr, a, b)
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) {
+            return JS_ThrowTypeError(ctx, "BigInts have no unsigned right shift, use >> instead")
+        }
         val ia = toUInt32(a)
         val ib = toInt32(b) and 31
         return JS_NewFloat64(ctx, (ia shr ib).toDouble())

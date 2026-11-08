@@ -35,6 +35,8 @@ class JSContext(
     var minusZero: JSValue = JS_NULL
     /* BigInt 原型（BigInt 值是 BIGINT mtag，非 OBJECT，属性查找需单独路由） */
     var bigIntProto: JSValue = JS_NULL
+    /* 当前 JS 调用深度（用于可配置的最大调用深度限制） */
+    var callDepth: Int = 0
     
     val classProto: LongArray = LongArray(classCount)
     val classObj: LongArray = LongArray(classCount)

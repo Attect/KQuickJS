@@ -375,7 +375,9 @@ object JSStdlib {
 
         defMethod(ctx, rt, objCtor, "getPrototypeOf", 1) { c, _, args ->
             val o = arg(args, 0)
-            if (!JS_IsPtr(o) || c.memory.getMTag(JS_VALUE_TO_PTR(o)) != JSMTags.JS_MTAG_OBJECT) {
+            if (JS_IsBigInt(c, o)) {
+                c.bigIntProto
+            } else if (!JS_IsPtr(o) || c.memory.getMTag(JS_VALUE_TO_PTR(o)) != JSMTags.JS_MTAG_OBJECT) {
                 throwTypeError(c, "not an object")
             } else {
                 c.memory.getJSValue(JS_VALUE_TO_PTR(o) + 8)
@@ -437,6 +439,7 @@ object JSStdlib {
                 JSMTags.JS_MTAG_OBJECT -> {
                     return when (ctx.memory.getU8(p + 2)) {
                         JSObjectClassEnum.JS_CLASS_ARRAY.value -> "[object Array]"
+                        JSObjectClassEnum.JS_CLASS_SET.value -> "[object Set]"
                         JSObjectClassEnum.JS_CLASS_CLOSURE.value,
                         JSObjectClassEnum.JS_CLASS_C_FUNCTION.value -> "[object Function]"
                         JSObjectClassEnum.JS_CLASS_ERROR.value -> "[object Error]"
@@ -1247,7 +1250,13 @@ object JSStdlib {
     private fun initNumber(ctx: JSContext, rt: JSRuntime) {
         val proto = ctx.classProto[JSObjectClassEnum.JS_CLASS_NUMBER.value]
         val numberCtor = native(ctx, 1) { c, _, args ->
-            if (args.isEmpty()) JS_NewShortInt(0) else JS_NewFloat64(c, toNum(c, rt, args[0]))
+            if (args.isEmpty()) {
+                JS_NewShortInt(0)
+            } else if (JS_IsBigInt(c, args[0])) {
+                JS_ThrowTypeError(c, "cannot convert BigInt to number")
+            } else {
+                JS_NewFloat64(c, toNum(c, rt, args[0]))
+            }
         }
         rt.setProperty(numberCtor, JS_NewString(ctx, "prototype"), proto)
         rt.setProperty(proto, JS_NewString(ctx, "constructor"), numberCtor)
@@ -2102,15 +2111,42 @@ object JSStdlib {
             } else {
                 val keep = c.gcKeepAlive.size
                 c.gcKeepAlive.add(obj)
-                val arr = JS_NewArray(c, 0)
-                c.memory.putJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24, arr)
-                if (args.isNotEmpty() && JS_IsPtr(args[0]) &&
-                    c.memory.getMTag(JS_VALUE_TO_PTR(args[0])) == JSMTags.JS_MTAG_OBJECT) {
-                    val src = args[0]
-                    val n = c.memory.getI32(JS_VALUE_TO_PTR(src) + 32)
-                    for (i in 0 until n) addValue(c, c.gcKeepAlive[keep], rt.getElement(src, JS_NewShortInt(i)))
+                try {
+                    val arr = JS_NewArray(c, 0)
+                    c.memory.putJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24, arr)
+                    if (args.isNotEmpty() && !JS_IsUndefined(args[0])) {
+                        val src = args[0]
+                        if (JS_IsString(c, src)) {
+                            val s = jsGetString(c, src)
+                            for (ch in s) addValue(c, c.gcKeepAlive[keep], JS_NewString(c, ch.toString()))
+                        } else if (JS_IsPtr(src) &&
+                            c.memory.getMTag(JS_VALUE_TO_PTR(src)) == JSMTags.JS_MTAG_OBJECT) {
+                            val cid = c.memory.getU8(JS_VALUE_TO_PTR(src) + 2)
+                            if (cid == JSObjectClassEnum.JS_CLASS_SET.value) {
+                                val inner = c.memory.getJSValue(JS_VALUE_TO_PTR(src) + 24)
+                                val n = if (JS_IsPtr(inner))
+                                    c.memory.getI32(JS_VALUE_TO_PTR(inner) + 32) else 0
+                                for (i in 0 until n) {
+                                    addValue(c, c.gcKeepAlive[keep],
+                                             rt.getElement(inner, JS_NewShortInt(i)))
+                                }
+                            } else {
+                                val n = c.memory.getI32(JS_VALUE_TO_PTR(src) + 32)
+                                for (i in 0 until n) {
+                                    addValue(c, c.gcKeepAlive[keep],
+                                             rt.getElement(src, JS_NewShortInt(i)))
+                                }
+                            }
+                        } else {
+                            return@native JS_ThrowTypeError(c, "Set is not iterable")
+                        }
+                    }
+                    c.gcKeepAlive[keep]
+                } finally {
+                    while (c.gcKeepAlive.size > keep) {
+                        c.gcKeepAlive.removeAt(c.gcKeepAlive.size - 1)
+                    }
                 }
-                c.gcKeepAlive[keep]
             }
         }
         rt.setProperty(ctor, JS_NewString(ctx, "prototype"), proto)
@@ -2257,10 +2293,14 @@ object JSStdlib {
                     java.math.BigInteger.valueOf(JS_VALUE_GET_INT(v).toLong())
                 JS_IsShortFloat(v) -> {
                     val d = jsGetShortFloat(v)
-                    if (d != Math.floor(d)) {
+                    if (!d.isFinite() || d != Math.floor(d)) {
                         return@native JS_ThrowRangeError(c, "cannot convert to BigInt: not an integer")
                     }
-                    java.math.BigInteger.valueOf(d.toLong())
+                    try {
+                        java.math.BigDecimal(d).toBigIntegerExact()
+                    } catch (e: ArithmeticException) {
+                        return@native JS_ThrowRangeError(c, "cannot convert to BigInt: not an integer")
+                    }
                 }
                 JS_IsPtr(v) && c.memory.getMTag(JS_VALUE_TO_PTR(v)) == JSMTags.JS_MTAG_FLOAT64 -> {
                     val d = c.memory.getFloat64(JS_VALUE_TO_PTR(v) + 8)
@@ -2311,12 +2351,14 @@ object JSStdlib {
         }
         defMethod(ctx, rt, ctor, "asUintN", 2) { c, _, args ->
             val bits = toInt(c, rt, arg(args, 0))
+            if (bits < 0) return@defMethod JS_ThrowRangeError(c, "invalid bit length")
             val b = JS_GetBigInt(c, arg(args, 1)) ?: return@defMethod JS_ThrowTypeError(c, "not a BigInt")
             val mod = java.math.BigInteger.ONE.shiftLeft(bits)
             JS_NewBigInt(c, b.mod(mod))
         }
         defMethod(ctx, rt, ctor, "asIntN", 2) { c, _, args ->
             val bits = toInt(c, rt, arg(args, 0))
+            if (bits < 0) return@defMethod JS_ThrowRangeError(c, "invalid bit length")
             val b = JS_GetBigInt(c, arg(args, 1)) ?: return@defMethod JS_ThrowTypeError(c, "not a BigInt")
             val mod = java.math.BigInteger.ONE.shiftLeft(bits)
             var v = b.mod(mod)
@@ -2330,8 +2372,13 @@ object JSStdlib {
         defGlobal(ctx, rt, "JSON", json)
         defMethod(ctx, rt, json, "stringify", 3) { c, _, args ->
             val sb = StringBuilder()
-            if (jsonStringify(c, rt, arg(args, 0), sb, HashSet())) JS_NewString(c, sb.toString())
-            else JS_UNDEFINED
+            if (jsonStringify(c, rt, arg(args, 0), sb, HashSet())) {
+                JS_NewString(c, sb.toString())
+            } else if (JS_HasException(c)) {
+                JS_EXCEPTION
+            } else {
+                JS_UNDEFINED
+            }
         }
         defMethod(ctx, rt, json, "parse", 2) { c, _, args ->
             val s = rt.toStringValue(arg(args, 0))
@@ -2344,6 +2391,10 @@ object JSStdlib {
                               sb: StringBuilder, seen: MutableSet<Int>): Boolean {
         if (JS_IsUndefined(v) || JS_IsNull(v)) {
             sb.append("null"); return true
+        }
+        if (JS_IsBigInt(ctx, v)) {
+            JS_ThrowTypeError(ctx, "BigInt value cannot be serialized in JSON")
+            return false
         }
         if (JS_IsBool(v)) {
             sb.append(if (JS_VALUE_GET_SPECIAL_VALUE(v) != 0) "true" else "false"); return true
@@ -2370,7 +2421,9 @@ object JSStdlib {
                         sb.append('[')
                         for (i in 0 until len) {
                             if (i > 0) sb.append(',')
-                            jsonStringify(ctx, rt, rt.getElement(v, JS_NewShortInt(i)), sb, seen)
+                            if (!jsonStringify(ctx, rt, rt.getElement(v, JS_NewShortInt(i)), sb, seen)) {
+                                seen.remove(p); return false
+                            }
                         }
                         sb.append(']')
                     } else {
@@ -2386,7 +2439,9 @@ object JSStdlib {
                             first = false
                             sb.append(jsonQuote(rt.toStringValue(k)))
                             sb.append(':')
-                            jsonStringify(ctx, rt, pv, sb, seen)
+                            if (!jsonStringify(ctx, rt, pv, sb, seen)) {
+                                seen.remove(p); return false
+                            }
                         }
                         sb.append('}')
                     }

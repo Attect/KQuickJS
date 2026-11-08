@@ -652,6 +652,17 @@ var r = outer();
 末行 `total 529025.50`；包含新增的 bigint64_arith / bigint256_arith 基准
 （sort_bench 已正常收尾）。
 
+### 可配置栈与调用深度（2026-11 第六期）
+
+- CLI 新增：
+  - `--stack-size n`：解析期大栈重试线程的栈大小（字节，支持 K/M/G，默认 64M）；
+  - `--max-call-depth n`：JS 最大调用深度（默认 1000，超出抛
+    `RangeError: maximum call stack size exceeded`）。
+- 也可用环境变量 `KQJS_STACK_SIZE` / `KQJS_MAX_CALL_DEPTH` 设置默认值；
+  实现在 `KQuickJSOptions`（`JSContextFactory.kt`），`JS_Eval` 的深嵌套
+  解析重试与 `JSRuntime.run` 的调用深度计数统一读取。
+- 新增 `JsOptionsTest` 覆盖可配置深度（64 层时 500 层递归抛异常）。
+
 ### Set 与 BigInt（2026-11 第五期）
 
 - **Set**：新增 `JS_CLASS_SET`（class id 28，`JS_CLASS_USER` 顺延为 29），
@@ -674,8 +685,11 @@ var r = outer();
    比较函数时走通用路径（正确但较慢）；
 3. 解释器仍是逐指令分发的 Kotlin 循环，虽经超级指令优化，单条指令成本仍显著高于
    C 版；如需进一步接近 C 性能，需要更彻底的分发/代码生成改造；
-4. BigInt 移位/指数计数需落在 Int 范围内（超大计数报 RangeError），
-   且当前 `>>>`、JSON 序列化 BigInt 等边缘语义未覆盖。
+4. BigInt 移位/指数计数需落在 Int 范围内（超大计数报 RangeError）；
+   `BigInt64Array`/TypedArray 的 BigInt 变体未实现；
+5. Set 元素存储为线性数组（add/has/delete 为 O(n)），大数据量下未做哈希索引；
+6. 解析期大栈重试仅覆盖 `JS_Eval` 解析阶段；JS 运行时深递归由
+   `--max-call-depth` 限制，不再依赖 JVM 栈溢出。
 
 ## 相关文件
 
@@ -704,3 +718,4 @@ var r = outer();
 - **2026-11-05**：Array 默认排序快速路径、setElement 扩容 GC 保活；五个 JS 测试文件与 Kotlin 全量测试全部通过
 - **2026-11-08**：内存/性能对齐（惰性闭包原型、标准库阈值 160KB、数组几何扩容、原生执行栈与帧栈、字节码缓存、peephole 超级指令；bench 约 3.5 倍提升）
 - **2026-11-08**：实现 Set 与 BigInt；小堆回归扩大到 512KB/1000 函数；microbench bigint 基准可运行
+- **2026-11-08**：可配置 `--stack-size`/`--max-call-depth`；完善 Set（for-of/构造器/类型标签）与 BigInt（JSON/Number/>>>/asIntN 等边界）

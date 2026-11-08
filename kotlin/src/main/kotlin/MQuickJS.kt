@@ -26,6 +26,8 @@ object MQuickJS {
         var parseFlags = 0
         var outFilename: String? = null
         var allowBytecode = false
+        var cliStackSize = 0
+        var cliMaxCallDepth = 0
         val includeList = mutableListOf<String>()
         
         while (optind < args.size && args[optind].startsWith("-")) {
@@ -95,6 +97,22 @@ object MQuickJS {
                         memSize = parseMemoryLimit(args[optind++])
                         longopt = ""
                     }
+                    longopt == "stack-size" -> {
+                        if (optind >= args.size) {
+                            System.err.println("expecting stack size")
+                            System.exit(1)
+                        }
+                        cliStackSize = parseMemoryLimit(args[optind++])
+                        longopt = ""
+                    }
+                    longopt == "max-call-depth" -> {
+                        if (optind >= args.size) {
+                            System.err.println("expecting max call depth")
+                            System.exit(1)
+                        }
+                        cliMaxCallDepth = args[optind++].toIntOrNull() ?: 0
+                        longopt = ""
+                    }
                     opt == 'd' || longopt == "dump" -> {
                         dumpMemory++
                         longopt = ""
@@ -127,6 +145,9 @@ object MQuickJS {
                 }
             }
         }
+        
+        if (cliStackSize > 0) KQuickJSOptions.evalStackSizeBytes = cliStackSize.toLong()
+        if (cliMaxCallDepth > 0) KQuickJSOptions.maxCallDepth = cliMaxCallDepth
         
         if (outFilename != null) {
             if (optind >= args.size) {
@@ -178,6 +199,8 @@ usage: mqjs [options] [file [args]]
 -I  --include file    include an additional file
 -d  --dump            dump the memory usage stats
     --memory-limit n  limit the memory usage to 'n' bytes
+    --stack-size n    evaluation stack size in bytes (default 64M)
+    --max-call-depth n  maximum JS call depth (default 1000)
 --no-column           no column number in debug information
 -o FILE               save the bytecode to FILE
 -b  --allow-bytecode  allow bytecode in input file
