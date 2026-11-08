@@ -59,7 +59,7 @@ fun JS_NewContext(mem: ByteArray, memSize: Int, stdlib: JSSTDLibraryDef): JSCont
     ctx.minusZero = allocFloat64(ctx, -0.0)
     
     /* 长期 JVM 根列表（bind 等）始终参与 GC 标记与搬移 */
-    ctx.jvmRoots.add(ctx.persistentRoots)
+    ctx.jvmRoots.add(ListRoot(ctx.persistentRoots))
     
     // 标准库引导（对照 C 的 mqjs_stdlib.c；堆过小时跳过）
     JSStdlib.init(ctx, JSRuntime(ctx))

@@ -345,6 +345,7 @@ class JSParser(private val s: JSParseState) {
         }
         /* 收缩到精确长度后再挂到函数对象上：块大小由 +4 的长度字段推导，
          * 容量与长度不一致会让 GC 堆遍历错位（见 shrinkByteArray 注释） */
+        peepholeOptimize()
         val exactByteCode = shrinkByteArray(s.byteCode, s.byteCodeLen)
         if (JS_IsException(exactByteCode)) {
             s.error("out of memory")
@@ -629,7 +630,8 @@ class JSParser(private val s: JSParseState) {
                 
                 /* 收缩到精确长度：块大小按 +4 长度字段推导，容量大于长度会使
                  * GC 堆遍历错位并破坏堆（对照 C 的 js_shrink_byte_array） */
-                val exactByteCode = shrinkByteArray(s.byteCode, s.byteCodeLen)
+                peepholeOptimize()
+        val exactByteCode = shrinkByteArray(s.byteCode, s.byteCodeLen)
                 if (JS_IsException(exactByteCode)) {
                     s.error("out of memory")
                 } else {
@@ -2385,7 +2387,8 @@ class JSParser(private val s: JSParseState) {
             emitOp(OPCodeEnum.OP_return_undef)
             
             /* 收缩到精确长度（同 parseFunctionDecl 的说明） */
-            val exactByteCode = shrinkByteArray(s.byteCode, s.byteCodeLen)
+            peepholeOptimize()
+        val exactByteCode = shrinkByteArray(s.byteCode, s.byteCodeLen)
             if (JS_IsException(exactByteCode)) {
                 s.error("out of memory")
             } else {
@@ -2597,7 +2600,193 @@ class JSParser(private val s: JSParseState) {
         ctx.pc2lineMap[JS_VALUE_TO_PTR(s.curFunc)] = arr
     }
     
-    fun allocFunctionBytecode(): JSValue {        val ptr = ctx.mallocz(72, JS_MTAG_FUNCTION_BYTECODE)
+    /* 读取/写入字节码指定位置的辅助（peephole 使用） */
+    private fun bcU8(pos: Int): Int = ctx.memory.getU8(JS_VALUE_TO_PTR(s.byteCode) + 8 + pos)
+    private fun bcU16(pos: Int): Int = ctx.memory.getU16(JS_VALUE_TO_PTR(s.byteCode) + 8 + pos)
+    private fun bcI32(pos: Int): Int = ctx.memory.getI32(JS_VALUE_TO_PTR(s.byteCode) + 8 + pos)
+    private fun bcPutU8(pos: Int, v: Int) {
+        ctx.memory.putU8(JS_VALUE_TO_PTR(s.byteCode) + 8 + pos, v)
+    }
+    private fun bcPutU16(pos: Int, v: Int) {
+        ctx.memory.putU16(JS_VALUE_TO_PTR(s.byteCode) + 8 + pos, v)
+    }
+    private fun bcPutU32(pos: Int, v: Long) {
+        ctx.memory.putU32(JS_VALUE_TO_PTR(s.byteCode) + 8 + pos, v)
+    }
+
+    /* 解释器超级指令融合（对照 C 的 peephole 优化思路）：
+     * 识别常见的自增/复合赋值/比较跳转序列，替换为单条超级指令；
+     * 新指令占用与原序列相同的字节长度（剩余字节填 NOP），跳转偏移无需修正；
+     * 含跳转目标落点的序列不融合，避免跳过目标。 */
+    private fun peepholeOptimize() {
+        val len = s.byteCodeLen
+        if (len < 8) return
+        val sizeOf = IntArray(256) { 1 }
+        for (e in OPCodeEnum.entries) {
+            if (e.id in 0..255) sizeOf[e.id] = if (e.size > 0) e.size else 1
+        }
+        fun isJump(op: Int) = op == OPCodeEnum.OP_goto.id || op == OPCodeEnum.OP_if_false.id ||
+                              op == OPCodeEnum.OP_if_true.id
+        val targets = HashSet<Int>()
+        var p = 0
+        while (p < len) {
+            val op = bcU8(p)
+            if (isJump(op)) targets.add(p + 5 + bcI32(p + 1))
+            p += sizeOf[op]
+        }
+        fun hasTargetInside(from: Int, toExcl: Int): Boolean {
+            for (t in targets) if (t > from && t < toExcl) return true
+            return false
+        }
+        fun fillNop(from: Int, toExcl: Int) {
+            for (j in from until toExcl) bcPutU8(j, OPCodeEnum.OP_nop.id)
+        }
+        p = 0
+        while (p < len) {
+            val op = bcU8(p)
+            if (op == OPCodeEnum.OP_put_loc.id) {
+                /* i++ / i--（语句上下文） */
+                val tmp = bcU16(p + 1)
+                if (p + 16 <= len &&
+                    bcU8(p + 3) == OPCodeEnum.OP_get_loc.id &&
+                    bcU8(p + 6) == OPCodeEnum.OP_push_1.id &&
+                    (bcU8(p + 7) == OPCodeEnum.OP_add.id || bcU8(p + 7) == OPCodeEnum.OP_sub.id) &&
+                    bcU8(p + 8) == OPCodeEnum.OP_put_loc.id && bcU16(p + 9) == bcU16(p + 4) &&
+                    bcU8(p + 11) == OPCodeEnum.OP_get_loc.id && bcU16(p + 12) == tmp &&
+                    bcU8(p + 14) == OPCodeEnum.OP_plus.id &&
+                    bcU8(p + 15) == OPCodeEnum.OP_drop.id &&
+                    bcU16(p + 4) != tmp && !hasTargetInside(p, p + 16)) {
+                    val idx = bcU16(p + 4)
+                    bcPutU8(p, if (bcU8(p + 7) == OPCodeEnum.OP_add.id) OPCodeEnum.OP_inc_loc.id
+                               else OPCodeEnum.OP_dec_loc.id)
+                    bcPutU16(p + 1, idx)
+                    fillNop(p + 3, p + 16)
+                    p += 16
+                    continue
+                }
+            } else if (op == OPCodeEnum.OP_get_loc.id) {
+                val a = bcU16(p + 1)
+                /* s += b（局部变量） */
+                if (p + 18 <= len &&
+                    bcU8(p + 3) == OPCodeEnum.OP_get_loc.id &&
+                    bcU8(p + 6) == OPCodeEnum.OP_add.id &&
+                    bcU8(p + 7) == OPCodeEnum.OP_dup.id &&
+                    bcU8(p + 8) == OPCodeEnum.OP_put_loc.id &&
+                    bcU8(p + 11) == OPCodeEnum.OP_put_loc.id && bcU16(p + 12) == a &&
+                    bcU8(p + 14) == OPCodeEnum.OP_get_loc.id &&
+                    bcU16(p + 15) == bcU16(p + 9) &&
+                    bcU8(p + 17) == OPCodeEnum.OP_drop.id &&
+                    !hasTargetInside(p, p + 18)) {
+                    bcPutU8(p, OPCodeEnum.OP_add_loc_loc.id)
+                    bcPutU16(p + 1, a)
+                    bcPutU16(p + 3, bcU16(p + 4))
+                    fillNop(p + 5, p + 18)
+                    p += 18
+                    continue
+                }
+                /* s += <小整数> */
+                val pushOp = bcU8(p + 3)
+                var imm = 0
+                var immOk = false
+                if (pushOp in OPCodeEnum.OP_push_0.id..OPCodeEnum.OP_push_7.id) {
+                    imm = pushOp - OPCodeEnum.OP_push_0.id; immOk = true
+                } else if (pushOp == OPCodeEnum.OP_push_i8.id) {
+                    imm = bcU8(p + 4).toByte().toInt(); immOk = true
+                }
+                if (immOk && p + 16 <= len &&
+                    bcU8(p + 4) == OPCodeEnum.OP_add.id &&
+                    bcU8(p + 5) == OPCodeEnum.OP_dup.id &&
+                    bcU8(p + 6) == OPCodeEnum.OP_put_loc.id &&
+                    bcU8(p + 9) == OPCodeEnum.OP_put_loc.id && bcU16(p + 10) == a &&
+                    bcU8(p + 12) == OPCodeEnum.OP_get_loc.id &&
+                    bcU16(p + 13) == bcU16(p + 7) &&
+                    bcU8(p + 15) == OPCodeEnum.OP_drop.id &&
+                    !hasTargetInside(p, p + 16)) {
+                    bcPutU8(p, OPCodeEnum.OP_add_loc_imm.id)
+                    bcPutU16(p + 1, a)
+                    bcPutU8(p + 2, imm and 0xFF)
+                    fillNop(p + 3, p + 16)
+                    p += 16
+                    continue
+                }
+                /* get_loc a; get_loc b; <cmp>; if_false */
+                if (p + 12 <= len && bcU8(p + 3) == OPCodeEnum.OP_get_loc.id &&
+                    bcU8(p + 7) == OPCodeEnum.OP_if_false.id) {
+                    val cmpOp = bcU8(p + 6)
+                    val cmpOk = cmpOp == OPCodeEnum.OP_lt.id || cmpOp == OPCodeEnum.OP_lte.id ||
+                                cmpOp == OPCodeEnum.OP_gt.id || cmpOp == OPCodeEnum.OP_gte.id ||
+                                cmpOp == OPCodeEnum.OP_eq.id || cmpOp == OPCodeEnum.OP_neq.id ||
+                                cmpOp == OPCodeEnum.OP_strict_eq.id || cmpOp == OPCodeEnum.OP_strict_neq.id
+                    if (cmpOk && !hasTargetInside(p, p + 12)) {
+                        val off = bcI32(p + 8)
+                        bcPutU8(p, OPCodeEnum.OP_cmp_loc_loc_jump.id)
+                        bcPutU8(p + 1, cmpOp)
+                        bcPutU16(p + 2, a)
+                        bcPutU16(p + 4, bcU16(p + 4))
+                        bcPutU32(p + 6, off.toLong() and 0xFFFFFFFFL)
+                        fillNop(p + 10, p + 12)
+                        p += 12
+                        continue
+                    }
+                }
+                /* get_loc a; push_imm; <binop> → 融合为 OP_bin_loc_imm（结果压栈） */
+                val binPush = bcU8(p + 3)
+                var binImm = 0
+                var binImmOk = false
+                var binPad = false
+                if (binPush in OPCodeEnum.OP_push_0.id..OPCodeEnum.OP_push_7.id) {
+                    binImm = binPush - OPCodeEnum.OP_push_0.id; binImmOk = true
+                } else if (binPush == OPCodeEnum.OP_push_i8.id) {
+                    binImm = bcU8(p + 4).toByte().toInt(); binImmOk = true; binPad = true
+                }
+                if (binImmOk) {
+                    val opPos = if (binPad) p + 5 else p + 4
+                    val kind = bcU8(opPos)
+                    if (isBinOp(kind) && p + (if (binPad) 6 else 5) <= len &&
+                        !hasTargetInside(p, p + (if (binPad) 6 else 5))) {
+                        val total = if (binPad) 6 else 5
+                        bcPutU8(p, OPCodeEnum.OP_bin_loc_imm.id)
+                        bcPutU8(p + 1, kind or (if (binPad) 0x80 else 0))
+                        bcPutU16(p + 2, a)
+                        bcPutU8(p + 4, binImm and 0xFF)
+                        if (binPad) fillNop(p + 5, p + 6)
+                        p += total
+                        continue
+                    }
+                }
+                /* get_loc a; get_loc b; <binop> → OP_bin_loc_loc（结果压栈） */
+                if (p + 7 <= len && bcU8(p + 3) == OPCodeEnum.OP_get_loc.id) {
+                    val kind = bcU8(p + 6)
+                    if (isBinOp(kind) && !hasTargetInside(p, p + 7)) {
+                        val b = bcU16(p + 4)
+                        bcPutU8(p, OPCodeEnum.OP_bin_loc_loc.id)
+                        bcPutU8(p + 1, kind)
+                        bcPutU16(p + 2, a)
+                        bcPutU16(p + 4, b)
+                        fillNop(p + 6, p + 7)
+                        p += 7
+                        continue
+                    }
+                }
+            }
+            p += sizeOf[op]
+        }
+    }
+    
+    /* 可融合的二元运算 opcode（结果为一个值） */
+    private fun isBinOp(kind: Int): Boolean = when (kind) {
+        OPCodeEnum.OP_add.id, OPCodeEnum.OP_sub.id, OPCodeEnum.OP_mul.id,
+        OPCodeEnum.OP_div.id, OPCodeEnum.OP_mod.id, OPCodeEnum.OP_shl.id,
+        OPCodeEnum.OP_sar.id, OPCodeEnum.OP_shr.id, OPCodeEnum.OP_and.id,
+        OPCodeEnum.OP_or.id, OPCodeEnum.OP_xor.id, OPCodeEnum.OP_lt.id,
+        OPCodeEnum.OP_lte.id, OPCodeEnum.OP_gt.id, OPCodeEnum.OP_gte.id,
+        OPCodeEnum.OP_eq.id, OPCodeEnum.OP_neq.id,
+        OPCodeEnum.OP_strict_eq.id, OPCodeEnum.OP_strict_neq.id -> true
+        else -> false
+    }
+
+    fun allocFunctionBytecode(): JSValue {
+        val ptr = ctx.mallocz(72, JS_MTAG_FUNCTION_BYTECODE)
         if (ptr == 0) return JS_EXCEPTION
         ctx.memory.putJSValue(ptr + 8, JS_NULL)
         ctx.memory.putJSValue(ptr + 16, JS_NULL)
@@ -2824,7 +3013,7 @@ class JSParser(private val s: JSParseState) {
                 } else {
                     emitOpWithArg(OPCodeEnum.OP_get_loc, localIdx)
                 }
-                if (System.getenv("MQJS_TRACE") != null) {
+                if (ctx.traceEnabled) {
                     println("DBG load '$nameStr' local=$localIdx slot=$slot scopes=${compileScopes.size}")
                 }
                 return true
@@ -2834,7 +3023,7 @@ class JSParser(private val s: JSParseState) {
             val captured = tryCaptureOuterVar(nameStr)
             if (captured >= 0) {
                 emitOpWithArg(OPCodeEnum.OP_get_var_ref, captured)
-                if (System.getenv("MQJS_TRACE") != null) {
+                if (ctx.traceEnabled) {
                     println("DBG load '$nameStr' captured=$captured scopes=${compileScopes.size}")
                 }
                 return true
@@ -2846,7 +3035,7 @@ class JSParser(private val s: JSParseState) {
                 if (inTypeof) OPCodeEnum.OP_get_global_undef else OPCodeEnum.OP_get_global,
                 cidx
             )
-            if (System.getenv("MQJS_TRACE") != null) {
+            if (ctx.traceEnabled) {
                 println("DBG load '$nameStr' global=$cidx scopes=${compileScopes.size}")
             }
             return true
@@ -2945,7 +3134,7 @@ class JSParser(private val s: JSParseState) {
             }
             i += e.size
         }
-        if (System.getenv("MQJS_TRACE") != null) {
+        if (ctx.traceEnabled) {
             println("DBG rewrite len=$len localIdx=$localIdx slot=$slot rewritten=$rewritten")
         }
         return rewritten

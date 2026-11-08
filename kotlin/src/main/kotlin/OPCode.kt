@@ -145,7 +145,15 @@ enum class OPCodeEnum(val id: Int, val size: Int, val nPop: Int, val nPush: Int,
     /* typeof 专用：未声明的全局标识符返回 undefined 而不是抛 ReferenceError */
     OP_get_global_undef(128, 3, 0, 1, 7),
     /* 顶层 var/function 声明：总是创建全局属性（赋值走 OP_put_global 的严格检查） */
-    OP_define_global(129, 3, 1, 0, 7);
+    OP_define_global(129, 3, 1, 0, 7),
+    /* 超级指令（解析收尾时由 peephole 生成，字节长度与原序列一致，用 NOP 填充） */
+    OP_inc_loc(130, 3, 0, 0, 7),
+    OP_dec_loc(131, 3, 0, 0, 7),
+    OP_add_loc_loc(132, 5, 0, 0, 7),
+    OP_add_loc_imm(133, 4, 0, 0, 7),
+    OP_cmp_loc_loc_jump(134, 10, 0, 0, 7),
+    OP_bin_loc_imm(135, 5, 0, 1, 7),
+    OP_bin_loc_loc(136, 6, 0, 1, 7);
     
     companion object {
         fun fromId(id: Int): OPCodeEnum? = entries.find { it.id == id }

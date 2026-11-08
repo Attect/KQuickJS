@@ -189,8 +189,8 @@ fun JS_ThrowUncatchable(ctx: JSContext): JSValue {
 
 /* 错误类便捷包装（对照 C JS_ThrowTypeError/RangeError/ReferenceError/SyntaxError/InternalError） */
 fun JS_ThrowTypeError(ctx: JSContext, message: String): JSValue {
-    if (System.getenv("MQJS_THROW_TRACE") != null) {
-        System.err.println("THROW TypeError: $message stack=${ctx.jsCallStack}")
+    if (ctx.throwTraceEnabled) {
+        System.err.println("THROW TypeError: $message stack=${ctx.buildBacktrace()}")
     }
     return ctx.throwError(JSObjectClassEnum.JS_CLASS_TYPE_ERROR, message)
 }

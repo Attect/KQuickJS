@@ -18,7 +18,7 @@ import app.muka.project.kquickjs.runtime.JSRuntime
  */
 object JSStdlib {
 
-    const val MIN_MEM_SIZE = 512 * 1024
+    const val MIN_MEM_SIZE = 160 * 1024
 
     private fun native(ctx: JSContext, length: Int,
                        fn: (JSContext, JSValue, List<JSValue>) -> JSValue): JSValue {
@@ -518,7 +518,9 @@ object JSStdlib {
             val tabPtr = JS_VALUE_TO_PTR(tab)
             val cap = ctx.memory.getI32(tabPtr + 4)
             if (cap < len) {
-                val nt = runtimeResizeArray(ctx, tab, len)
+                /* 几何扩容：避免逐元素 push 时每次重新分配导致的 O(n²) */
+                val newCap = maxOf(len, cap * 2, 8)
+                val nt = runtimeResizeArray(ctx, tab, newCap)
                 if (!JS_IsNull(nt)) ctx.memory.putJSValue(p + 24, nt)
             }
         }
@@ -1898,13 +1900,16 @@ object JSStdlib {
     private fun makeTypedArray(ctx: JSContext, rt: JSRuntime, kind: Int, bpe: Int,
                                bufferObj: JSValue, bufInfo: ArrayBufferInfo,
                                offset: Int, length: Int): JSValue {
-        val obj = JS_NewArray(ctx, length)
+        val obj = JS_NewObjectProtoClass(ctx,
+            ctx.classProto[JSObjectClassEnum.JS_CLASS_ARRAY.value],
+            JSObjectClassEnum.JS_CLASS_TYPED_ARRAY.value, 2)
         if (JS_IsException(obj)) return obj
         val keep = ctx.gcKeepAlive.size
         ctx.gcKeepAlive.add(obj)
         ctx.gcKeepAlive.add(bufferObj)
         try {
             val o = ctx.gcKeepAlive[keep]
+            ctx.memory.putJSValue(JS_VALUE_TO_PTR(o) + 24, JS_NULL)
             ctx.memory.putI32(JS_VALUE_TO_PTR(o) + 32, length)
             rt.setProperty(o, JS_NewString(ctx, "BYTES_PER_ELEMENT"), JS_NewShortInt(bpe))
             rt.setProperty(o, JS_NewString(ctx, "byteOffset"), JS_NewShortInt(offset))
@@ -1947,7 +1952,8 @@ object JSStdlib {
                     else ((info.bytes.size - off) / bpe).coerceAtLeast(0)
                     makeTypedArray(c, rt, kind, bpe, a0, info, off, len)
                 } else if (JS_IsPtr(a0) && c.memory.getMTag(JS_VALUE_TO_PTR(a0)) == JSMTags.JS_MTAG_OBJECT &&
-                           c.memory.getU8(JS_VALUE_TO_PTR(a0) + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value) {
+                           (c.memory.getU8(JS_VALUE_TO_PTR(a0) + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value ||
+                           c.memory.getU8(JS_VALUE_TO_PTR(a0) + 2) == JSObjectClassEnum.JS_CLASS_TYPED_ARRAY.value)) {
                     val len = c.memory.getI32(JS_VALUE_TO_PTR(a0) + 32)
                     val buf = makeArrayBuffer(c, rt, len * bpe)
                     val info = JS_GetOpaque(c, buf) as ArrayBufferInfo

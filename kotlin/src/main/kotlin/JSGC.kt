@@ -42,8 +42,8 @@ object JSGC {
         
         /* 解释器 JVM 侧根：调用帧的操作数栈与局部变量表 */
         for (roots in ctx.jvmRoots) {
-            for (v in roots) {
-                gcMark(ctx, markStack, v)
+            for (i in 0 until roots.rootSize) {
+                gcMark(ctx, markStack, roots.rootGet(i))
             }
         }
         
@@ -130,6 +130,7 @@ object JSGC {
                         /* 对象已释放，清理宿主 opaque 引用表条目 */
                         ctx.userOpaqueTable.remove(ptr1)
                         ctx.pc2lineMap.remove(ptr1)
+                        ctx.byteCodeCache.remove(ptr1)
                     }
                     
                     total += size1
@@ -306,7 +307,7 @@ object JSGC {
             ctx.userOpaqueTable.putAll(remapped)
         }
         
-        /* 函数 pc2line 表的 key 随函数字节码块搬移更新 */
+        /* 函数 pc2line 表 / 字节码缓存的 key 随函数字节码块搬移更新 */
         if (ctx.pc2lineMap.isNotEmpty()) {
             val remapped = HashMap<Int, IntArray>()
             for ((oldPtr, v) in ctx.pc2lineMap) {
@@ -314,6 +315,14 @@ object JSGC {
             }
             ctx.pc2lineMap.clear()
             ctx.pc2lineMap.putAll(remapped)
+        }
+        if (ctx.byteCodeCache.isNotEmpty()) {
+            val remapped = HashMap<Int, ByteArray>()
+            for ((oldPtr, v) in ctx.byteCodeCache) {
+                remapped[moveMap[oldPtr] ?: oldPtr] = v
+            }
+            ctx.byteCodeCache.clear()
+            ctx.byteCodeCache.putAll(remapped)
         }
         
         /* pass2：搬移存活块 */
@@ -439,8 +448,8 @@ object JSGC {
         /* 解释器调用帧的操作数栈/局部变量表就地更新（Kotlin 集合无法参与
          * C 版根区域遍历，必须逐元素改写） */
         for (roots in ctx.jvmRoots) {
-            for (i in roots.indices) {
-                roots[i] = remapValue(roots[i])
+            for (i in 0 until roots.rootSize) {
+                roots.rootSet(i, remapValue(roots.rootGet(i)))
             }
         }
         

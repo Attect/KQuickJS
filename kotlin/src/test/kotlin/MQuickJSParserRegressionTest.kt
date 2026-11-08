@@ -95,7 +95,7 @@ class MQuickJSParserRegressionTest {
      * 且函数声明/调用仍然正确 */
     @Test
     fun testLongScriptWithManyFunctionsSurvivesGc() {
-        val count = 300
+        val count = 400
         val js = StringBuilder()
         for (i in 0 until count) {
             js.append("function f$i() { return \"s$i\"; }\n")
@@ -104,6 +104,6 @@ class MQuickJSParserRegressionTest {
 
         val r = runJS(js.toString(), 256 * 1024)
         assertTrue(JS_IsString(r.ctx, r.value), "结果应为字符串")
-        assertEquals("s0s299", jsGetString(r.ctx, r.value))
+        assertEquals("s0s399", jsGetString(r.ctx, r.value))
     }
 }

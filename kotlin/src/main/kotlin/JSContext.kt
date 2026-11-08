@@ -70,11 +70,35 @@ class JSContext(
     /* 长期 JVM 根（bind 绑定信息等；随上下文存活，不随调用帧弹出） */
     val persistentRoots: MutableList<JSValue> = mutableListOf()
     
-    /* 解释器调用帧：func 在 gcKeepAlive 的槽位 + 当前字节码 pc（用于错误回溯） */
-    class JSFrame(val keep: Int, var pc: Int)
-    val frames: MutableList<JSFrame> = mutableListOf()
+    /* 解释器调用帧：func 在 gcKeepAlive 的槽位 + 当前字节码 pc（用于错误回溯）。
+     * 用原生 IntArray 栈保存，避免每次函数调用分配帧对象 */
+    private var frameKeeps = IntArray(64)
+    private var framePcs = IntArray(64)
+    var frameDepth = 0
+        private set
+
+    fun pushFrame(keep: Int) {
+        if (frameDepth == frameKeeps.size) {
+            frameKeeps = frameKeeps.copyOf(frameDepth * 2)
+            framePcs = framePcs.copyOf(frameDepth * 2)
+        }
+        frameKeeps[frameDepth] = keep
+        framePcs[frameDepth] = 0
+        frameDepth++
+    }
+
+    fun popFrame() { if (frameDepth > 0) frameDepth-- }
+    fun setFramePc(depth: Int, pc: Int) { framePcs[depth] = pc }
+    fun frameKeepAt(i: Int): Int = frameKeeps[i]
+    fun framePcAt(i: Int): Int = framePcs[i]
+    /* 调试开关缓存：避免每条指令调用 System.getenv（热路径开销极大） */
+    val traceEnabled: Boolean = System.getenv("MQJS_TRACE") != null
+    val throwTraceEnabled: Boolean = System.getenv("MQJS_THROW_TRACE") != null
     /* 函数字节码指针 → pc2line 稀疏表 [pc,packed,...]（GC 搬移时同步更新键） */
     val pc2lineMap: MutableMap<Int, IntArray> = HashMap()
+    /* 函数字节码缓存：按函数块指针缓存一份 ByteArray，避免每次调用都从堆复制
+     * （GC 搬移时同步 key，函数释放时清理） */
+    val byteCodeCache: MutableMap<Int, ByteArray> = HashMap()
     
     /* 读取函数字节码 +56 的 pc→(line<<16|col) 稀疏表，二分查找不超过 pc 的最近位置 */
     fun pcToLineCol(funcPtr: Int, pc: Int): Int {
@@ -98,10 +122,10 @@ class JSContext(
     /* 生成错误回溯字符串（对照 C 的 build_backtrace）：最内层帧在前 */
     fun buildBacktrace(): String {
         val sb = StringBuilder()
-        for (i in frames.indices.reversed()) {
-            val f = frames[i]
-            if (f.keep < 0 || f.keep >= gcKeepAlive.size) continue
-            val fn = gcKeepAlive[f.keep]
+        for (i in frameDepth - 1 downTo 0) {
+            val keep = frameKeeps[i]
+            if (keep < 0 || keep >= gcKeepAlive.size) continue
+            val fn = gcKeepAlive[keep]
             if (!JS_IsPtr(fn)) continue
             val p = JS_VALUE_TO_PTR(fn)
             if (p < heapBase || p >= memory.size) continue
@@ -110,7 +134,7 @@ class JSContext(
             val name = if (JS_IsString(this, nameV)) jsGetString(this, nameV) else "<anonymous>"
             val fileV = memory.getJSValue(p + 48)
             val file = if (JS_IsString(this, fileV)) jsGetString(this, fileV) else "<eval>"
-            val packed = pcToLineCol(p, f.pc)
+            val packed = pcToLineCol(p, framePcs[i])
             sb.append("    at ").append(name).append(" (").append(file)
                 .append(':').append(packed ushr 16).append(':').append(packed and 0xFFFF)
                 .append(")\n")
@@ -124,7 +148,9 @@ class JSContext(
     /* 解释器 JVM 侧根：runBody 的操作数栈与局部变量表是 Kotlin 集合，GC 无法
      * 自动发现其中的 JSValue；由 runBody 注册后，JSGC 负责标记这些值，并在
      * 压缩搬移时就地改写集合元素（否则执行期触发 GC 会留下悬垂地址） */
-    val jvmRoots: MutableList<MutableList<JSValue>> = mutableListOf()
+/* JVM 侧根抽象：解释器用原生 LongArray（ValueStack/ValueArray），
+     * 其余 Kotlin 列表用 ListRoot 适配，GC 统一按接口标记/搬移 */
+    val jvmRoots: MutableList<JvmRoot> = mutableListOf()
     var randomState: Long = 1
     
     var parseState: JSParseState? = null
@@ -306,4 +332,18 @@ class JSContext(
 class JSGCRef(val ctx: JSContext, val offset: Int = 0) {
     var prev: Int = 0
     var value: JSValue = JS_UNDEFINED
+}
+
+/* JVM 侧 GC 根：size + 按下标读写 JSValue */
+interface JvmRoot {
+    val rootSize: Int
+    fun rootGet(i: Int): JSValue
+    fun rootSet(i: Int, v: JSValue)
+}
+
+/* Kotlin 可变列表的根适配器（如 persistentRoots） */
+class ListRoot(private val list: MutableList<JSValue>) : JvmRoot {
+    override val rootSize: Int get() = list.size
+    override fun rootGet(i: Int): JSValue = list[i]
+    override fun rootSet(i: Int, v: JSValue) { list[i] = v }
 }
