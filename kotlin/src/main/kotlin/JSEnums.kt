@@ -32,8 +32,9 @@ enum class JSObjectClassEnum(val value: Int) {
     JS_CLASS_UINT32_ARRAY(25),
     JS_CLASS_FLOAT32_ARRAY(26),
     JS_CLASS_FLOAT64_ARRAY(27),
+    JS_CLASS_SET(28),
     
-    JS_CLASS_USER(28);
+    JS_CLASS_USER(29);
     
     companion object {
         fun fromValue(value: Int): JSObjectClassEnum? = entries.find { it.value == value }

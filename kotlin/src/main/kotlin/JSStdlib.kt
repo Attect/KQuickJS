@@ -99,7 +99,9 @@ object JSStdlib {
             initArray(ctx, rt)
             initString(ctx, rt)
             initNumber(ctx, rt)
+            initBigInt(ctx, rt)
             initRegExp(ctx, rt)
+            initSet(ctx, rt)
             initTypedArrays(ctx, rt)
             initMath(ctx, rt)
             initJson(ctx, rt)
@@ -427,6 +429,7 @@ object JSStdlib {
         if (JS_IsString(ctx, v)) return "[object String]"
         if (JS_IsPtr(v)) {
             val p = JS_VALUE_TO_PTR(v)
+            if (JS_IsBigInt(ctx, v)) return "[object BigInt]"
             when (ctx.memory.getMTag(p)) {
                 JSMTags.JS_MTAG_FLOAT64 -> return "[object Number]"
                 JSMTags.JS_MTAG_STRING -> return "[object String]"
@@ -2037,6 +2040,288 @@ object JSStdlib {
                 else makeTypedArray(c, rt, ti.kind, typedBpe(ti.kind), buf, info,
                                     ti.offset + s * typedBpe(ti.kind), e - s)
             }
+        }
+    }
+
+    /* ---------------- Set ---------------- */
+
+    private fun isSetValue(c: JSContext, v: JSValue): Boolean {
+        if (!JS_IsPtr(v)) return false
+        val p = JS_VALUE_TO_PTR(v)
+        return c.memory.getMTag(p) == JSMTags.JS_MTAG_OBJECT &&
+               c.memory.getU8(p + 2) == JSObjectClassEnum.JS_CLASS_SET.value
+    }
+
+    private fun setSameValueZero(rt: JSRuntime, a: JSValue, b: JSValue): Boolean {
+        if (rt.strictEquals(a, b)) return true
+        /* SameValueZero：NaN 与 NaN 视为相同 */
+        if (rt.isNumberValue(a) && rt.isNumberValue(b)) {
+            val x = rt.toNumber(a)
+            val y = rt.toNumber(b)
+            return x.isNaN() && y.isNaN()
+        }
+        return false
+    }
+
+    private fun setLength(c: JSContext, setObj: JSValue): Int {
+        val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(setObj) + 24)
+        return if (JS_IsPtr(arr)) c.memory.getI32(JS_VALUE_TO_PTR(arr) + 32) else 0
+    }
+
+    private fun initSet(ctx: JSContext, rt: JSRuntime) {
+        val proto = JS_NewObject(ctx)
+        ctx.classProto[JSObjectClassEnum.JS_CLASS_SET.value] = proto
+
+        fun addValue(c: JSContext, setObj: JSValue, value: JSValue) {
+            val keep = c.gcKeepAlive.size
+            c.gcKeepAlive.add(setObj)
+            c.gcKeepAlive.add(value)
+            try {
+                val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24)
+                if (!JS_IsPtr(arr)) return
+                val len = c.memory.getI32(JS_VALUE_TO_PTR(arr) + 32)
+                for (i in 0 until len) {
+                    val cur = rt.getElement(c.gcKeepAlive[keep].let {
+                        c.memory.getJSValue(JS_VALUE_TO_PTR(it) + 24)
+                    }, JS_NewShortInt(i))
+                    if (setSameValueZero(rt, cur, c.gcKeepAlive[keep + 1])) return
+                }
+                val freshArr = c.memory.getJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24)
+                rt.setElement(freshArr, JS_NewShortInt(len), c.gcKeepAlive[keep + 1])
+                c.memory.putI32(JS_VALUE_TO_PTR(freshArr) + 32, len + 1)
+            } finally {
+                while (c.gcKeepAlive.size > keep) c.gcKeepAlive.removeAt(c.gcKeepAlive.size - 1)
+            }
+        }
+
+        val ctor = native(ctx, 0) { c, _, args ->
+            val obj = JS_NewObjectProtoClass(c, c.classProto[JSObjectClassEnum.JS_CLASS_SET.value],
+                                             JSObjectClassEnum.JS_CLASS_SET.value, 1)
+            if (JS_IsException(obj)) {
+                JS_EXCEPTION
+            } else {
+                val keep = c.gcKeepAlive.size
+                c.gcKeepAlive.add(obj)
+                val arr = JS_NewArray(c, 0)
+                c.memory.putJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24, arr)
+                if (args.isNotEmpty() && JS_IsPtr(args[0]) &&
+                    c.memory.getMTag(JS_VALUE_TO_PTR(args[0])) == JSMTags.JS_MTAG_OBJECT) {
+                    val src = args[0]
+                    val n = c.memory.getI32(JS_VALUE_TO_PTR(src) + 32)
+                    for (i in 0 until n) addValue(c, c.gcKeepAlive[keep], rt.getElement(src, JS_NewShortInt(i)))
+                }
+                c.gcKeepAlive[keep]
+            }
+        }
+        rt.setProperty(ctor, JS_NewString(ctx, "prototype"), proto)
+        rt.setProperty(proto, JS_NewString(ctx, "constructor"), ctor)
+        defGlobal(ctx, rt, "Set", ctor)
+
+        defMethod(ctx, rt, proto, "add", 1) { c, thisVal, args ->
+            if (!isSetValue(c, thisVal)) JS_ThrowTypeError(c, "not a Set")
+            else addValue(c, thisVal, arg(args, 0))
+            thisVal
+        }
+        defMethod(ctx, rt, proto, "has", 1) { c, thisVal, args ->
+            if (!isSetValue(c, thisVal)) {
+                JS_ThrowTypeError(c, "not a Set")
+            } else {
+                val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(thisVal) + 24)
+                val len = if (JS_IsPtr(arr)) c.memory.getI32(JS_VALUE_TO_PTR(arr) + 32) else 0
+                var found = false
+                for (i in 0 until len) {
+                    if (setSameValueZero(rt, rt.getElement(arr, JS_NewShortInt(i)), arg(args, 0))) {
+                        found = true; break
+                    }
+                }
+                JS_NewBool(found)
+            }
+        }
+        defMethod(ctx, rt, proto, "delete", 1) { c, thisVal, args ->
+            if (!isSetValue(c, thisVal)) {
+                JS_ThrowTypeError(c, "not a Set")
+            } else {
+                val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(thisVal) + 24)
+                val len = if (JS_IsPtr(arr)) c.memory.getI32(JS_VALUE_TO_PTR(arr) + 32) else 0
+                var idx = -1
+                for (i in 0 until len) {
+                    if (setSameValueZero(rt, rt.getElement(arr, JS_NewShortInt(i)), arg(args, 0))) {
+                        idx = i; break
+                    }
+                }
+                if (idx >= 0) {
+                    for (i in idx until len - 1) {
+                        rt.setElement(arr, JS_NewShortInt(i),
+                                      rt.getElement(arr, JS_NewShortInt(i + 1)))
+                    }
+                    rt.setElement(arr, JS_NewShortInt(len - 1), JS_UNDEFINED)
+                    c.memory.putI32(JS_VALUE_TO_PTR(arr) + 32, len - 1)
+                    JS_TRUE
+                } else {
+                    JS_FALSE
+                }
+            }
+        }
+        defMethod(ctx, rt, proto, "clear", 0) { c, thisVal, _ ->
+            if (isSetValue(c, thisVal)) {
+                val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(thisVal) + 24)
+                if (JS_IsPtr(arr)) c.memory.putI32(JS_VALUE_TO_PTR(arr) + 32, 0)
+            }
+            JS_UNDEFINED
+        }
+        defMethod(ctx, rt, proto, "forEach", 1) { c, thisVal, args ->
+            val cb = arg(args, 0)
+            if (!isSetValue(c, thisVal) || !JS_IsFunction(c, cb)) {
+                JS_ThrowTypeError(c, "invalid Set.forEach")
+            } else {
+                val keep = c.gcKeepAlive.size
+                c.gcKeepAlive.add(thisVal)
+                c.gcKeepAlive.add(cb)
+                try {
+                    val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24)
+                    val len = if (JS_IsPtr(arr)) c.memory.getI32(JS_VALUE_TO_PTR(arr) + 32) else 0
+                    for (i in 0 until len) {
+                        val v = rt.getElement(
+                            c.memory.getJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24),
+                            JS_NewShortInt(i))
+                        val r = rt.callFunction(c.gcKeepAlive[keep + 1],
+                            listOf(v, v, c.gcKeepAlive[keep]), JS_UNDEFINED)
+                        if (JS_IsException(r)) return@defMethod r
+                    }
+                    JS_UNDEFINED
+                } finally {
+                    while (c.gcKeepAlive.size > keep) c.gcKeepAlive.removeAt(c.gcKeepAlive.size - 1)
+                }
+            }
+        }
+        fun snapshot(c: JSContext, setObj: JSValue): JSValue {
+            val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(setObj) + 24)
+            val len = if (JS_IsPtr(arr)) c.memory.getI32(JS_VALUE_TO_PTR(arr) + 32) else 0
+            val out = JS_NewArray(c, len)
+            val keep = c.gcKeepAlive.size
+            c.gcKeepAlive.add(out)
+            for (i in 0 until len) {
+                rt.setElement(c.gcKeepAlive[keep], JS_NewShortInt(i),
+                    rt.getElement(arr, JS_NewShortInt(i)))
+            }
+            c.memory.putI32(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 32, len)
+            return c.gcKeepAlive[keep]
+        }
+        defMethod(ctx, rt, proto, "values", 0) { c, thisVal, _ ->
+            if (isSetValue(c, thisVal)) snapshot(c, thisVal) else JS_ThrowTypeError(c, "not a Set")
+        }
+        defMethod(ctx, rt, proto, "keys", 0) { c, thisVal, _ ->
+            if (isSetValue(c, thisVal)) snapshot(c, thisVal) else JS_ThrowTypeError(c, "not a Set")
+        }
+        defMethod(ctx, rt, proto, "entries", 0) { c, thisVal, _ ->
+            if (!isSetValue(c, thisVal)) {
+                JS_ThrowTypeError(c, "not a Set")
+            } else {
+                val src = snapshot(c, thisVal)
+                val len = c.memory.getI32(JS_VALUE_TO_PTR(src) + 32)
+                val out = JS_NewArray(c, len)
+                val keep = c.gcKeepAlive.size
+                c.gcKeepAlive.add(out)
+                for (i in 0 until len) {
+                    val pair = JS_NewArray(c, 2)
+                    val pk = c.gcKeepAlive.size
+                    c.gcKeepAlive.add(pair)
+                    val v = rt.getElement(src, JS_NewShortInt(i))
+                    rt.setElement(c.gcKeepAlive[pk], JS_NewShortInt(0), v)
+                    rt.setElement(c.gcKeepAlive[pk], JS_NewShortInt(1), v)
+                    c.memory.putI32(JS_VALUE_TO_PTR(c.gcKeepAlive[pk]) + 32, 2)
+                    rt.setElement(c.gcKeepAlive[keep], JS_NewShortInt(i), c.gcKeepAlive[pk])
+                    c.gcKeepAlive.removeAt(pk)
+                }
+                c.memory.putI32(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 32, len)
+                c.gcKeepAlive[keep]
+            }
+        }
+        val sizeGetter = native(ctx, 0) { c, thisVal, _ ->
+            if (isSetValue(c, thisVal)) JS_NewShortInt(setLength(c, thisVal))
+            else JS_UNDEFINED
+        }
+        rt.defineAccessor(proto, JS_NewString(ctx, "size"), sizeGetter, true)
+    }
+
+    /* ---------------- BigInt ---------------- */
+
+    private fun initBigInt(ctx: JSContext, rt: JSRuntime) {
+        val proto = JS_NewObject(ctx)
+        ctx.bigIntProto = proto
+        val ctor = native(ctx, 1) { c, _, args ->
+            val v = arg(args, 0)
+            val bi: java.math.BigInteger? = when {
+                JS_IsBigInt(c, v) -> JS_GetBigInt(c, v)
+                JS_IsInt(v) ->
+                    java.math.BigInteger.valueOf(JS_VALUE_GET_INT(v).toLong())
+                JS_IsShortFloat(v) -> {
+                    val d = jsGetShortFloat(v)
+                    if (d != Math.floor(d)) {
+                        return@native JS_ThrowRangeError(c, "cannot convert to BigInt: not an integer")
+                    }
+                    java.math.BigInteger.valueOf(d.toLong())
+                }
+                JS_IsPtr(v) && c.memory.getMTag(JS_VALUE_TO_PTR(v)) == JSMTags.JS_MTAG_FLOAT64 -> {
+                    val d = c.memory.getFloat64(JS_VALUE_TO_PTR(v) + 8)
+                    if (!d.isFinite() || d != Math.floor(d)) {
+                        return@native JS_ThrowRangeError(c, "cannot convert to BigInt: not an integer")
+                    }
+                    try {
+                        java.math.BigDecimal(d).toBigIntegerExact()
+                    } catch (e: ArithmeticException) {
+                        return@native JS_ThrowRangeError(c, "cannot convert to BigInt: not an integer")
+                    }
+                }
+                JS_IsBool(v) ->
+                    if (JS_VALUE_GET_SPECIAL_VALUE(v) != 0) java.math.BigInteger.ONE
+                    else java.math.BigInteger.ZERO
+                JS_IsString(c, v) -> {
+                    val s = jsGetString(c, v)
+                    rt.parseBigIntString(s)
+                        ?: return@native JS_ThrowSyntaxError(c, "invalid BigInt string")
+                }
+                JS_IsUndefined(v) -> java.math.BigInteger.ZERO
+                else -> return@native JS_ThrowTypeError(c, "cannot convert to BigInt")
+            }
+            if (bi == null) JS_EXCEPTION else JS_NewBigInt(c, bi)
+        }
+        rt.setProperty(ctor, JS_NewString(ctx, "prototype"), proto)
+        rt.setProperty(proto, JS_NewString(ctx, "constructor"), ctor)
+        defGlobal(ctx, rt, "BigInt", ctor)
+
+        defMethod(ctx, rt, proto, "toString", 1) { c, thisVal, args ->
+            val b = JS_GetBigInt(c, thisVal)
+            if (b == null) {
+                JS_ThrowTypeError(c, "not a BigInt")
+            } else {
+                val radix = if (args.isEmpty() || JS_IsUndefined(args[0])) 10
+                            else toInt(c, rt, args[0])
+                if (radix !in 2..36) {
+                    JS_ThrowRangeError(c, "radix must be between 2 and 36")
+                } else {
+                    JS_NewString(c, b.toString(radix))
+                }
+            }
+        }
+        defMethod(ctx, rt, proto, "valueOf", 0) { _, thisVal, _ -> thisVal }
+        defMethod(ctx, rt, proto, "toLocaleString", 0) { c, thisVal, _ ->
+            val b = JS_GetBigInt(c, thisVal)
+            if (b == null) JS_ThrowTypeError(c, "not a BigInt") else JS_NewString(c, b.toString())
+        }
+        defMethod(ctx, rt, ctor, "asUintN", 2) { c, _, args ->
+            val bits = toInt(c, rt, arg(args, 0))
+            val b = JS_GetBigInt(c, arg(args, 1)) ?: return@defMethod JS_ThrowTypeError(c, "not a BigInt")
+            val mod = java.math.BigInteger.ONE.shiftLeft(bits)
+            JS_NewBigInt(c, b.mod(mod))
+        }
+        defMethod(ctx, rt, ctor, "asIntN", 2) { c, _, args ->
+            val bits = toInt(c, rt, arg(args, 0))
+            val b = JS_GetBigInt(c, arg(args, 1)) ?: return@defMethod JS_ThrowTypeError(c, "not a BigInt")
+            val mod = java.math.BigInteger.ONE.shiftLeft(bits)
+            var v = b.mod(mod)
+            if (v.testBit(bits - 1)) v = v.subtract(mod)
+            JS_NewBigInt(c, v)
         }
     }
 

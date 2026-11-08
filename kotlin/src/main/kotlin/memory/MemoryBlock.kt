@@ -68,6 +68,7 @@ class MemoryBlock(val memory: Memory, val offset: Int) {
                     if (isDetached != 0) 16 else 24
                 }
                 JSMTags.JS_MTAG_FUNCTION_BYTECODE -> 72
+                JSMTags.JS_MTAG_BIGINT -> 8
                 else -> 0
             }
         }

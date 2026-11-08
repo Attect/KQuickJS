@@ -1,6 +1,7 @@
 package app.muka.project.kquickjs
 
 import app.muka.project.kquickjs.JSMTags.JS_MTAG_OBJECT
+import app.muka.project.kquickjs.JSMTags.JS_MTAG_VARREF
 import app.muka.project.kquickjs.JSMTags.JS_MTAG_STRING
 import app.muka.project.kquickjs.JSMTags.JS_MTAG_VALUE_ARRAY
 import app.muka.project.kquickjs.memory.getMTag
@@ -73,14 +74,16 @@ fun JS_GetClassID(ctx: JSContext, val1: JSValue): Int {
 fun JS_SetOpaque(ctx: JSContext, val1: JSValue, opaque: Any?) {
     if (!JS_IsPtr(val1)) return
     val ptr = JS_VALUE_TO_PTR(val1)
-    if (ctx.memory.getMTag(ptr) != JS_MTAG_OBJECT) return
+    val mt = ctx.memory.getMTag(ptr)
+    if (mt != JS_MTAG_OBJECT && mt != JS_MTAG_VARREF) return
     ctx.userOpaqueTable[ptr] = opaque
 }
 
 fun JS_GetOpaque(ctx: JSContext, val1: JSValue): Any? {
     if (!JS_IsPtr(val1)) return null
     val ptr = JS_VALUE_TO_PTR(val1)
-    if (ctx.memory.getMTag(ptr) != JS_MTAG_OBJECT) return null
+    val mt = ctx.memory.getMTag(ptr)
+    if (mt != JS_MTAG_OBJECT && mt != JS_MTAG_VARREF) return null
     return ctx.userOpaqueTable[ptr]
 }
 

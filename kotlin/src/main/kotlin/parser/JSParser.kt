@@ -2143,6 +2143,12 @@ class JSParser(private val s: JSParseState) {
                 s.nextToken()
                 return true
             }
+            JSTokenVal.TOK_BIGINT.value -> {
+                val idx = addConstPool(s.token.value)
+                emitOpWithArg(OPCodeEnum.OP_push_const, idx)
+                s.nextToken()
+                return true
+            }
             JSTokenVal.TOK_NUMBER.value -> {
                 val d = s.token.d
                 val i = d.toInt()

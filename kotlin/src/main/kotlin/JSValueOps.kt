@@ -2,6 +2,7 @@ package app.muka.project.kquickjs
 
 import app.muka.project.kquickjs.JSMTags.JS_MTAG_FLOAT64
 import app.muka.project.kquickjs.JSMTags.JS_MTAG_STRING
+import app.muka.project.kquickjs.JSMTags.JS_MTAG_VARREF
 import app.muka.project.kquickjs.memory.getMTag
 
 const val JS_SHORTINT_MIN = -(1 shl 30)
@@ -137,6 +138,36 @@ fun jsGetString(ctx: JSContext, v: JSValue): String {
     return jsDecodeString(ctx.memory.getBytes(ptr + 8, len))
 }
 
+/* ---------------- BigInt ----------------
+ * JVM 移植版用一个 detach 的 VARREF 块承载 BigInt（块头 mtag 只有 3 位，
+ * 不能再新增 mtag）：+2 的 detached 标志置 1，+4 写入魔数区分于普通 varref；
+ * BigInteger 本体存放于 userOpaqueTable（GC 释放时清理、搬移时更新 key）。 */
+const val JS_BIGINT_MAGIC: Int = 0x42494749  /* "BIGI" */
+
+fun JS_IsBigInt(ctx: JSContext, v: JSValue): Boolean {
+    if (!JS_IsPtr(v)) return false
+    val p = JS_VALUE_TO_PTR(v)
+    if (p < ctx.heapBase || p >= ctx.heapFree) return false
+    if (ctx.memory.getMTag(p) != JS_MTAG_VARREF) return false
+    return (ctx.memory.getU8(p + 2) and 1) != 0 && ctx.memory.getI32(p + 4) == JS_BIGINT_MAGIC
+}
+
+fun JS_GetBigInt(ctx: JSContext, v: JSValue): java.math.BigInteger? {
+    if (!JS_IsBigInt(ctx, v)) return null
+    return ctx.userOpaqueTable[JS_VALUE_TO_PTR(v)] as? java.math.BigInteger
+}
+
+fun JS_NewBigInt(ctx: JSContext, value: java.math.BigInteger): JSValue {
+    val ptr = ctx.malloc(16, JS_MTAG_VARREF)
+    if (ptr == 0) return JS_EXCEPTION
+    ctx.memory.putU8(ptr + 2, 1)              /* detached：GC 不遍历 +16 */
+    ctx.memory.putI32(ptr + 4, JS_BIGINT_MAGIC)
+    ctx.userOpaqueTable[ptr] = value
+    return JS_VALUE_FROM_PTR(ptr)
+}
+
+fun JS_NewBigInt(ctx: JSContext, value: Long): JSValue =
+    JS_NewBigInt(ctx, java.math.BigInteger.valueOf(value))
 /* JS 字符串使用 WTF-8 编码存储：允许孤立代理项（\udbc4 等）原样往返，
  * 普通 UTF-8 无法表示孤立代理项（会被替换成 '?'），会破坏字符串拼接/切片语义 */
 fun jsEncodeString(str: String): ByteArray {

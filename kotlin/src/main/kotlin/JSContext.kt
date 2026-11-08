@@ -33,6 +33,8 @@ class JSContext(
     var emptyProps: JSValue = JS_NULL
     var globalObj: JSValue = JS_NULL
     var minusZero: JSValue = JS_NULL
+    /* BigInt 原型（BigInt 值是 BIGINT mtag，非 OBJECT，属性查找需单独路由） */
+    var bigIntProto: JSValue = JS_NULL
     
     val classProto: LongArray = LongArray(classCount)
     val classObj: LongArray = LongArray(classCount)

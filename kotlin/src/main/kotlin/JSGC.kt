@@ -113,8 +113,10 @@ object JSGC {
                 while (ptr1 < ctx.heapFree && ctx.memory.getGCMark(ptr1) == 0) {
                     val size1 = ctx.memory.getBlockSize(ptr1)
                     
-                    if (ctx.memory.getMTag(ptr1) == JSMTags.JS_MTAG_OBJECT) {
-                        val classId = ctx.memory.getU8(ptr1 + 2)
+                    val deadTag = ctx.memory.getMTag(ptr1)
+                    if (deadTag == JSMTags.JS_MTAG_OBJECT || deadTag == JSMTags.JS_MTAG_VARREF) {
+                        val classId = if (deadTag == JSMTags.JS_MTAG_OBJECT)
+                            ctx.memory.getU8(ptr1 + 2) else 0
                         /* finalizer 查找：user 类走 cFinalizerTable（建表给定）；
                          * 其余类（含桥接层宿主对象复用的普通对象类）查扩展 finalizer 表 */
                         val fin: ((ctx: JSContext, opaque: Any?) -> Unit)? =
@@ -123,11 +125,11 @@ object JSGC {
                             } else {
                                 ctx.extFinalizerTable[classId]
                             }
-                        if (fin != null) {
+                        if (deadTag == JSMTags.JS_MTAG_OBJECT && fin != null) {
                             /* 调用用户 finalizer（禁止在其中调用 JS 函数） */
                             fin(ctx, ctx.userOpaqueTable[ptr1])
                         }
-                        /* 对象已释放，清理宿主 opaque 引用表条目 */
+                        /* 对象/BigInt 已释放，清理宿主 opaque 与缓存条目 */
                         ctx.userOpaqueTable.remove(ptr1)
                         ctx.pc2lineMap.remove(ptr1)
                         ctx.byteCodeCache.remove(ptr1)
@@ -166,6 +168,7 @@ object JSGC {
             JSMTags.JS_MTAG_OBJECT,
             JSMTags.JS_MTAG_VALUE_ARRAY,
             JSMTags.JS_MTAG_VARREF,
+            JSMTags.JS_MTAG_BIGINT,
             JSMTags.JS_MTAG_FUNCTION_BYTECODE -> true
             else -> false
         }
@@ -211,6 +214,9 @@ object JSGC {
                         val tab = ctx.memory.getJSValue(ptr + 24)
                         gcMark(ctx, markStack, tab)
                     }
+                    JSObjectClassEnum.JS_CLASS_SET.value -> {
+                        gcMark(ctx, markStack, ctx.memory.getJSValue(ptr + 24))
+                    }
                     JSObjectClassEnum.JS_CLASS_ERROR.value -> {
                         /* 错误对象：mark message（槽 0）与 stack（槽 1），对照 C p->u.error */
                         gcMark(ctx, markStack, ctx.memory.getJSValue(ptr + 24))
@@ -233,6 +239,9 @@ object JSGC {
                     val elem = ctx.memory.getJSValue(ptr + 8 + i * 8)
                     gcMark(ctx, markStack, elem)
                 }
+            }
+            JSMTags.JS_MTAG_BIGINT -> {
+                /* BigInt：无子引用，块本身被标记即可 */
             }
             JSMTags.JS_MTAG_VARREF -> {
                 val isDetached = ctx.memory.getU8(ptr + 2) and 1
@@ -382,6 +391,9 @@ object JSGC {
                     JSObjectClassEnum.JS_CLASS_ARRAY.value -> {
                         remap(ptr + 24)
                     }
+                    JSObjectClassEnum.JS_CLASS_SET.value -> {
+                        remap(ptr + 24)
+                    }
                     JSObjectClassEnum.JS_CLASS_ERROR.value -> {
                         /* 错误对象：更新 message（槽 0）与 stack（槽 1）指针，对照 C p->u.error */
                         remap(ptr + 24)
@@ -402,6 +414,9 @@ object JSGC {
                 for (i in 0 until size) {
                     remap(ptr + 8 + i * 8)
                 }
+            }
+            JSMTags.JS_MTAG_BIGINT -> {
+                /* BigInt：无子引用，块本身被标记即可 */
             }
             JSMTags.JS_MTAG_VARREF -> {
                 val isDetached = ctx.memory.getU8(ptr + 2) and 1

@@ -82,7 +82,8 @@ enum class JSTokenVal(val value: Int) {
     TOK_PROTECTED(202),
     TOK_PUBLIC(203),
     TOK_STATIC(204),
-    TOK_YIELD(205);
+    TOK_YIELD(205),
+    TOK_BIGINT(206);
     
     companion object {
         fun fromValue(value: Int): JSTokenVal? = entries.find { it.value == value }
@@ -720,6 +721,13 @@ class JSParseState(
                         advance()
                         value = (value shl 4) or h.toLong()
                     }
+                    if (peekChar() == 'n'.code) {
+                        advance()
+                        val text = String(sourceBuf, start + 2, bufPos - start - 3, Charsets.UTF_8)
+                        token.val1 = JSTokenVal.TOK_BIGINT.value
+                        token.value = JS_NewBigInt(ctx, java.math.BigInteger(text, 16))
+                        return
+                    }
                     token.val1 = JSTokenVal.TOK_NUMBER.value
                     token.d = value.toDouble()
                     return
@@ -735,6 +743,13 @@ class JSParseState(
                         } else {
                             break
                         }
+                    }
+                    if (peekChar() == 'n'.code) {
+                        advance()
+                        val text = String(sourceBuf, start + 2, bufPos - start - 3, Charsets.UTF_8)
+                        token.val1 = JSTokenVal.TOK_BIGINT.value
+                        token.value = JS_NewBigInt(ctx, java.math.BigInteger(text, 2))
+                        return
                     }
                     token.val1 = JSTokenVal.TOK_NUMBER.value
                     token.d = value.toDouble()
@@ -752,6 +767,13 @@ class JSParseState(
                             break
                         }
                     }
+                    if (peekChar() == 'n'.code) {
+                        advance()
+                        val text = String(sourceBuf, start + 2, bufPos - start - 3, Charsets.UTF_8)
+                        token.val1 = JSTokenVal.TOK_BIGINT.value
+                        token.value = JS_NewBigInt(ctx, java.math.BigInteger(text, 8))
+                        return
+                    }
                     token.val1 = JSTokenVal.TOK_NUMBER.value
                     token.d = value.toDouble()
                     return
@@ -763,7 +785,9 @@ class JSParseState(
             advance()
         }
         
+        var hasFractionOrExp = false
         if (peekChar() == '.'.code) {
+            hasFractionOrExp = true
             advance()
             while (bufPos < bufLen && isDigit(peekChar())) {
                 advance()
@@ -771,6 +795,7 @@ class JSParseState(
         }
         
         if (peekChar() == 'e'.code || peekChar() == 'E'.code) {
+            hasFractionOrExp = true
             advance()
             if (peekChar() == '+'.code || peekChar() == '-'.code) {
                 advance()
@@ -780,6 +805,17 @@ class JSParseState(
             }
         }
         
+        if (peekChar() == 'n'.code) {
+            if (hasFractionOrExp) {
+                error("invalid BigInt literal")
+                return
+            }
+            advance()
+            val text = String(sourceBuf, start, bufPos - start - 1, Charsets.UTF_8)
+            token.val1 = JSTokenVal.TOK_BIGINT.value
+            token.value = JS_NewBigInt(ctx, java.math.BigInteger(text))
+            return
+        }
         val numStr = String(sourceBuf, start, bufPos - start, Charsets.UTF_8)
         token.val1 = JSTokenVal.TOK_NUMBER.value
         token.d = numStr.toDouble()

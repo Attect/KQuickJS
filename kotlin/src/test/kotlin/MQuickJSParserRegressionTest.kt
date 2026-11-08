@@ -90,20 +90,20 @@ class MQuickJSParserRegressionTest {
         assertEquals("inner_const_79outerB", jsGetString(r.ctx, r.value))
     }
 
-    /* 长脚本（大量函数 + 字符串常量）在 256KB 堆上会触发多次解析期与
+    /* 长脚本（1000 个函数 + 字符串常量）在 512KB 堆上会触发多次解析期与
      * 执行期 GC：验证字节码数组收缩与 JVM 侧 GC 根修复后不再崩溃，
      * 且函数声明/调用仍然正确 */
     @Test
     fun testLongScriptWithManyFunctionsSurvivesGc() {
-        val count = 400
+        val count = 1000
         val js = StringBuilder()
         for (i in 0 until count) {
             js.append("function f$i() { return \"s$i\"; }\n")
         }
         js.append("f0() + f${count - 1}()\n")
 
-        val r = runJS(js.toString(), 256 * 1024)
+        val r = runJS(js.toString(), 512 * 1024)
         assertTrue(JS_IsString(r.ctx, r.value), "结果应为字符串")
-        assertEquals("s0s399", jsGetString(r.ctx, r.value))
+        assertEquals("s0s999", jsGetString(r.ctx, r.value))
     }
 }

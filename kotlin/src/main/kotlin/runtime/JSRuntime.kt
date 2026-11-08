@@ -1212,6 +1212,11 @@ class JSRuntime(private val ctx: JSContext) {
         if (isNumberValue(a) && isNumberValue(b)) {
             return toNumber(a) == toNumber(b)
         }
+        if (JS_IsBigInt(ctx, a) && JS_IsBigInt(ctx, b)) {
+            val x = JS_GetBigInt(ctx, a)
+            val y = JS_GetBigInt(ctx, b)
+            return x != null && y != null && x == y
+        }
         return false
     }
     
@@ -1228,6 +1233,10 @@ class JSRuntime(private val ctx: JSContext) {
         if (JS_IsNull(v) || JS_IsUndefined(v)) return false
         if (JS_IsBool(v)) return JS_VALUE_GET_SPECIAL_VALUE(v) != 0
         if (JS_IsPtr(v)) {
+            if (JS_IsBigInt(ctx, v)) {
+                val b = JS_GetBigInt(ctx, v)
+                return b != null && b.signum() != 0
+            }
             val ptr = JS_VALUE_TO_PTR(v)
             if (ctx.memory.getMTag(ptr) == JSMTags.JS_MTAG_FLOAT64) {
                 val d = ctx.memory.getFloat64(ptr + 8)
@@ -1267,6 +1276,15 @@ class JSRuntime(private val ctx: JSContext) {
             return JS_NewFloat64(ctx, r.toDouble())
         }
         
+        /* BigInt：与字符串仍按字符串拼接，其余混合类型抛 TypeError */
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) {
+            val pa0 = toPrimitive(a, 0)
+            val pb0 = toPrimitive(b, 0)
+            if (JS_IsString(ctx, pa0) || JS_IsString(ctx, pb0)) {
+                return JS_NewString(ctx, toStringValue(pa0) + toStringValue(pb0))
+            }
+            return bigIntBinary(OPCodeEnum.OP_add, pa0, pb0)
+        }
         /* ToPrimitive 之后再决定字符串拼接还是数值加法 */
         val pa = toPrimitive(a, 0)
         val pb = toPrimitive(b, 0)
@@ -1278,6 +1296,7 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun doSub(a: JSValue, b: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) return bigIntBinary(OPCodeEnum.OP_sub, a, b)
         if (JS_IsInt(a) && JS_IsInt(b)) {
             val ia = JS_VALUE_GET_INT(a)
             val ib = JS_VALUE_GET_INT(b)
@@ -1291,7 +1310,132 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     /* 超级指令的二元运算分派（kind 为原 opcode id） */
-    fun doBinOp(kind: Int, a: JSValue, b: JSValue): JSValue = when (kind) {
+    /* BigInt 二元运算：两侧必须都是 BigInt；除法/取模按向零截断，
+     * 位移计数为 BigInt（负数反向移位），其余位运算按补码语义 */
+    fun bigIntBinary(op: OPCodeEnum, a: JSValue, b: JSValue): JSValue {
+        val x = JS_GetBigInt(ctx, a)
+        val y = JS_GetBigInt(ctx, b)
+        if (x == null || y == null) {
+            return JS_ThrowTypeError(ctx, "cannot mix BigInt and other types, use explicit conversions")
+        }
+        val r: java.math.BigInteger = try {
+            when (op) {
+                OPCodeEnum.OP_add -> x.add(y)
+                OPCodeEnum.OP_sub -> x.subtract(y)
+                OPCodeEnum.OP_mul -> x.multiply(y)
+                OPCodeEnum.OP_div -> {
+                    if (y.signum() == 0) return JS_ThrowRangeError(ctx, "division by zero")
+                    x.divide(y)
+                }
+                OPCodeEnum.OP_mod -> {
+                    if (y.signum() == 0) return JS_ThrowRangeError(ctx, "division by zero")
+                    x.remainder(y)
+                }
+                OPCodeEnum.OP_pow -> {
+                    if (y.signum() < 0) return JS_ThrowRangeError(ctx, "exponent must be positive")
+                    if (y.bitLength() > 31) return JS_ThrowRangeError(ctx, "exponent too large")
+                    x.pow(y.toInt())
+                }
+                OPCodeEnum.OP_shl -> shiftBigInt(x, y, left = true)
+                OPCodeEnum.OP_shr, OPCodeEnum.OP_sar -> shiftBigInt(x, y, left = false)
+                OPCodeEnum.OP_and -> x.and(y)
+                OPCodeEnum.OP_or -> x.or(y)
+                OPCodeEnum.OP_xor -> x.xor(y)
+                else -> return JS_ThrowTypeError(ctx, "unsupported BigInt operation")
+            }
+        } catch (e: ArithmeticException) {
+            return JS_ThrowRangeError(ctx, "BigInt arithmetic error")
+        }
+        return JS_NewBigInt(ctx, r)
+    }
+    
+    private fun shiftBigInt(x: java.math.BigInteger, y: java.math.BigInteger,
+                            left: Boolean): java.math.BigInteger {
+        if (y.bitLength() > 31) {
+            return if (y.signum() > 0) (if (left) java.math.BigInteger.ZERO
+                                        else if (x.signum() < 0) java.math.BigInteger.valueOf(-1)
+                                        else java.math.BigInteger.ZERO)
+                   else throw java.lang.ArithmeticException("shift too large")
+        }
+        val n = y.toInt()
+        return when {
+            left && n >= 0 -> x.shiftLeft(n)
+            left -> x.shiftRight(-n)
+            n >= 0 -> x.shiftRight(n)
+            else -> x.shiftLeft(-n)
+        }
+    }
+    
+    /* 字符串 → BigInt（BigInt() 构造与 == 比较使用） */
+    fun parseBigIntString(s0: String): java.math.BigInteger? {
+        var s = s0.trim()
+        if (s.isEmpty()) return null
+        var sign = 1
+        if (s[0] == '+' || s[0] == '-') {
+            if (s[0] == '-') sign = -1
+            s = s.substring(1)
+        }
+        if (s.isEmpty()) return null
+        val radix: Int
+        val digits: String
+        when {
+            s.startsWith("0x") || s.startsWith("0X") -> { radix = 16; digits = s.substring(2) }
+            s.startsWith("0o") || s.startsWith("0O") -> { radix = 8; digits = s.substring(2) }
+            s.startsWith("0b") || s.startsWith("0B") -> { radix = 2; digits = s.substring(2) }
+            else -> { radix = 10; digits = s }
+        }
+        if (digits.isEmpty()) return null
+        return try {
+            val v = java.math.BigInteger(digits, radix)
+            if (sign < 0) v.negate() else v
+        } catch (e: NumberFormatException) {
+            null
+        }
+    }
+    
+    /* BigInt 与数字/字符串之间的数值比较（关系运算与 == 使用） */
+    private fun bigIntCompareNumeric(a: JSValue, b: JSValue): Int? {
+        val ba = JS_GetBigInt(ctx, a)
+        val bb = JS_GetBigInt(ctx, b)
+        if (ba != null && bb != null) return ba.compareTo(bb)
+        if (ba != null) {
+            val other = if (isNumberValue(b)) {
+                val d = toNumber(b)
+                if (d.isNaN()) return null
+                java.math.BigDecimal(d)
+            } else if (JS_IsString(ctx, b)) {
+                val bi = parseBigIntString(jsGetString(ctx, b)) ?: return null
+                java.math.BigDecimal(bi)
+            } else if (JS_IsBool(b)) {
+                java.math.BigDecimal(if (JS_VALUE_GET_SPECIAL_VALUE(b) != 0) 1 else 0)
+            } else return null
+            return java.math.BigDecimal(ba).compareTo(other)
+        }
+        if (bb != null) {
+            val other = if (isNumberValue(a)) {
+                val d = toNumber(a)
+                if (d.isNaN()) return null
+                java.math.BigDecimal(d)
+            } else if (JS_IsString(ctx, a)) {
+                val bi = parseBigIntString(jsGetString(ctx, a)) ?: return null
+                java.math.BigDecimal(bi)
+            } else if (JS_IsBool(a)) {
+                java.math.BigDecimal(if (JS_VALUE_GET_SPECIAL_VALUE(a) != 0) 1 else 0)
+            } else return null
+            return other.compareTo(java.math.BigDecimal(bb))
+        }
+        return null
+    }
+    fun doBinOp(kind: Int, a: JSValue, b: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) {
+            if (kind == OPCodeEnum.OP_add.id) return doAdd(a, b)
+            val op = OPCodeEnum.entries.find { it.id == kind } ?: return JS_UNDEFINED
+            return bigIntBinary(op, a, b)
+        }
+        return doBinOpNoBigInt(kind, a, b)
+    }
+    
+    private fun doBinOpNoBigInt(kind: Int, a: JSValue, b: JSValue): JSValue = when (kind) {
         OPCodeEnum.OP_add.id -> doAdd(a, b)
         OPCodeEnum.OP_sub.id -> doSub(a, b)
         OPCodeEnum.OP_mul.id -> doMul(a, b)
@@ -1315,6 +1459,7 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun doMul(a: JSValue, b: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) return bigIntBinary(OPCodeEnum.OP_mul, a, b)
         if (JS_IsInt(a) && JS_IsInt(b)) {
             val ia = JS_VALUE_GET_INT(a)
             val ib = JS_VALUE_GET_INT(b)
@@ -1332,10 +1477,12 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun doDiv(a: JSValue, b: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) return bigIntBinary(OPCodeEnum.OP_div, a, b)
         return JS_NewFloat64(ctx, toNumber(a) / toNumber(b))
     }
     
     fun doMod(a: JSValue, b: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) return bigIntBinary(OPCodeEnum.OP_mod, a, b)
         if (JS_IsInt(a) && JS_IsInt(b)) {
             val va = JS_VALUE_GET_INT(a)
             val vb = JS_VALUE_GET_INT(b)
@@ -1347,6 +1494,10 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun doNeg(a: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a)) {
+            val b = JS_GetBigInt(ctx, a)
+            return if (b == null) JS_EXCEPTION else JS_NewBigInt(ctx, b.negate())
+        }
         if (JS_IsInt(a)) {
             val ia = JS_VALUE_GET_INT(a)
             /* -0 必须是 -0.0（1 / -0 === -Infinity） */
@@ -1359,40 +1510,54 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun doShl(a: JSValue, b: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) return bigIntBinary(OPCodeEnum.OP_shl, a, b)
         val ia = toInt32(a)
         val ib = toInt32(b) and 31
         return JS_NewShortInt(ia shl ib)
     }
     
     fun doSar(a: JSValue, b: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) return bigIntBinary(OPCodeEnum.OP_sar, a, b)
         val ia = toInt32(a)
         val ib = toInt32(b) and 31
         return JS_NewShortInt(ia shr ib)
     }
     
     fun doShr(a: JSValue, b: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) return bigIntBinary(OPCodeEnum.OP_shr, a, b)
         val ia = toUInt32(a)
         val ib = toInt32(b) and 31
         return JS_NewFloat64(ctx, (ia shr ib).toDouble())
     }
     
     fun doAnd(a: JSValue, b: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) return bigIntBinary(OPCodeEnum.OP_and, a, b)
         return JS_NewShortInt(toInt32(a) and toInt32(b))
     }
     
     fun doOr(a: JSValue, b: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) return bigIntBinary(OPCodeEnum.OP_or, a, b)
         return JS_NewShortInt(toInt32(a) or toInt32(b))
     }
     
     fun doXor(a: JSValue, b: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) return bigIntBinary(OPCodeEnum.OP_xor, a, b)
         return JS_NewShortInt(toInt32(a) xor toInt32(b))
     }
     
     fun doNot(a: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a)) {
+            val b = JS_GetBigInt(ctx, a)
+            return if (b == null) JS_EXCEPTION else JS_NewBigInt(ctx, b.not())
+        }
         return JS_NewShortInt(toInt32(a).inv())
     }
     
     fun doLt(a: JSValue, b: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) {
+            val c = bigIntCompareNumeric(a, b) ?: return JS_FALSE
+            return if (c < 0) JS_TRUE else JS_FALSE
+        }
         if (JS_IsString(ctx, a) && JS_IsString(ctx, b)) {
             val sa = jsGetString(ctx, a)
             val sb = jsGetString(ctx, b)
@@ -1402,6 +1567,10 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun doLte(a: JSValue, b: JSValue): JSValue {
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) {
+            val c = bigIntCompareNumeric(a, b) ?: return JS_FALSE
+            return if (c <= 0) JS_TRUE else JS_FALSE
+        }
         if (JS_IsString(ctx, a) && JS_IsString(ctx, b)) {
             val sa = jsGetString(ctx, a)
             val sb = jsGetString(ctx, b)
@@ -1419,6 +1588,10 @@ class JSRuntime(private val ctx: JSContext) {
         if (JS_IsString(ctx, a) && JS_IsString(ctx, b)) {
             return if (jsGetString(ctx, a) == jsGetString(ctx, b)) JS_TRUE else JS_FALSE
         }
+        if (JS_IsBigInt(ctx, a) || JS_IsBigInt(ctx, b)) {
+            val c = bigIntCompareNumeric(a, b) ?: return JS_FALSE
+            return if (c == 0) JS_TRUE else JS_FALSE
+        }
         return if (toNumber(a) == toNumber(b)) JS_TRUE else JS_FALSE
     }
     
@@ -1432,6 +1605,10 @@ class JSRuntime(private val ctx: JSContext) {
             return ""
         }
         val ptr = JS_VALUE_TO_PTR(v)
+        if (JS_IsBigInt(ctx, v)) {
+            val b = JS_GetBigInt(ctx, v)
+            return b?.toString() ?: "0"
+        }
         if (ctx.memory.getMTag(ptr) != JSMTags.JS_MTAG_STRING) {
             if (ctx.memory.getMTag(ptr) == JSMTags.JS_MTAG_FLOAT64) {
                 return jsNumberToString(ctx.memory.getFloat64(ptr + 8))
@@ -1497,6 +1674,10 @@ class JSRuntime(private val ctx: JSContext) {
             return JS_UNDEFINED
         }
         val objPtr = JS_VALUE_TO_PTR(obj)
+        if (JS_IsBigInt(ctx, obj)) {
+            return if (ctx.bigIntProto == JS_NULL) JS_UNDEFINED
+                   else getProperty(ctx.bigIntProto, key, obj)
+        }
         if (ctx.memory.getMTag(objPtr) != JSMTags.JS_MTAG_OBJECT) return JS_UNDEFINED
 
         val props = ctx.memory.getJSValue(objPtr + 16)
@@ -1640,10 +1821,12 @@ class JSRuntime(private val ctx: JSContext) {
         if (JS_IsNull(v)) return "object"
         if (JS_IsUndefined(v)) return "undefined"
         if (!JS_IsPtr(v)) return "undefined"
+        if (JS_IsBigInt(ctx, v)) return "bigint"
         val ptr = JS_VALUE_TO_PTR(v)
         when (ctx.memory.getMTag(ptr)) {
             JSMTags.JS_MTAG_STRING -> return "string"
             JSMTags.JS_MTAG_FLOAT64 -> return "number"
+            JSMTags.JS_MTAG_BIGINT -> return "bigint"
             JSMTags.JS_MTAG_OBJECT -> {
                 val classId = ctx.memory.getU8(ptr + 2)
                 if (classId == JSObjectClassEnum.JS_CLASS_CLOSURE.value ||
@@ -1653,6 +1836,7 @@ class JSRuntime(private val ctx: JSContext) {
                 return "object"
             }
         }
+        if (ctx.throwTraceEnabled) System.err.println("TYPEOF_UNKNOWN mtag=${ctx.memory.getMTag(ptr)} ptr=$ptr heapFree=${ctx.heapFree}")
         return "object"
     }
     

@@ -9,7 +9,8 @@ object JSMTags {
     const val JS_MTAG_VALUE_ARRAY: Int = 5
     const val JS_MTAG_BYTE_ARRAY: Int = 6
     const val JS_MTAG_VARREF: Int = 7
-    const val JS_MTAG_COUNT: Int = 8
+    const val JS_MTAG_BIGINT: Int = 8
+    const val JS_MTAG_COUNT: Int = 9
     
     const val JS_MTAG_BITS: Int = 4
     
@@ -21,7 +22,8 @@ object JSMTags {
         "func_bytecode",
         "value_array",
         "byte_array",
-        "varref"
+        "varref",
+        "bigint"
     )
     
     fun getMTagName(mtag: Int): String {
