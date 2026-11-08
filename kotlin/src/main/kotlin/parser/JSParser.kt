@@ -2645,7 +2645,8 @@ class JSParser(private val s: JSParseState) {
         while (p < len) {
             val op = bcU8(p)
             if (op == OPCodeEnum.OP_put_loc.id) {
-                /* i++ / i--（语句上下文） */
+                /* i++ / i--（语句上下文）：前一条 get_loc 已把旧值压栈，
+                 * 超级指令执行时需先弹出该旧值，保持与原序列一致的栈净效果 */
                 val tmp = bcU16(p + 1)
                 if (p + 16 <= len &&
                     bcU8(p + 3) == OPCodeEnum.OP_get_loc.id &&

@@ -851,7 +851,8 @@ class JSRuntime(private val ctx: JSContext) {
                     val iterPtr = JS_VALUE_TO_PTR(iter)
                     val keys = ctx.memory.getJSValue(iterPtr + 8)
                     val pos = JS_VALUE_GET_INT(ctx.memory.getJSValue(iterPtr + 16))
-                    val keyArrPtr = JS_VALUE_TO_PTR(keys)
+                    val keyArrPtr = if (JS_IsPtr(keys)) JS_VALUE_TO_PTR(keys) else -1
+                    if (keyArrPtr < ctx.heapBase || keyArrPtr >= ctx.heapFree) return JS_EXCEPTION
                     val len = ctx.memory.getI32(keyArrPtr + 32)
                     if (pos >= len) {
                         stack.push(JS_UNDEFINED)
@@ -921,12 +922,14 @@ class JSRuntime(private val ctx: JSContext) {
                 OPCodeEnum.OP_inc_loc.id -> {
                     val start = pc - 1
                     val idx = readU16(code, pc)
+                    stack.pop()   /* 丢弃前一条 get_loc 压入的旧值 */
                     vars[idx] = doAdd(vars[idx], JS_NewShortInt(1))
                     pc = start + 16
                 }
                 OPCodeEnum.OP_dec_loc.id -> {
                     val start = pc - 1
                     val idx = readU16(code, pc)
+                    stack.pop()
                     vars[idx] = doSub(vars[idx], JS_NewShortInt(1))
                     pc = start + 16
                 }
@@ -1877,6 +1880,36 @@ class JSRuntime(private val ctx: JSContext) {
     }
     
     fun setProperty(obj: JSValue, key: JSValue, val1: JSValue) {
+        /* 快路径：普通对象已有同名数据属性时直接改写值，无需保活/慢路径分配 */
+        if (JS_IsPtr(obj)) {
+            val op = JS_VALUE_TO_PTR(obj)
+            if (ctx.memory.getMTag(op) == JSMTags.JS_MTAG_OBJECT) {
+                val cid = ctx.memory.getU8(op + 2)
+                if (cid != JSObjectClassEnum.JS_CLASS_ARRAY.value &&
+                    cid != JSObjectClassEnum.JS_CLASS_TYPED_ARRAY.value) {
+                    val props = ctx.memory.getJSValue(op + 16)
+                    if (props != JS_NULL && props != ctx.emptyProps) {
+                        val pp = JS_VALUE_TO_PTR(props)
+                        val mask = JS_VALUE_GET_INT(ctx.memory.getJSValue(pp + 16))
+                        val h = hashProp(key, mask)
+                        var idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(pp + 24 + h * 8)) shr 1
+                        while (idx != 0) {
+                            val propPtr = pp + 8 + idx * 8
+                            val pk = ctx.memory.getJSValue(propPtr)
+                            if (pk == key || jsPropKeyEquals(pk, key)) {
+                                val cur = ctx.memory.getJSValue(propPtr + 8)
+                                if (!isAccessorValue(cur)) {
+                                    ctx.memory.putJSValue(propPtr + 8, val1)
+                                    return
+                                }
+                                break
+                            }
+                            idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propPtr + 16)) shr 1
+                        }
+                    }
+                }
+            }
+        }
         /* obj/key/val1 保活：写入路径的 allocProps/扩容 malloc 可能触发 GC 搬移，
          * Kotlin 局部值会过期——内部通过保活列表读取最新地址 */
         ctx.gcKeepAlive.add(obj)

@@ -31,8 +31,8 @@ object JSGC {
         gcMark(ctx, markStack, ctx.minusZero)
         
         /* 原生代码分配期间的临时保活值 */
-        for (v in ctx.gcKeepAlive) {
-            gcMark(ctx, markStack, v)
+        for (i in 0 until ctx.gcKeepAlive.size) {
+            gcMark(ctx, markStack, ctx.gcKeepAlive[i])
         }
         
         /* 闭包捕获变量槽池（对照 C 的 varref 对象图） */

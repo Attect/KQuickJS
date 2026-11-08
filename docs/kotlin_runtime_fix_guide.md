@@ -616,15 +616,44 @@ var r = outer();
 | `tests/mandelbrot.js` | 通过（rc=0，输出正确图形） |
 | Kotlin 全量测试 | 173 个全部通过 |
 
+### 性能与内存对齐（2026-11 第四期）
+
+- **闭包惰性 prototype**：闭包对象用 extra 槽保存 funcBytecode/prototype/name，
+  `prototype` 首次访问或 `new` 时才创建；不再为每个函数建立属性表。
+  256KB 堆 + 标准库下 400 个全局函数可正常创建/调用（此前 400 即 OOM）；
+- **标准库内存足迹**：实测引导占用约 69KB，`MIN_MEM_SIZE` 降回 160KB
+  （`MemoryFootprintTest` 覆盖）；
+- **数组几何扩容**：`push`/`setElement` 按 2 倍扩容，消除逐元素 O(n²) 复制；
+- **原生执行栈**：操作数栈/局部变量表改为 `LongArray`（`ValueStack`/`ValueArray`，
+  通过 `JvmRoot` 接口参与 GC 标记/搬移），并做调用间池化复用；
+- **调用帧数组化**：`ctx.frameKeeps/framePcs` 原生 IntArray 栈，错误回溯时按需解码
+  函数名/行号，移除每次调用的字符串分配与 `System.getenv`；
+- **字节码缓存**：按函数块指针缓存 ByteArray（GC 同步 key），避免每次调用从堆复制；
+- **peephole 超级指令**（等长替换 + NOP 填充，跳转偏移不变）：
+  局部自增/自减、局部复合赋值（`s += b`、`s += 小整数`）、局部比较跳转、
+  局部二元运算（`get_loc/push_imm/op`、`get_loc/get_loc/op`）。
+
+本机固定工作负载（临时目录 bench.js，含 int 循环/函数调用/属性/数组/字符串）：
+
+| 指标 | 优化前 | 优化后 |
+|------|--------|--------|
+| int 2M 次 | 55.8s | 32.8s |
+| 函数调用 1M 次 | 29.7s | 18.5s |
+| 属性读写 1M 次 | 29.5s | 21.2s |
+| 数组 push/read 500K | 197.6s→22.8s（几何扩容后） | 13.3s |
+| 字符串 1M 次 | 18.5s | 10.7s |
+| 合计 | 342.8s | 96.5s（约 3.5 倍） |
+
 ### 已知限制
 
-1. 极低内存（256KB 堆）下 300+ 全局函数仍可能因属性表分配失败而丢失末尾属性；
-   标准库启用阈值已提高到 512KB（Kotlin 标准库内存占用较大），
-   回归测试维持 300 函数；
+1. 256KB 堆下 600 个全局函数（含标准库）仍会 OOM；800 个在解析期即 OOM。
+   回归测试使用 400 函数；
 2. `Set`/`BigInt` 未实现（microbench 有 `typeof` 守卫可跳过 BigInt，
    `Set` 基准在测试列表中被注释掉）；
 3. 默认 `Array.prototype.sort` 的快速路径仅覆盖原始值元素；含对象元素或自定义
-   比较函数时走通用路径（正确但较慢）。
+   比较函数时走通用路径（正确但较慢）；
+4. 解释器仍是逐指令分发的 Kotlin 循环，虽经超级指令优化，单条指令成本仍显著高于
+   C 版；如需进一步接近 C 性能，需要更彻底的分发/代码生成改造。
 
 ## 相关文件
 
@@ -651,3 +680,4 @@ var r = outer();
 - **2026-11-05**：语言特性与标准库对齐（switch/for-in/标签/提升/访问器/arguments、Array/String/Number/Math/JSON/Error/RegExp/TypedArray、WTF-8 字符串、全局 eval/Function/bind）
 - **2026-11-05**：错误回溯行列号与严格模式语义（pc2line 表、SyntaxError stack、未声明赋值 ReferenceError、null 访问 TypeError、异常统一展开）
 - **2026-11-05**：Array 默认排序快速路径、setElement 扩容 GC 保活；五个 JS 测试文件与 Kotlin 全量测试全部通过
+- **2026-11-08**：内存/性能对齐（惰性闭包原型、标准库阈值 160KB、数组几何扩容、原生执行栈与帧栈、字节码缓存、peephole 超级指令；bench 约 3.5 倍提升）

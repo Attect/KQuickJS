@@ -59,7 +59,7 @@ class JSContext(
     /* 原生代码分配期间的临时 GC 保活列表：JSGC 的 mark 与压缩根更新会遍历它。
      * 注意不要用 pushValue/popValue（ctx.sp）保活——解释器运行中 ctx.sp 与
      * 局部缓存的 sp 不同步，会破坏执行栈 */
-    val gcKeepAlive: MutableList<JSValue> = mutableListOf()
+    val gcKeepAlive: JSValueList = JSValueList()
     /* Function.prototype.bind 的绑定信息：每项为 gcKeepAlive 槽索引
      * [target, thisArg, firstBoundArg, boundArgCount]（槽位永久保活并由 GC 更新） */
     val boundFns: MutableList<IntArray> = mutableListOf()
@@ -346,4 +346,32 @@ class ListRoot(private val list: MutableList<JSValue>) : JvmRoot {
     override val rootSize: Int get() = list.size
     override fun rootGet(i: Int): JSValue = list[i]
     override fun rootSet(i: Int, v: JSValue) { list[i] = v }
+}
+/* 原生 LongArray 的 JSValue 列表：用于 gcKeepAlive 等高频 add/get 场景，
+ * 避免 MutableList<Long> 的装箱与逐次扩容对象分配 */
+class JSValueList(initialCapacity: Int = 64) {
+    private var data = LongArray(if (initialCapacity > 0) initialCapacity else 8)
+    var size = 0
+        private set
+
+    fun add(v: JSValue) {
+        if (size == data.size) data = data.copyOf(if (data.size < 16) 32 else data.size * 2)
+        data[size++] = v
+    }
+
+    operator fun get(i: Int): JSValue = data[i]
+    operator fun set(i: Int, v: JSValue) { data[i] = v }
+
+    fun removeAt(i: Int): JSValue {
+        val v = data[i]
+        val n = size - i - 1
+        if (n > 0) System.arraycopy(data, i + 1, data, i, n)
+        size--
+        return v
+    }
+
+    fun last(): JSValue = data[size - 1]
+    val indices: IntRange get() = 0 until size
+    fun isEmpty(): Boolean = size == 0
+    fun clear() { size = 0 }
 }
