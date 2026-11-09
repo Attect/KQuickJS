@@ -699,6 +699,11 @@ class JSRuntime(private val ctx: JSContext) {
                         pc = target
                     } else {
                         setElement(obj, idx, val1)
+                        if (JS_HasException(ctx)) {
+                            val target = unwindToCatch(stack)
+                            if (target < 0) return JS_EXCEPTION
+                            pc = target
+                        }
                     }
                 }
                 
@@ -1255,9 +1260,13 @@ class JSRuntime(private val ctx: JSContext) {
         if (JS_IsBool(v)) return JS_VALUE_GET_SPECIAL_VALUE(v) != 0
         if (JS_IsPtr(v)) {
             if (JS_IsBigInt(ctx, v)) {
-                val b = JS_GetBigInt(ctx, v)
-                return b != null && b.signum() != 0
+            val b = JS_GetBigIntAny(ctx, v)
+            return when (b) {
+                is Long -> b != 0L
+                is java.math.BigInteger -> b.signum() != 0
+                else -> false
             }
+        }
             val ptr = JS_VALUE_TO_PTR(v)
             if (ctx.memory.getMTag(ptr) == JSMTags.JS_MTAG_FLOAT64) {
                 val d = ctx.memory.getFloat64(ptr + 8)
@@ -1334,6 +1343,34 @@ class JSRuntime(private val ctx: JSContext) {
     /* BigInt 二元运算：两侧必须都是 BigInt；除法/取模按向零截断，
      * 位移计数为 BigInt（负数反向移位），其余位运算按补码语义 */
     fun bigIntBinary(op: OPCodeEnum, a: JSValue, b: JSValue): JSValue {
+        val anyX = JS_GetBigIntAny(ctx, a)
+        val anyY = JS_GetBigIntAny(ctx, b)
+        if (anyX == null || anyY == null) {
+            return JS_ThrowTypeError(ctx, "cannot mix BigInt and other types, use explicit conversions")
+        }
+        /* Long 快速路径：64 位范围内避免 BigInteger 分配 */
+        if (anyX is Long && anyY is Long) {
+            val fast: Long? = when (op) {
+                OPCodeEnum.OP_add -> try { Math.addExact(anyX, anyY) } catch (e: ArithmeticException) { null }
+                OPCodeEnum.OP_sub -> try { Math.subtractExact(anyX, anyY) } catch (e: ArithmeticException) { null }
+                OPCodeEnum.OP_mul -> try { Math.multiplyExact(anyX, anyY) } catch (e: ArithmeticException) { null }
+                OPCodeEnum.OP_div -> {
+                    if (anyY == 0L) return JS_ThrowRangeError(ctx, "division by zero")
+                    if (anyX == Long.MIN_VALUE && anyY == -1L) null else anyX / anyY
+                }
+                OPCodeEnum.OP_mod -> {
+                    if (anyY == 0L) return JS_ThrowRangeError(ctx, "division by zero")
+                    if (anyX == Long.MIN_VALUE && anyY == -1L) 0L else anyX % anyY
+                }
+                OPCodeEnum.OP_and -> anyX and anyY
+                OPCodeEnum.OP_or -> anyX or anyY
+                OPCodeEnum.OP_xor -> anyX xor anyY
+                OPCodeEnum.OP_shl -> shiftLong(anyX, anyY, left = true)
+                OPCodeEnum.OP_shr, OPCodeEnum.OP_sar -> shiftLong(anyX, anyY, left = false)
+                else -> null
+            }
+            if (fast != null) return JS_NewBigInt(ctx, fast)
+        }
         val x = JS_GetBigInt(ctx, a)
         val y = JS_GetBigInt(ctx, b)
         if (x == null || y == null) {
@@ -1368,6 +1405,22 @@ class JSRuntime(private val ctx: JSContext) {
             return JS_ThrowRangeError(ctx, "BigInt arithmetic error")
         }
         return JS_NewBigInt(ctx, r)
+    }
+    
+    /* Long 位移：结果超出 64 位时返回 null，由 BigInteger 慢路径处理 */
+    private fun shiftLong(x: Long, y: Long, left: Boolean): Long? {
+        if (y > 63L || y < -63L) return null
+        val n = y.toInt()
+        if (left) {
+            if (n >= 0) {
+                val r = x shl n
+                return if ((r shr n) == x) r else null
+            }
+            return x shr (-n)
+        }
+        if (n >= 0) return x shr n
+        val r = x shl (-n)
+        return if ((r shr (-n)) == x) r else null
     }
     
     private fun shiftBigInt(x: java.math.BigInteger, y: java.math.BigInteger,
@@ -1416,6 +1469,9 @@ class JSRuntime(private val ctx: JSContext) {
     
     /* BigInt 与数字/字符串之间的数值比较（关系运算与 == 使用） */
     private fun bigIntCompareNumeric(a: JSValue, b: JSValue): Int? {
+        val xa = JS_GetBigIntAny(ctx, a)
+        val ya = JS_GetBigIntAny(ctx, b)
+        if (xa is Long && ya is Long) return xa.compareTo(ya)
         val ba = JS_GetBigInt(ctx, a)
         val bb = JS_GetBigInt(ctx, b)
         if (ba != null && bb != null) return ba.compareTo(bb)
@@ -1519,8 +1575,12 @@ class JSRuntime(private val ctx: JSContext) {
     
     fun doNeg(a: JSValue): JSValue {
         if (JS_IsBigInt(ctx, a)) {
-            val b = JS_GetBigInt(ctx, a)
-            return if (b == null) JS_EXCEPTION else JS_NewBigInt(ctx, b.negate())
+            return when (val b = JS_GetBigIntAny(ctx, a)) {
+                is Long -> if (b == Long.MIN_VALUE) JS_NewBigInt(ctx, java.math.BigInteger.valueOf(b).negate())
+                          else JS_NewBigInt(ctx, -b)
+                is java.math.BigInteger -> JS_NewBigInt(ctx, b.negate())
+                else -> JS_EXCEPTION
+            }
         }
         if (JS_IsInt(a)) {
             val ia = JS_VALUE_GET_INT(a)
@@ -1573,8 +1633,11 @@ class JSRuntime(private val ctx: JSContext) {
     
     fun doNot(a: JSValue): JSValue {
         if (JS_IsBigInt(ctx, a)) {
-            val b = JS_GetBigInt(ctx, a)
-            return if (b == null) JS_EXCEPTION else JS_NewBigInt(ctx, b.not())
+            return when (val b = JS_GetBigIntAny(ctx, a)) {
+                is Long -> JS_NewBigInt(ctx, b.inv())
+                is java.math.BigInteger -> JS_NewBigInt(ctx, b.not())
+                else -> JS_EXCEPTION
+            }
         }
         return JS_NewShortInt(toInt32(a).inv())
     }
@@ -1632,8 +1695,11 @@ class JSRuntime(private val ctx: JSContext) {
         }
         val ptr = JS_VALUE_TO_PTR(v)
         if (JS_IsBigInt(ctx, v)) {
-            val b = JS_GetBigInt(ctx, v)
-            return b?.toString() ?: "0"
+            return when (val b = JS_GetBigIntAny(ctx, v)) {
+                is Long -> b.toString()
+                is java.math.BigInteger -> b.toString()
+                else -> "0"
+            }
         }
         if (ctx.memory.getMTag(ptr) != JSMTags.JS_MTAG_STRING) {
             if (ctx.memory.getMTag(ptr) == JSMTags.JS_MTAG_FLOAT64) {

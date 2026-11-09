@@ -677,6 +677,24 @@ var r = outer();
   `BigInteger` 本体存于 `userOpaqueTable`（GC 释放清理、搬移更新 key）。
 - `microbench.js` 的 `bigint64_arith`/`bigint256_arith` 基准已可运行并通过。
 
+### Set 哈希索引与 BigInt 64 位优化（2026-11 第七期）
+
+- **Set 哈希索引**：Set 对象 3 个隐藏槽——+24 值数组、+32 桶数组、+40 计数；
+  桶为 2 的幂容量、开放寻址线性探测，`add/has/delete` 均摊 O(1)；
+  哈希稳定：字符串按内容 FNV-1a、数值按位型（NaN 归一、-0=+0）、BigInt 按值，
+  对象/函数用常量哈希（GC 搬移会改变指针，不能按地址哈希，注意对象多时退化为同桶）。
+  扩容按负载 0.75 重建；`delete` 标记 tombstone 后压缩重建，保持迭代顺序与
+  `for...of` 正确。GC 同步标记/搬移 +24/+32 两个数组。
+  实测 5000 元素 Set：20000 次 `has` 约 0.43s（线性实现不可行）。
+- **BigInt Long 快速路径**：64 位范围内的 BigInt 以 Kotlin `Long` 存储
+  （`userOpaqueTable`），超出时回退 `BigInteger`；加/减/乘用
+  `Math.addExact` 等检测溢出，除/模/位运算/移位优先 Long，溢出或大位移回退
+  BigInteger；比较、`typeof`、`toString` 同样有 Long 分支。语义与任意精度一致。
+- **BigInt TypedArray**：新增 `BigInt64Array`、`BigUint64Array`（BPE=8，
+  小端读写，共享 ArrayBuffer/subarray）；写入必须是 BigInt，否则抛 TypeError；
+  读取返回 BigInt（无符号高位用 BigInteger 表示），支持构造器数组拷贝、
+  `set()`、`subarray()`；`a[0]=1` 这类 Number 写入会抛 TypeError 并走异常展开。
+
 ### 已知限制
 
 1. 小堆回归场景改为 **512KB 堆 + 1000 个全局函数**（通过）；更大规模（1500+）
@@ -686,7 +704,6 @@ var r = outer();
 3. 解释器仍是逐指令分发的 Kotlin 循环，虽经超级指令优化，单条指令成本仍显著高于
    C 版；如需进一步接近 C 性能，需要更彻底的分发/代码生成改造；
 4. BigInt 移位/指数计数需落在 Int 范围内（超大计数报 RangeError）；
-   `BigInt64Array`/TypedArray 的 BigInt 变体未实现；
 5. Set 元素存储为线性数组（add/has/delete 为 O(n)），大数据量下未做哈希索引；
 6. 解析期大栈重试仅覆盖 `JS_Eval` 解析阶段；JS 运行时深递归由
    `--max-call-depth` 限制，不再依赖 JVM 栈溢出。
@@ -719,3 +736,4 @@ var r = outer();
 - **2026-11-08**：内存/性能对齐（惰性闭包原型、标准库阈值 160KB、数组几何扩容、原生执行栈与帧栈、字节码缓存、peephole 超级指令；bench 约 3.5 倍提升）
 - **2026-11-08**：实现 Set 与 BigInt；小堆回归扩大到 512KB/1000 函数；microbench bigint 基准可运行
 - **2026-11-08**：可配置 `--stack-size`/`--max-call-depth`；完善 Set（for-of/构造器/类型标签）与 BigInt（JSON/Number/>>>/asIntN 等边界）
+- **2026-11-09**：Set 改为哈希索引（开放寻址）；BigInt 增加 64 位 Long 快路径；实现 BigInt64Array/BigUint64Array

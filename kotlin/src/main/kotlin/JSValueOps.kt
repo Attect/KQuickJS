@@ -154,7 +154,17 @@ fun JS_IsBigInt(ctx: JSContext, v: JSValue): Boolean {
 
 fun JS_GetBigInt(ctx: JSContext, v: JSValue): java.math.BigInteger? {
     if (!JS_IsBigInt(ctx, v)) return null
-    return ctx.userOpaqueTable[JS_VALUE_TO_PTR(v)] as? java.math.BigInteger
+    return when (val raw = ctx.userOpaqueTable[JS_VALUE_TO_PTR(v)]) {
+        is java.math.BigInteger -> raw
+        is Long -> java.math.BigInteger.valueOf(raw)
+        else -> null
+    }
+}
+
+/* Long 快速路径：64 位范围内的 BigInt 以 Long 存储，避免 BigInteger 对象开销 */
+fun JS_GetBigIntAny(ctx: JSContext, v: JSValue): Any? {
+    if (!JS_IsBigInt(ctx, v)) return null
+    return ctx.userOpaqueTable[JS_VALUE_TO_PTR(v)]
 }
 
 fun JS_NewBigInt(ctx: JSContext, value: java.math.BigInteger): JSValue {
@@ -162,12 +172,20 @@ fun JS_NewBigInt(ctx: JSContext, value: java.math.BigInteger): JSValue {
     if (ptr == 0) return JS_EXCEPTION
     ctx.memory.putU8(ptr + 2, 1)              /* detached：GC 不遍历 +16 */
     ctx.memory.putI32(ptr + 4, JS_BIGINT_MAGIC)
+    ctx.userOpaqueTable[ptr] =
+        if (value.bitLength() <= 63) value.toLong() else value
+    return JS_VALUE_FROM_PTR(ptr)
+}
+
+fun JS_NewBigInt(ctx: JSContext, value: Long): JSValue {
+    val ptr = ctx.malloc(16, JS_MTAG_VARREF)
+    if (ptr == 0) return JS_EXCEPTION
+    ctx.memory.putU8(ptr + 2, 1)
+    ctx.memory.putI32(ptr + 4, JS_BIGINT_MAGIC)
     ctx.userOpaqueTable[ptr] = value
     return JS_VALUE_FROM_PTR(ptr)
 }
 
-fun JS_NewBigInt(ctx: JSContext, value: Long): JSValue =
-    JS_NewBigInt(ctx, java.math.BigInteger.valueOf(value))
 /* JS 字符串使用 WTF-8 编码存储：允许孤立代理项（\udbc4 等）原样往返，
  * 普通 UTF-8 无法表示孤立代理项（会被替换成 '?'），会破坏字符串拼接/切片语义 */
 fun jsEncodeString(str: String): ByteArray {

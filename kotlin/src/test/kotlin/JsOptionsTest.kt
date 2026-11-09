@@ -61,6 +61,43 @@ class JsOptionsTest {
         assertTrue("Set/BigInt 语义检查失败", jsToBoolean(ctx, r))
     }
 
+    @Test
+    fun setHashingSurvivesGcAndDeletion() {
+        val ctx = newCtx()
+        val r = JS_Eval(ctx, """
+            var s = new Set();
+            for (var i = 0; i < 200; i++) s.add("k" + i);
+            for (var round = 0; round < 10; round++)
+                for (var j = 0; j < 2000; j++) { var t = "tmp" + j; }
+            var ok = s.size === 200;
+            for (var i = 0; i < 200; i++) if (!s.has("k" + i)) ok = false;
+            if (!s.delete("k5") || s.has("k5") || s.size !== 199) ok = false;
+            s.add("k5");
+            var obj = {};
+            s.add(obj); s.add(obj);
+            if (s.size !== 201 || !s.has(obj)) ok = false;
+            ok
+        """.trimIndent(), "<sethash>", JS_EVAL_RETVAL)
+        assertTrue("哈希 Set 语义/GC 检查失败", !JS_IsException(r) && jsToBoolean(ctx, r))
+    }
+
+    @Test
+    fun bigIntLongPathAndBigIntTypedArrays() {
+        val ctx = newCtx()
+        val r = JS_Eval(ctx, """
+            var a = new BigInt64Array(3);
+            a[0] = 1n; a[1] = -2n; a[2] = 9223372036854775807n;
+            var b = new BigUint64Array([18446744073709551615n, 9223372036854775808n]);
+            var e1 = false;
+            try { a[0] = 1 } catch (e) { e1 = e instanceof TypeError }
+            var overflow = (9223372036854775807n + 1n) === 9223372036854775808n;
+            a[0] === 1n && a[1] === -2n && a[2] === 9223372036854775807n &&
+            b[0] === 18446744073709551615n && b[1] === 9223372036854775808n &&
+            BigInt64Array.BYTES_PER_ELEMENT === 8 && e1 && overflow
+        """.trimIndent(), "<bigtyped>", JS_EVAL_RETVAL)
+        assertTrue("BigInt Long 路径/TypedArray 检查失败", !JS_IsException(r) && jsToBoolean(ctx, r))
+    }
+
     private fun jsToBoolean(ctx: JSContext, v: JSValue): Boolean {
         if (JS_IsBool(v)) return JS_VALUE_GET_SPECIAL_VALUE(v) != 0
         return false

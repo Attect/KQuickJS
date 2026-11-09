@@ -1837,7 +1837,19 @@ object JSStdlib {
         for (i in 0 until 8) bits = bits or ((b[o + i].toLong() and 0xFF) shl (8 * i))
         return Double.fromBits(bits)
     }
-    private fun writeTypedF64(b: ByteArray, o: Int, d: Double) {
+    private fun readTypedI64(b: ByteArray, o: Int): Long {
+        var bits = 0L
+        for (i in 0 until 8) bits = bits or ((b[o + i].toLong() and 0xFF) shl (8 * i))
+        return bits
+    }
+    private fun writeTypedI64(b: ByteArray, o: Int, v: Long) {
+        for (i in 0 until 8) b[o + i] = ((v shr (8 * i)) and 0xFF).toByte()
+    }
+    private fun readTypedU64Big(b: ByteArray, o: Int): java.math.BigInteger {
+        var x = java.math.BigInteger.ZERO
+        for (i in 7 downTo 0) x = x.shiftLeft(8).or(java.math.BigInteger.valueOf((b[o + i].toLong() and 0xFF)))
+        return x
+    }    private fun writeTypedF64(b: ByteArray, o: Int, d: Double) {
         val bits = d.toBits()
         for (i in 0 until 8) b[o + i] = ((bits shr (8 * i)) and 0xFF).toByte()
     }
@@ -1853,6 +1865,12 @@ object JSStdlib {
             5 -> JS_NewShortInt(readTypedI32(ti.bytes, o))
             6 -> JS_NewFloat64(ctx, readTypedF32(ti.bytes, o).toDouble())
             7 -> JS_NewFloat64(ctx, readTypedF64(ti.bytes, o))
+            9 -> JS_NewBigInt(ctx, readTypedI64(ti.bytes, o))
+            10 -> {
+                val bits = readTypedI64(ti.bytes, o)
+                if (bits >= 0) JS_NewBigInt(ctx, bits)
+                else JS_NewBigInt(ctx, readTypedU64Big(ti.bytes, o))
+            }
             else -> JS_NewShortInt(ti.bytes[o].toInt() and 0xFF)
         }
     }
@@ -1866,6 +1884,20 @@ object JSStdlib {
             5 -> writeTypedI32(ti.bytes, o, rt.toInt32(v).toLong())
             6 -> writeTypedF32(ti.bytes, o, rt.toNumber(v).toFloat())
             7 -> writeTypedF64(ti.bytes, o, rt.toNumber(v))
+            9, 10 -> {
+                val any = JS_GetBigIntAny(ctx, v)
+                if (any == null) {
+                    JS_ThrowTypeError(ctx, "cannot convert value to BigInt")
+                    return
+                }
+                val big = when (any) {
+                    is Long -> java.math.BigInteger.valueOf(any)
+                    is java.math.BigInteger -> any
+                    else -> java.math.BigInteger.ZERO
+                }
+                val mod = big.mod(java.math.BigInteger.ONE.shiftLeft(64))
+                writeTypedI64(ti.bytes, o, mod.toLong())
+            }
             else -> {
                 val d = rt.toNumber(v)
                 val clamped = when {
@@ -1950,7 +1982,8 @@ object JSStdlib {
             Triple("Uint16Array", 2, 2), Triple("Int16Array", 2, 3),
             Triple("Uint32Array", 4, 4), Triple("Int32Array", 4, 5),
             Triple("Float32Array", 4, 6), Triple("Float64Array", 8, 7),
-            Triple("Uint8ClampedArray", 1, 8)
+            Triple("Uint8ClampedArray", 1, 8),
+            Triple("BigInt64Array", 8, 9), Triple("BigUint64Array", 8, 10)
         )
         for ((name, bpe, kind) in defs) {
             val proto = JS_NewObject(ctx)
@@ -2052,7 +2085,7 @@ object JSStdlib {
         }
     }
 
-    /* ---------------- Set ---------------- */
+    /* ---------------- Set（哈希索引） ---------------- */
 
     private fun isSetValue(c: JSContext, v: JSValue): Boolean {
         if (!JS_IsPtr(v)) return false
@@ -2063,7 +2096,6 @@ object JSStdlib {
 
     private fun setSameValueZero(rt: JSRuntime, a: JSValue, b: JSValue): Boolean {
         if (rt.strictEquals(a, b)) return true
-        /* SameValueZero：NaN 与 NaN 视为相同 */
         if (rt.isNumberValue(a) && rt.isNumberValue(b)) {
             val x = rt.toNumber(a)
             val y = rt.toNumber(b)
@@ -2072,9 +2104,119 @@ object JSStdlib {
         return false
     }
 
-    private fun setLength(c: JSContext, setObj: JSValue): Int {
-        val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(setObj) + 24)
-        return if (JS_IsPtr(arr)) c.memory.getI32(JS_VALUE_TO_PTR(arr) + 32) else 0
+    private fun setCount(c: JSContext, setObj: JSValue): Int {
+        val n = c.memory.getJSValue(JS_VALUE_TO_PTR(setObj) + 40)
+        return if (JS_IsInt(n)) JS_VALUE_GET_INT(n) else 0
+    }
+
+    /* 稳定哈希：字符串按内容、数值按位型（NaN 归一、-0=+0）、BigInt 按值；
+     * 对象/函数使用常量哈希（GC 搬移会改变指针，不能按地址哈希），
+     * 因此对象多的 Set 会退化为同桶链，但语义保持正确。 */
+    private fun setHashValue(c: JSContext, rt: JSRuntime, v: JSValue): Int {
+        if (JS_IsInt(v)) return JS_VALUE_GET_INT(v)
+        if (JS_IsShortFloat(v)) {
+            val d = jsGetShortFloat(v)
+            val n = if (d == 0.0) 0.0 else d
+            return java.lang.Double.hashCode(n)
+        }
+        if (JS_IsBool(v)) return if (JS_VALUE_GET_SPECIAL_VALUE(v) != 0) 1231 else 1237
+        if (JS_IsNull(v)) return 0x6e756c6c
+        if (JS_IsUndefined(v)) return 0x756e6465
+        if (JS_IsString(c, v)) {
+            val p = JS_VALUE_TO_PTR(v)
+            val len = c.memory.getI32(p + 4)
+            var h = 0x811c9dc5.toInt()
+            for (i in 0 until len) {
+                h = (h xor (c.memory.getU8(p + 8 + i) and 0xFF)) * 16777619
+            }
+            return h
+        }
+        if (JS_IsBigInt(c, v)) {
+            val b = JS_GetBigInt(c, v)
+            return b?.hashCode() ?: 0
+        }
+        if (JS_IsPtr(v)) {
+            val p = JS_VALUE_TO_PTR(v)
+            if (c.memory.getMTag(p) == JSMTags.JS_MTAG_FLOAT64) {
+                val d = c.memory.getFloat64(p + 8)
+                val n = if (d == 0.0) 0.0 else d
+                return java.lang.Double.hashCode(n)
+            }
+        }
+        return 0x9e3779b9.toInt()
+    }
+
+    private fun setFindIndex(c: JSContext, rt: JSRuntime, setObj: JSValue, v: JSValue): Int {
+        val values = c.memory.getJSValue(JS_VALUE_TO_PTR(setObj) + 24)
+        val buckets = c.memory.getJSValue(JS_VALUE_TO_PTR(setObj) + 32)
+        if (!JS_IsPtr(values) || !JS_IsPtr(buckets)) return -1
+        val cap = c.memory.getI32(JS_VALUE_TO_PTR(buckets) + 32)
+        if (cap <= 0) return -1
+        val mask = cap - 1
+        var idx = setHashValue(c, rt, v) and mask
+        for (n in 0 until cap) {
+            val b = rt.getElement(buckets, JS_NewShortInt(idx))
+            if (!JS_IsInt(b) || JS_VALUE_GET_INT(b) == 0) return -1
+            val vi = JS_VALUE_GET_INT(b) - 1
+            val cur = rt.getElement(values, JS_NewShortInt(vi))
+            if (setSameValueZero(rt, cur, v)) return vi
+            idx = (idx + 1) and mask
+        }
+        return -1
+    }
+
+    private fun setInsertBucket(c: JSContext, rt: JSRuntime, buckets: JSValue, cap: Int,
+                                values: JSValue, valueIdx: Int) {
+        val v = rt.getElement(values, JS_NewShortInt(valueIdx))
+        val mask = cap - 1
+        var idx = setHashValue(c, rt, v) and mask
+        for (n in 0 until cap) {
+            val b = rt.getElement(buckets, JS_NewShortInt(idx))
+            if (!JS_IsInt(b) || JS_VALUE_GET_INT(b) == 0) {
+                rt.setElement(buckets, JS_NewShortInt(idx), JS_NewShortInt(valueIdx + 1))
+                return
+            }
+            idx = (idx + 1) and mask
+        }
+    }
+
+    /* 重建哈希表：压缩 values（跳过 tombstone）并按新容量重插桶 */
+    private fun setRebuild(c: JSContext, rt: JSRuntime, setObj: JSValue, newCap0: Int) {
+        val keep = c.gcKeepAlive.size
+        c.gcKeepAlive.add(setObj)
+        try {
+            val oldVals = c.memory.getJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24)
+            val oldLen = if (JS_IsPtr(oldVals)) c.memory.getI32(JS_VALUE_TO_PTR(oldVals) + 32) else 0
+            /* 容量至少容纳所有存活值（含 tombstone 的旧长度），负载 <= 0.5 */
+            val need = maxOf(newCap0, oldLen * 2, 16)
+            val cap = Integer.highestOneBit(need - 1) shl 1
+            c.gcKeepAlive.add(oldVals)
+            val nv = JS_NewArray(c, 0)
+            c.gcKeepAlive.add(nv)
+            var n = 0
+            for (i in 0 until oldLen) {
+                val v = rt.getElement(c.gcKeepAlive[keep + 1], JS_NewShortInt(i))
+                if (v == JS_UNINITIALIZED) continue
+                rt.setElement(c.gcKeepAlive[keep + 2], JS_NewShortInt(n), v)
+                n++
+            }
+            c.memory.putI32(JS_VALUE_TO_PTR(c.gcKeepAlive[keep + 2]) + 32, n)
+            val nb = JS_NewArray(c, cap)
+            c.gcKeepAlive.add(nb)
+            for (i in 0 until cap) {
+                rt.setElement(c.gcKeepAlive[keep + 3], JS_NewShortInt(i), JS_NewShortInt(0))
+            }
+            for (i in 0 until n) {
+                setInsertBucket(c, rt, c.gcKeepAlive[keep + 3], cap,
+                                c.gcKeepAlive[keep + 2], i)
+            }
+            val op = JS_VALUE_TO_PTR(c.gcKeepAlive[keep])
+            c.memory.putJSValue(op + 24, c.gcKeepAlive[keep + 2])
+            c.memory.putJSValue(op + 32, c.gcKeepAlive[keep + 3])
+            c.memory.putJSValue(op + 40, JS_NewShortInt(n))
+        } finally {
+            while (c.gcKeepAlive.size > keep) c.gcKeepAlive.removeAt(c.gcKeepAlive.size - 1)
+        }
     }
 
     private fun initSet(ctx: JSContext, rt: JSRuntime) {
@@ -2086,18 +2228,23 @@ object JSStdlib {
             c.gcKeepAlive.add(setObj)
             c.gcKeepAlive.add(value)
             try {
-                val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24)
-                if (!JS_IsPtr(arr)) return
-                val len = c.memory.getI32(JS_VALUE_TO_PTR(arr) + 32)
-                for (i in 0 until len) {
-                    val cur = rt.getElement(c.gcKeepAlive[keep].let {
-                        c.memory.getJSValue(JS_VALUE_TO_PTR(it) + 24)
-                    }, JS_NewShortInt(i))
-                    if (setSameValueZero(rt, cur, c.gcKeepAlive[keep + 1])) return
+                if (setFindIndex(c, rt, c.gcKeepAlive[keep], c.gcKeepAlive[keep + 1]) >= 0) return
+                var count = setCount(c, c.gcKeepAlive[keep])
+                val buckets = c.memory.getJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 32)
+                val cap = if (JS_IsPtr(buckets))
+                    c.memory.getI32(JS_VALUE_TO_PTR(buckets) + 32) else 0
+                if (cap <= 0 || (count + 1) * 4 > cap * 3) {
+                    setRebuild(c, rt, c.gcKeepAlive[keep], maxOf(cap * 2, 16))
+                    count = setCount(c, c.gcKeepAlive[keep])
                 }
-                val freshArr = c.memory.getJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24)
-                rt.setElement(freshArr, JS_NewShortInt(len), c.gcKeepAlive[keep + 1])
-                c.memory.putI32(JS_VALUE_TO_PTR(freshArr) + 32, len + 1)
+                val vals = c.memory.getJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24)
+                rt.setElement(vals, JS_NewShortInt(count), c.gcKeepAlive[keep + 1])
+                c.memory.putI32(JS_VALUE_TO_PTR(vals) + 32, count + 1)
+                val freshBuckets = c.memory.getJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 32)
+                val freshCap = c.memory.getI32(JS_VALUE_TO_PTR(freshBuckets) + 32)
+                setInsertBucket(c, rt, freshBuckets, freshCap, vals, count)
+                c.memory.putJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 40,
+                                    JS_NewShortInt(count + 1))
             } finally {
                 while (c.gcKeepAlive.size > keep) c.gcKeepAlive.removeAt(c.gcKeepAlive.size - 1)
             }
@@ -2105,15 +2252,23 @@ object JSStdlib {
 
         val ctor = native(ctx, 0) { c, _, args ->
             val obj = JS_NewObjectProtoClass(c, c.classProto[JSObjectClassEnum.JS_CLASS_SET.value],
-                                             JSObjectClassEnum.JS_CLASS_SET.value, 1)
+                                             JSObjectClassEnum.JS_CLASS_SET.value, 3)
             if (JS_IsException(obj)) {
                 JS_EXCEPTION
             } else {
                 val keep = c.gcKeepAlive.size
                 c.gcKeepAlive.add(obj)
                 try {
-                    val arr = JS_NewArray(c, 0)
-                    c.memory.putJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24, arr)
+                    val vals = JS_NewArray(c, 0)
+                    val buckets = JS_NewArray(c, 16)
+                    c.gcKeepAlive.add(vals)
+                    c.gcKeepAlive.add(buckets)
+                    for (i in 0 until 16) {
+                        rt.setElement(c.gcKeepAlive[keep + 2], JS_NewShortInt(i), JS_NewShortInt(0))
+                    }
+                    c.memory.putJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24, c.gcKeepAlive[keep + 1])
+                    c.memory.putJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 32, c.gcKeepAlive[keep + 2])
+                    c.memory.putJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 40, JS_NewShortInt(0))
                     if (args.isNotEmpty() && !JS_IsUndefined(args[0])) {
                         val src = args[0]
                         if (JS_IsString(c, src)) {
@@ -2162,46 +2317,43 @@ object JSStdlib {
             if (!isSetValue(c, thisVal)) {
                 JS_ThrowTypeError(c, "not a Set")
             } else {
-                val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(thisVal) + 24)
-                val len = if (JS_IsPtr(arr)) c.memory.getI32(JS_VALUE_TO_PTR(arr) + 32) else 0
-                var found = false
-                for (i in 0 until len) {
-                    if (setSameValueZero(rt, rt.getElement(arr, JS_NewShortInt(i)), arg(args, 0))) {
-                        found = true; break
-                    }
-                }
-                JS_NewBool(found)
+                JS_NewBool(setFindIndex(c, rt, thisVal, arg(args, 0)) >= 0)
             }
         }
         defMethod(ctx, rt, proto, "delete", 1) { c, thisVal, args ->
             if (!isSetValue(c, thisVal)) {
                 JS_ThrowTypeError(c, "not a Set")
             } else {
-                val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(thisVal) + 24)
-                val len = if (JS_IsPtr(arr)) c.memory.getI32(JS_VALUE_TO_PTR(arr) + 32) else 0
-                var idx = -1
-                for (i in 0 until len) {
-                    if (setSameValueZero(rt, rt.getElement(arr, JS_NewShortInt(i)), arg(args, 0))) {
-                        idx = i; break
-                    }
-                }
-                if (idx >= 0) {
-                    for (i in idx until len - 1) {
-                        rt.setElement(arr, JS_NewShortInt(i),
-                                      rt.getElement(arr, JS_NewShortInt(i + 1)))
-                    }
-                    rt.setElement(arr, JS_NewShortInt(len - 1), JS_UNDEFINED)
-                    c.memory.putI32(JS_VALUE_TO_PTR(arr) + 32, len - 1)
-                    JS_TRUE
-                } else {
+                val idx = setFindIndex(c, rt, thisVal, arg(args, 0))
+                if (idx < 0) {
                     JS_FALSE
+                } else {
+                    val vals = c.memory.getJSValue(JS_VALUE_TO_PTR(thisVal) + 24)
+                    rt.setElement(vals, JS_NewShortInt(idx), JS_UNINITIALIZED)
+                    setRebuild(c, rt, thisVal, 16)
+                    JS_TRUE
                 }
             }
         }
         defMethod(ctx, rt, proto, "clear", 0) { c, thisVal, _ ->
             if (isSetValue(c, thisVal)) {
-                val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(thisVal) + 24)
-                if (JS_IsPtr(arr)) c.memory.putI32(JS_VALUE_TO_PTR(arr) + 32, 0)
+                val keep = c.gcKeepAlive.size
+                c.gcKeepAlive.add(thisVal)
+                try {
+                    val vals = JS_NewArray(c, 0)
+                    val buckets = JS_NewArray(c, 16)
+                    c.gcKeepAlive.add(vals)
+                    c.gcKeepAlive.add(buckets)
+                    for (i in 0 until 16) {
+                        rt.setElement(c.gcKeepAlive[keep + 2], JS_NewShortInt(i), JS_NewShortInt(0))
+                    }
+                    val op = JS_VALUE_TO_PTR(c.gcKeepAlive[keep])
+                    c.memory.putJSValue(op + 24, c.gcKeepAlive[keep + 1])
+                    c.memory.putJSValue(op + 32, c.gcKeepAlive[keep + 2])
+                    c.memory.putJSValue(op + 40, JS_NewShortInt(0))
+                } finally {
+                    while (c.gcKeepAlive.size > keep) c.gcKeepAlive.removeAt(c.gcKeepAlive.size - 1)
+                }
             }
             JS_UNDEFINED
         }
@@ -2214,12 +2366,10 @@ object JSStdlib {
                 c.gcKeepAlive.add(thisVal)
                 c.gcKeepAlive.add(cb)
                 try {
-                    val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24)
-                    val len = if (JS_IsPtr(arr)) c.memory.getI32(JS_VALUE_TO_PTR(arr) + 32) else 0
+                    val len = setCount(c, c.gcKeepAlive[keep])
                     for (i in 0 until len) {
-                        val v = rt.getElement(
-                            c.memory.getJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24),
-                            JS_NewShortInt(i))
+                        val vals = c.memory.getJSValue(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 24)
+                        val v = rt.getElement(vals, JS_NewShortInt(i))
                         val r = rt.callFunction(c.gcKeepAlive[keep + 1],
                             listOf(v, v, c.gcKeepAlive[keep]), JS_UNDEFINED)
                         if (JS_IsException(r)) return@defMethod r
@@ -2231,14 +2381,14 @@ object JSStdlib {
             }
         }
         fun snapshot(c: JSContext, setObj: JSValue): JSValue {
-            val arr = c.memory.getJSValue(JS_VALUE_TO_PTR(setObj) + 24)
-            val len = if (JS_IsPtr(arr)) c.memory.getI32(JS_VALUE_TO_PTR(arr) + 32) else 0
+            val len = setCount(c, setObj)
+            val vals = c.memory.getJSValue(JS_VALUE_TO_PTR(setObj) + 24)
             val out = JS_NewArray(c, len)
             val keep = c.gcKeepAlive.size
             c.gcKeepAlive.add(out)
             for (i in 0 until len) {
                 rt.setElement(c.gcKeepAlive[keep], JS_NewShortInt(i),
-                    rt.getElement(arr, JS_NewShortInt(i)))
+                    rt.getElement(vals, JS_NewShortInt(i)))
             }
             c.memory.putI32(JS_VALUE_TO_PTR(c.gcKeepAlive[keep]) + 32, len)
             return c.gcKeepAlive[keep]
@@ -2254,7 +2404,7 @@ object JSStdlib {
                 JS_ThrowTypeError(c, "not a Set")
             } else {
                 val src = snapshot(c, thisVal)
-                val len = c.memory.getI32(JS_VALUE_TO_PTR(src) + 32)
+                val len = setCount(c, thisVal)
                 val out = JS_NewArray(c, len)
                 val keep = c.gcKeepAlive.size
                 c.gcKeepAlive.add(out)
@@ -2274,12 +2424,11 @@ object JSStdlib {
             }
         }
         val sizeGetter = native(ctx, 0) { c, thisVal, _ ->
-            if (isSetValue(c, thisVal)) JS_NewShortInt(setLength(c, thisVal))
+            if (isSetValue(c, thisVal)) JS_NewShortInt(setCount(c, thisVal))
             else JS_UNDEFINED
         }
         rt.defineAccessor(proto, JS_NewString(ctx, "size"), sizeGetter, true)
     }
-
     /* ---------------- BigInt ---------------- */
 
     private fun initBigInt(ctx: JSContext, rt: JSRuntime) {

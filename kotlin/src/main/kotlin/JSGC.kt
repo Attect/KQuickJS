@@ -216,6 +216,7 @@ object JSGC {
                     }
                     JSObjectClassEnum.JS_CLASS_SET.value -> {
                         gcMark(ctx, markStack, ctx.memory.getJSValue(ptr + 24))
+                        gcMark(ctx, markStack, ctx.memory.getJSValue(ptr + 32))
                     }
                     JSObjectClassEnum.JS_CLASS_ERROR.value -> {
                         /* 错误对象：mark message（槽 0）与 stack（槽 1），对照 C p->u.error */
@@ -393,6 +394,7 @@ object JSGC {
                     }
                     JSObjectClassEnum.JS_CLASS_SET.value -> {
                         remap(ptr + 24)
+                        remap(ptr + 32)
                     }
                     JSObjectClassEnum.JS_CLASS_ERROR.value -> {
                         /* 错误对象：更新 message（槽 0）与 stack（槽 1）指针，对照 C p->u.error */
