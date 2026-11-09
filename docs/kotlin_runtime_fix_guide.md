@@ -648,8 +648,8 @@ var r = outer();
 | 字符串 1M 次 | 18.5s | 10.7s |
 | 合计 | 342.8s | 95~100s（约 3.4~3.6 倍；JVM/JIT 波动约 ±5%） |
 
-完整 `microbench.js` 在本轮优化后运行通过：退出码 0，耗时约 383s，
-末行 `total 508200.70`；包含 bigint64_arith / bigint256_arith 基准
+完整 `microbench.js` 在本轮优化后运行通过：退出码 0，耗时约 401s，
+末行 `total 530226.20`；包含 bigint64_arith / bigint256_arith 基准
 （sort_bench 已正常收尾）。
 
 ### 可配置栈与调用深度（2026-11 第六期）
@@ -704,9 +704,11 @@ var r = outer();
 3. 解释器仍是逐指令分发的 Kotlin 循环，虽经超级指令优化，单条指令成本仍显著高于
    C 版；如需进一步接近 C 性能，需要更彻底的分发/代码生成改造；
 4. BigInt 移位/指数计数需落在 Int 范围内（超大计数报 RangeError）；
-5. Set 元素存储为线性数组（add/has/delete 为 O(n)），大数据量下未做哈希索引；
+5. Set 的对象/函数元素使用常量哈希，对象很多时退化为同桶线性链；
 6. 解析期大栈重试仅覆盖 `JS_Eval` 解析阶段；JS 运行时深递归由
-   `--max-call-depth` 限制，不再依赖 JVM 栈溢出。
+   `--max-call-depth` 限制，不再依赖 JVM 栈溢出；
+7. BigInt TypedArray 尚未提供 `BigInt64Array.prototype` 专有方法
+   （如 `sort`/`fill` 的 BigInt 语义），DataView 的 BigInt 读写也未实现。
 
 ## 相关文件
 
