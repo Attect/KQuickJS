@@ -132,7 +132,7 @@ object JSGC {
                         /* 对象/BigInt 已释放，清理宿主 opaque 与缓存条目 */
                         ctx.userOpaqueTable.remove(ptr1)
                         ctx.pc2lineMap.remove(ptr1)
-                        ctx.byteCodeCache.remove(ptr1)
+                        
                     }
                     
                     total += size1
@@ -325,14 +325,6 @@ object JSGC {
             }
             ctx.pc2lineMap.clear()
             ctx.pc2lineMap.putAll(remapped)
-        }
-        if (ctx.byteCodeCache.isNotEmpty()) {
-            val remapped = HashMap<Int, ByteArray>()
-            for ((oldPtr, v) in ctx.byteCodeCache) {
-                remapped[moveMap[oldPtr] ?: oldPtr] = v
-            }
-            ctx.byteCodeCache.clear()
-            ctx.byteCodeCache.putAll(remapped)
         }
         
         /* pass2：搬移存活块 */

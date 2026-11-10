@@ -100,9 +100,9 @@ class JSContext(
     val throwTraceEnabled: Boolean = System.getenv("MQJS_THROW_TRACE") != null
     /* 函数字节码指针 → pc2line 稀疏表 [pc,packed,...]（GC 搬移时同步更新键） */
     val pc2lineMap: MutableMap<Int, IntArray> = HashMap()
-    /* 函数字节码缓存：按函数块指针缓存一份 ByteArray，避免每次调用都从堆复制
-     * （GC 搬移时同步 key，函数释放时清理） */
-    val byteCodeCache: MutableMap<Int, ByteArray> = HashMap()
+    /* 字节码内容不再缓存：指针地址为 key 的缓存会在 GC 压缩搬移/地址复用、以及同名函数
+     * 重新 eval 后命中陈旧副本，导致「字节码（N 槽布局）× 调用帧（M 槽）」错配越界
+     * （57c9c86 已修指针重取，此处收敛同族问题的内容缓存）。每次调用直接从堆复制。 */
     
     /* 读取函数字节码 +56 的 pc→(line<<16|col) 稀疏表，二分查找不超过 pc 的最近位置 */
     fun pcToLineCol(funcPtr: Int, pc: Int): Int {

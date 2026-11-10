@@ -75,10 +75,10 @@ class JSRuntime(private val ctx: JSContext) {
         
         val byteCodePtr = JS_VALUE_TO_PTR(byteCode)
         val byteCodeLen = ctx.memory.getI32(byteCodePtr + 4)
-        /* 字节码缓存：同一函数多次调用不必重复复制堆数据 */
-        val code = ctx.byteCodeCache[funcPtr] ?: ctx.memory.getBytes(byteCodePtr + 8, byteCodeLen).also {
-            ctx.byteCodeCache[funcPtr] = it
-        }
+        /* 字节码每次从堆复制（不缓存）：指针地址为 key 的缓存会在 GC 搬移/地址复用、
+         * 同名函数重新 eval 后命中陈旧副本，造成「字节码×帧容量」错配越界——
+         * 与 57c9c86（字节码指针每次重取）同族收尾 */
+        val code = ctx.memory.getBytes(byteCodePtr + 8, byteCodeLen)
         
         val varsObj = ctx.memory.getJSValue(funcPtr + 32)
         val varsSize = if (varsObj != JS_NULL) {
