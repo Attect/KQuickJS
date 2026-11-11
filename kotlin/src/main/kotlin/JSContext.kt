@@ -64,6 +64,10 @@ class JSContext(
      * 注意不要用 pushValue/popValue（ctx.sp）保活——解释器运行中 ctx.sp 与
      * 局部缓存的 sp 不同步，会破坏执行栈 */
     val gcKeepAlive: JSValueList = JSValueList()
+    /* 函数字节码内容缓存：key 为 FUNCTION_BYTECODE 块地址，value 为执行用 ByteArray。
+     * 避免每次 JS 函数调用都从紧凑堆复制一份字节码（调用密集负载的主要分配源）。
+     * 地址只在 GC 压缩时变化，JSGC 在每次 GC 结束时清空该缓存，杜绝陈旧副本命中。 */
+    val bytecodeCache: HashMap<Int, ByteArray> = HashMap()
     /* Function.prototype.bind 的绑定信息：每项为 gcKeepAlive 槽索引
      * [target, thisArg, firstBoundArg, boundArgCount]（槽位永久保活并由 GC 更新） */
     val boundFns: MutableList<IntArray> = mutableListOf()

@@ -1143,9 +1143,13 @@ object JSStdlib {
             }
             if (parts.size > limit) parts = parts.subList(0, limit)
             val out = JS_NewArray(c, parts.size)
-            for (i in parts.indices) rt.setElement(out, JS_NewShortInt(i), JS_NewString(c, parts[i]))
-            c.memory.putI32(JS_VALUE_TO_PTR(out) + 32, parts.size)
-            out
+            /* 结果数组必须保活：循环内 JS_NewString 会分配并可能触发 GC 压缩，
+             * 否则数组搬移后 setElement/写长度会作用在悬垂指针上（小堆下静默返回 NaN） */
+            val keepOut = c.gcKeepAlive.size
+            c.gcKeepAlive.add(out)
+            for (i in parts.indices) rt.setElement(c.gcKeepAlive[keepOut], JS_NewShortInt(i), JS_NewString(c, parts[i]))
+            c.memory.putI32(JS_VALUE_TO_PTR(c.gcKeepAlive[keepOut]) + 32, parts.size)
+            c.gcKeepAlive[keepOut]
         }
         defMethod(ctx, rt, proto, "toLowerCase", 0) { c, thisVal, _ ->
             JS_NewString(c, rt.toStringValue(thisVal).lowercase())
@@ -1775,13 +1779,16 @@ object JSStdlib {
         if (!global) return regexpExec(ctx, rt, re, s)
         val m = pat.matcher(s)
         val out = JS_NewArray(ctx, 0)
+        /* 全局匹配结果数组必须保活：循环内 JS_NewString 会分配并可能触发 GC 压缩 */
+        val keep = ctx.gcKeepAlive.size
+        ctx.gcKeepAlive.add(out)
         var n = 0
         while (m.find()) {
-            rt.setElement(out, JS_NewShortInt(n++), JS_NewString(ctx, m.group()))
+            rt.setElement(ctx.gcKeepAlive[keep], JS_NewShortInt(n++), JS_NewString(ctx, m.group()))
         }
         if (n == 0) return JS_NULL
-        ctx.memory.putI32(JS_VALUE_TO_PTR(out) + 32, n)
-        return out
+        ctx.memory.putI32(JS_VALUE_TO_PTR(ctx.gcKeepAlive[keep]) + 32, n)
+        return ctx.gcKeepAlive[keep]
     }
 
     private fun initRegExp(ctx: JSContext, rt: JSRuntime) {
@@ -2625,40 +2632,61 @@ object JSStdlib {
         return when (val c = s[pos[0]]) {
             '{' -> {
                 val obj = JS_NewObject(ctx)
-                pos[0]++
-                skipWs(s, pos)
-                if (pos[0] < s.length && s[pos[0]] == '}') { pos[0]++; return obj }
-                while (pos[0] < s.length) {
-                    skipWs(s, pos)
-                    val key = jsonParseString(s, pos)
-                    skipWs(s, pos)
-                    if (pos[0] >= s.length || s[pos[0]] != ':') return JS_UNDEFINED
+                /* 解析过程持续分配字符串/子对象并可能触发 GC 压缩：结果对象必须保活，
+                 * 否则 obj 搬移后 setProperty 会写入旧地址（小堆下静默丢属性） */
+                val keep = ctx.gcKeepAlive.size
+                ctx.gcKeepAlive.add(obj)
+                try {
                     pos[0]++
-                    val v = jsonParse(ctx, rt, s, pos)
-                    rt.setProperty(obj, JS_NewString(ctx, key), v)
                     skipWs(s, pos)
-                    if (pos[0] < s.length && s[pos[0]] == ',') { pos[0]++; continue }
-                    if (pos[0] < s.length && s[pos[0]] == '}') pos[0]++
-                    break
+                    if (pos[0] < s.length && s[pos[0]] == '}') {
+                        pos[0]++
+                        return ctx.gcKeepAlive[keep]
+                    }
+                    while (pos[0] < s.length) {
+                        skipWs(s, pos)
+                        val key = jsonParseString(s, pos)
+                        skipWs(s, pos)
+                        if (pos[0] >= s.length || s[pos[0]] != ':') return JS_UNDEFINED
+                        pos[0]++
+                        val v = jsonParse(ctx, rt, s, pos)
+                        rt.setProperty(ctx.gcKeepAlive[keep], JS_NewString(ctx, key), v)
+                        skipWs(s, pos)
+                        if (pos[0] < s.length && s[pos[0]] == ',') { pos[0]++; continue }
+                        if (pos[0] < s.length && s[pos[0]] == '}') pos[0]++
+                        break
+                    }
+                    ctx.gcKeepAlive[keep]
+                } finally {
+                    ctx.gcKeepAlive.removeAt(keep)
                 }
-                obj
             }
             '[' -> {
                 val arr = JS_NewArray(ctx, 0)
-                pos[0]++
-                var n = 0
-                skipWs(s, pos)
-                if (pos[0] < s.length && s[pos[0]] == ']') { pos[0]++; return arr }
-                while (pos[0] < s.length) {
-                    val v = jsonParse(ctx, rt, s, pos)
-                    rt.setElement(arr, JS_NewShortInt(n++), v)
+                /* 同对象分支：递归解析可能触发 GC 搬移，数组必须保活 */
+                val keep = ctx.gcKeepAlive.size
+                ctx.gcKeepAlive.add(arr)
+                try {
+                    pos[0]++
+                    var n = 0
                     skipWs(s, pos)
-                    if (pos[0] < s.length && s[pos[0]] == ',') { pos[0]++; continue }
-                    if (pos[0] < s.length && s[pos[0]] == ']') pos[0]++
-                    break
+                    if (pos[0] < s.length && s[pos[0]] == ']') {
+                        pos[0]++
+                        return ctx.gcKeepAlive[keep]
+                    }
+                    while (pos[0] < s.length) {
+                        val v = jsonParse(ctx, rt, s, pos)
+                        rt.setElement(ctx.gcKeepAlive[keep], JS_NewShortInt(n++), v)
+                        skipWs(s, pos)
+                        if (pos[0] < s.length && s[pos[0]] == ',') { pos[0]++; continue }
+                        if (pos[0] < s.length && s[pos[0]] == ']') pos[0]++
+                        break
+                    }
+                    ctx.memory.putI32(JS_VALUE_TO_PTR(ctx.gcKeepAlive[keep]) + 32, n)
+                    ctx.gcKeepAlive[keep]
+                } finally {
+                    ctx.gcKeepAlive.removeAt(keep)
                 }
-                ctx.memory.putI32(JS_VALUE_TO_PTR(arr) + 32, n)
-                arr
             }
             '"' -> JS_NewString(ctx, jsonParseString(s, pos))
             't' -> { pos[0] += 4; JS_TRUE }

@@ -7,6 +7,12 @@ import app.muka.project.kquickjs.OPCodeEnum
 
 class JSRuntime(private val ctx: JSContext) {
     
+    private companion object {
+        /* 冷门指令处理器返回值：本帧需要立即以异常结束。
+         * 正常返回值是新的 pc（>= 0）。常量定义在此避免污染热路径。 */
+        const val OP_EXCEPTION = -1
+    }
+    
     /* 执行栈/局部变量表的复用池：避免每次函数调用分配 LongArray */
     private val stackPool = ArrayList<ValueStack>()
     private val varsPool = HashMap<Int, ArrayDeque<ValueArray>>()
@@ -75,10 +81,17 @@ class JSRuntime(private val ctx: JSContext) {
         
         val byteCodePtr = JS_VALUE_TO_PTR(byteCode)
         val byteCodeLen = ctx.memory.getI32(byteCodePtr + 4)
-        /* 字节码每次从堆复制（不缓存）：指针地址为 key 的缓存会在 GC 搬移/地址复用、
-         * 同名函数重新 eval 后命中陈旧副本，造成「字节码×帧容量」错配越界——
-         * 与 57c9c86（字节码指针每次重取）同族收尾 */
-        val code = ctx.memory.getBytes(byteCodePtr + 8, byteCodeLen)
+        /* 字节码内容缓存：早期版本按指针缓存曾在 GC 搬移/地址复用后命中陈旧副本，
+         * 这里以 “块地址 + 长度” 双条件校验，且 JSGC 每次压缩后清空整个缓存，
+         * 因此不会跨 GC 复用陈旧内容；未命中时仍从紧凑堆复制一份。 */
+        val cachedCode = ctx.bytecodeCache[byteCodePtr]
+        val code = if (cachedCode != null && cachedCode.size == byteCodeLen) {
+            cachedCode
+        } else {
+            ctx.memory.getBytes(byteCodePtr + 8, byteCodeLen).also {
+                ctx.bytecodeCache[byteCodePtr] = it
+            }
+        }
         
         val varsObj = ctx.memory.getJSValue(funcPtr + 32)
         val varsSize = if (varsObj != JS_NULL) {
@@ -104,6 +117,11 @@ class JSRuntime(private val ctx: JSContext) {
         fun funcPtrNow(): Int = JS_VALUE_TO_PTR(ctx.gcKeepAlive[keepStart])
         ctx.pushFrame(keepStart)
         val frameIdx = ctx.frameDepth - 1
+        /* 统一出口：循环内不再使用 return，避免每个返回点复制一份 finally 清理代码
+         * （那会让 runBody 字节码膨胀数 KB，超过 HugeMethodLimit 后彻底失去 JIT）。
+         * exitKind：0=正常结束，1=异常，2=显式 return 值。 */
+        var exitKind = 0
+        var retVal = JS_UNDEFINED
         try {
         while (pc < code.size) {
             
@@ -138,86 +156,40 @@ class JSRuntime(private val ctx: JSContext) {
                 /* 闭包捕获变量读写（对照 C OP_get_var_ref/OP_put_var_ref：
                  * 槽为 UNINITIALIZED 时抛 ReferenceError） */
                 OPCodeEnum.OP_get_var_ref.id -> {
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    if (idx < 0 || idx >= ctx.varrefPool.size) {
-                        return JS_ThrowReferenceError(ctx, "variable is not defined")
-                    }
-                    val v = ctx.varrefPool[idx]
-                    if (JS_IsUninitialized(v)) {
-                        return JS_ThrowReferenceError(ctx, "variable is not defined")
-                    }
-                    stack.push(v)
+                    val npc = opGetVarRef(code, pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_put_var_ref.id -> {
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    val v = stack.pop()
-                    while (ctx.varrefPool.size <= idx) {
-                        ctx.varrefPool.add(JS_UNDEFINED)
-                    }
-                    ctx.varrefPool[idx] = v
+                    val npc = opPutVarRef(code, pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 /* 全局标识符读写（对照 C GLOBAL varref 经 globalObj 属性解析；
                  * 读取时属性不存在抛 ReferenceError） */
                 OPCodeEnum.OP_get_global.id -> {
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
-                    val name = if (cpool != JS_NULL) {
-                        ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
-                    } else JS_UNDEFINED
-                    val v = getProperty(ctx.globalObj, name)
-                    if (JS_IsUndefined(v) && !hasProperty(ctx.globalObj, name)) {
-                        JS_ThrowReferenceError(ctx, "'" + jsGetString(ctx, name) + "' is not defined")
-                        val target = unwindToCatch(stack)
-                        if (target < 0) return JS_EXCEPTION
-                        pc = target
-                    } else {
-                        stack.push(v)
-                    }
+                    val npc = opGetGlobal(code, pc, stack, keepStart)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_get_global_undef.id -> {
-                    /* typeof 操作数：不存在时返回 undefined，不抛异常 */
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
-                    val name = if (cpool != JS_NULL) {
-                        ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
-                    } else JS_UNDEFINED
-                    stack.push(getProperty(ctx.globalObj, name))
+                    val npc = opGetGlobalUndef(code, pc, stack, keepStart)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_put_global.id -> {
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    val v = stack.pop()
-                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
-                    val name = if (cpool != JS_NULL) {
-                        ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
-                    } else JS_UNDEFINED
-                    /* 严格模式：给未声明的全局标识符赋值抛 ReferenceError */
-                    if (!hasProperty(ctx.globalObj, name)) {
-                        JS_ThrowReferenceError(ctx, "\"" + jsGetString(ctx, name) + "\" is not defined")
-                        val target = unwindToCatch(stack)
-                        if (target < 0) return JS_EXCEPTION
-                        pc = target
-                    } else {
-                        setProperty(ctx.globalObj, name, v)
-                    }
+                    val npc = opPutGlobal(code, pc, stack, keepStart)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 OPCodeEnum.OP_define_global.id -> {
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    val v = stack.pop()
-                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
-                    val name = if (cpool != JS_NULL) {
-                        ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
-                    } else JS_UNDEFINED
-                    setProperty(ctx.globalObj, name, v)
+                    val npc = opDefineGlobal(code, pc, stack, keepStart)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 OPCodeEnum.OP_undefined.id -> stack.push(JS_UNDEFINED)
                 OPCodeEnum.OP_null.id -> stack.push(JS_NULL)
@@ -252,74 +224,15 @@ class JSRuntime(private val ctx: JSContext) {
                 }
                 
                 OPCodeEnum.OP_push_const.id -> {
-                    val idx = (code[pc].toInt() and 0xFF) or ((code[pc + 1].toInt() and 0xFF) shl 8)
-                    pc += 2
-                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
-                    if (cpool != JS_NULL) {
-                        val cpoolPtr = JS_VALUE_TO_PTR(cpool)
-                        stack.push(ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8))
-                    } else {
-                        stack.push(JS_UNDEFINED)
-                    }
+                    val npc = opPushConst(code, pc, stack, keepStart)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_fclosure.id -> {
-                    /* 从 cpool 的函数字节码创建 JS_CLASS_CLOSURE 对象（extra 槽 0 = funcBytecode） */
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
-                    val funcBytecode = if (cpool != JS_NULL) {
-                        ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
-                    } else JS_NULL
-                    
-                    /* 分配会触发 GC：函数字节码入保活槽，之后从槽位读取 */
-                    ctx.gcKeepAlive.add(funcBytecode)
-                    try {
-                        /* 槽位：+24 函数字节码，+32 prototype（惰性创建），+40 name */
-                        val closure = JS_NewObjectProtoClass(ctx, ctx.classProto[JSObjectClassEnum.JS_CLASS_CLOSURE.value],
-                                                             JSObjectClassEnum.JS_CLASS_CLOSURE.value, 3)
-                        if (JS_IsException(closure)) return JS_EXCEPTION
-                        val closurePtr = JS_VALUE_TO_PTR(closure)
-                        val fb0 = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
-                        ctx.memory.putJSValue(closurePtr + 24, fb0)
-                        ctx.memory.putJSValue(closurePtr + 32, JS_NULL)
-                        val nm = if (JS_IsPtr(fb0)) ctx.memory.getJSValue(JS_VALUE_TO_PTR(fb0) + 8) else JS_NULL
-                        ctx.memory.putJSValue(closurePtr + 40,
-                            if (JS_IsString(ctx, nm)) nm else JS_NULL)
-                        stack.push(closure)
-                        
-                        /* 捕获变量初始化：把当前帧同名实参/局部的当前值写入 varref 池槽 */
-                        val fb = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
-                        if (JS_IsPtr(fb)) {
-                            val capArr = ctx.memory.getJSValue(JS_VALUE_TO_PTR(fb) + 64)
-                            if (capArr != JS_NULL && !JS_IsException(capArr)) {
-                                val capPtr = JS_VALUE_TO_PTR(capArr)
-                                val capCount = ctx.memory.getI32(capPtr + 4) / 2
-                                val curVarsTab = ctx.memory.getJSValue(funcPtrNow() + 32)
-                                if (curVarsTab != JS_NULL) {
-                                    val tabPtr = JS_VALUE_TO_PTR(curVarsTab)
-                                    val tabLen = ctx.memory.getI32(tabPtr + 4)
-                                    for (ci in 0 until capCount) {
-                                        val name = ctx.memory.getJSValue(capPtr + 8 + 2 * ci * 8)
-                                        val slot = JS_VALUE_GET_INT(ctx.memory.getJSValue(capPtr + 16 + 2 * ci * 8))
-                                        for (j in 0 until minOf(tabLen, vars.size)) {
-                                            val vn = ctx.memory.getJSValue(tabPtr + 8 + j * 8)
-                                            if (vn == name || jsValueEquals(vn, name)) {
-                                                while (ctx.varrefPool.size <= slot) {
-                                                    ctx.varrefPool.add(JS_UNDEFINED)
-                                                }
-                                                ctx.varrefPool[slot] = vars[j]
-                                                break
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                    } finally {
-                        ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
-                    }
+                    val npc = opFclosure(code, pc, stack, vars, keepStart)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_drop.id -> stack.pop()
@@ -494,26 +407,18 @@ class JSRuntime(private val ctx: JSContext) {
                 }
                 
                 OPCodeEnum.OP_goto.id -> {
-                    val offset = readI32(code, pc)
-                    pc += 4
-                    pc += offset
+                    val npc = opGoto(code, pc)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
-                OPCodeEnum.OP_return.id -> return stack.pop()
-                OPCodeEnum.OP_return_undef.id -> return JS_UNDEFINED
+                OPCodeEnum.OP_return.id -> { retVal = stack.pop(); exitKind = 2; break }
+                OPCodeEnum.OP_return_undef.id -> { retVal = JS_UNDEFINED; exitKind = 2; break }
                 
                 OPCodeEnum.OP_regexp.id -> {
-                    /* [pattern, flags] -> RegExp 对象 */
-                    val flags = jsGetString(ctx, stack.pop())
-                    val pattern = jsGetString(ctx, stack.pop())
-                    val re = JSStdlib.newRegExp(ctx, pattern, flags)
-                    if (JS_IsException(re)) {
-                        val target = unwindToCatch(stack)
-                        if (target < 0) return JS_EXCEPTION
-                        pc = target
-                    } else {
-                        stack.push(re)
-                    }
+                    val npc = opRegexp(pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_object.id -> {
@@ -523,188 +428,51 @@ class JSRuntime(private val ctx: JSContext) {
                 }
                 
                 OPCodeEnum.OP_array_from.id -> {
-                    val argc = readU16(code, pc)
-                    pc += 2
-                    /* JS_NewArray 的分配可能触发 GC 搬移：此刻元素仍在解释器栈上
-                     * （栈是 GC 根，随搬移自动更新），先建数组再取元素 */
-                    val arr = JS_NewArray(ctx, argc)
-                    val keepBase = ctx.gcKeepAlive.size
-                    /* 元素先出栈入保活列表：随后补分配元素存储（见下）可能触发
-                     * GC 搬移，Kotlin 局部值会过期，保活列表中的值随搬移更新 */
-                    ctx.gcKeepAlive.add(arr)
-                    val elems = ArrayList<JSValue>(argc)
-                    for (i in 0 until argc) elems.add(stack.pop())
-                    for (e in elems) ctx.gcKeepAlive.add(e)
-
-                    /* JS_NewArray 不分配元素存储（arrData 为 JS_NULL）：补分配并
-                     * 写入元素（对照 C OP_array_from 的数组构造语义） */
-                    val arrKept = ctx.gcKeepAlive[keepBase]
-                    val arrPtr = JS_VALUE_TO_PTR(arrKept)
-                    var arrData = ctx.memory.getJSValue(arrPtr + 24)
-                    if (arrData == JS_NULL) {
-                        arrData = allocValueArray(argc)
-                        if (arrData != JS_NULL) {
-                            ctx.memory.putJSValue(arrPtr + 24, arrData)
-                        }
-                    }
-                    if (arrData != JS_NULL) {
-                        val dataPtr = JS_VALUE_TO_PTR(arrData)
-                        /* elems[i] 为第 argc-1-i 个元素（出栈序与写入序相反） */
-                        for (j in 0 until argc) {
-                            ctx.memory.putJSValue(
-                                dataPtr + 8 + j * 8,
-                                ctx.gcKeepAlive[keepBase + 1 + (argc - 1 - j)]
-                            )
-                        }
-                    }
-                    while (ctx.gcKeepAlive.size > keepBase) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
-                    stack.push(arrKept)
+                    val npc = opArrayFrom(code, pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_get_field.id -> {
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    val obj = stack.pop()
-                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
-                    val key = if (cpool != JS_NULL) {
-                        val cpoolPtr = JS_VALUE_TO_PTR(cpool)
-                        ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
-                    } else JS_UNDEFINED
-                    val v = getProperty(obj, key)
-                    if (JS_HasException(ctx)) {
-                        val target = unwindToCatch(stack)
-                        if (target < 0) return JS_EXCEPTION
-                        pc = target
-                    } else {
-                        stack.push(v)
-                    }
+                    val npc = opGetField(code, pc, stack, keepStart)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_get_field2.id -> {
-                    /* 对照 C：sp-- 后 sp[0] = get_field(sp[0], atom)
-                     * —— 栈顶对象被保留，属性值压入其上（[obj] → [obj, value]），
-                     * 供方法调用把 obj 作为 this 使用 */
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    if (stack.isEmpty()) {
-                        return JS_EXCEPTION
-                    }
-                    val obj = stack.top()
-                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
-                    val key = if (cpool != JS_NULL) {
-                        val cpoolPtr = JS_VALUE_TO_PTR(cpool)
-                        ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
-                    } else JS_UNDEFINED
-                    val fv = getProperty(obj, key)
-                    if (JS_HasException(ctx)) {
-                        val target = unwindToCatch(stack)
-                        if (target < 0) return JS_EXCEPTION
-                        pc = target
-                    } else {
-                        stack.push(fv)
-                    }
+                    val npc = opGetField2(code, pc, stack, keepStart)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_put_field.id -> {
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    val val1 = stack.pop()
-                    val obj = stack.pop()
-                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
-                    val key = if (cpool != JS_NULL) {
-                        val cpoolPtr = JS_VALUE_TO_PTR(cpool)
-                        ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
-                    } else JS_UNDEFINED
-                    /* 数组只接受 length 与规范索引属性；其他键按 C 版语义抛 TypeError */
-                    var badKey = false
-                    if (JS_IsPtr(obj)) {
-                        val op = JS_VALUE_TO_PTR(obj)
-                        if (ctx.memory.getMTag(op) == JSMTags.JS_MTAG_OBJECT &&
-                            ctx.memory.getU8(op + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value &&
-                            JS_IsString(ctx, key)) {
-                            val ks = jsGetString(ctx, key)
-                            if (ks != "length" && arrayIndexFromString(ks) < 0) {
-                                JS_ThrowTypeError(ctx, "invalid array index")
-                                badKey = true
-                            }
-                        }
-                    }
-                    if (badKey) {
-                        val target = unwindToCatch(stack)
-                        if (target < 0) return JS_EXCEPTION
-                        pc = target
-                    } else {
-                        setProperty(obj, key, val1)
-                    }
-                    if (ctx.traceEnabled) {
-                        println("TRACE put_field obj=${if (JS_IsPtr(obj)) JS_VALUE_TO_PTR(obj) else obj} key='${jsGetString(ctx, key)}' val=${if (JS_IsInt(val1)) JS_VALUE_GET_INT(val1) else -1}")
-                    }
+                    val npc = opPutField(code, pc, stack, keepStart)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_define_field.id -> {
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    val val1 = stack.pop()
-                    val obj = stack.pop()
-                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
-                    val key = if (cpool != JS_NULL) {
-                        val cpoolPtr = JS_VALUE_TO_PTR(cpool)
-                        ctx.memory.getJSValue(cpoolPtr + 8 + idx * 8)
-                    } else JS_UNDEFINED
-                    defineProperty(obj, key, val1)
-                    stack.push(obj)
+                    val npc = opDefineField(code, pc, stack, keepStart)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_get_array_el.id -> {
-                    val idx = stack.pop()
-                    val obj = stack.pop()
-                    val ev = getElement(obj, idx)
-                    if (JS_HasException(ctx)) {
-                        val target = unwindToCatch(stack)
-                        if (target < 0) return JS_EXCEPTION
-                        pc = target
-                    } else {
-                        stack.push(ev)
-                    }
+                    val npc = opGetArrayEl(pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_get_array_el2.id -> {
-                    /* 对照 C：与 get_field2 同构——弹出 key 但保留 obj（[obj, key] → [obj, val]） */
-                    if (stack.size < 2) {
-                        return JS_EXCEPTION
-                    }
-                    val idx = stack.pop()
-                    val obj = stack.top()
-                    val val1 = getElement(obj, idx)
-                    stack.push(val1)
+                    val npc = opGetArrayEl2(pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_put_array_el.id -> {
-                    val val1 = stack.pop()
-                    val idx = stack.pop()
-                    val obj = stack.pop()
-                    var badIndex = false
-                    if (JS_IsPtr(obj)) {
-                        val op = JS_VALUE_TO_PTR(obj)
-                        if (ctx.memory.getMTag(op) == JSMTags.JS_MTAG_OBJECT &&
-                            ctx.memory.getU8(op + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value &&
-                            !isArrayIndexValue(idx)) {
-                            JS_ThrowTypeError(ctx, "invalid array index")
-                            badIndex = true
-                        }
-                    }
-                    if (badIndex) {
-                        val target = unwindToCatch(stack)
-                        if (target < 0) return JS_EXCEPTION
-                        pc = target
-                    } else {
-                        setElement(obj, idx, val1)
-                        if (JS_HasException(ctx)) {
-                            val target = unwindToCatch(stack)
-                            if (target < 0) return JS_EXCEPTION
-                            pc = target
-                        }
-                    }
+                    val npc = opPutArrayEl(pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_get_length.id -> {
@@ -728,16 +496,9 @@ class JSRuntime(private val ctx: JSContext) {
                 }
                 
                 OPCodeEnum.OP_instanceof.id -> {
-                    val ctor = stack.pop()
-                    val obj = stack.pop()
-                    val r = jsInstanceof(obj, ctor)
-                    if (JS_IsException(r)) {
-                        val target = unwindToCatch(stack)
-                        if (target < 0) return JS_EXCEPTION
-                        pc = target
-                    } else {
-                        stack.push(r)
-                    }
+                    val npc = opInstanceof(pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_delete.id -> {
@@ -748,190 +509,52 @@ class JSRuntime(private val ctx: JSContext) {
                 }
                 
                 OPCodeEnum.OP_arguments.id -> {
-                    /* arguments：把本帧实参复制成数组对象（length/索引均可用）。
-                     * 实参已由 runBody 放入 gcKeepAlive（keepStart+2 起） */
-                    val argc = args.size
-                    val arr = JS_NewArray(ctx, argc)
-                    if (JS_IsException(arr)) return JS_EXCEPTION
-                    ctx.gcKeepAlive.add(arr)
-                    try {
-                        val tab = allocValueArray(argc)
-                        if (!JS_IsNull(tab) && !JS_IsException(tab)) {
-                            val tabPtr = JS_VALUE_TO_PTR(tab)
-                            for (i in 0 until argc) {
-                                ctx.memory.putJSValue(tabPtr + 8 + i * 8,
-                                                      ctx.gcKeepAlive[keepStart + 3 + i])
-                            }
-                            val arrPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
-                            ctx.memory.putJSValue(arrPtr + 24, tab)
-                            ctx.memory.putI32(arrPtr + 32, argc)
-                        }
-                        stack.push(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
-                    } finally {
-                        ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
-                    }
+                    val npc = opArguments(pc, stack, keepStart, args.size)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_define_getter.id, OPCodeEnum.OP_define_setter.id -> {
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    val func = stack.pop()
-                    val obj = stack.pop()
-                    val cpool = ctx.memory.getJSValue(funcPtrNow() + 24)
-                    val key = if (cpool != JS_NULL) {
-                        ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
-                    } else JS_UNDEFINED
-                    defineAccessor(obj, key, func, isGetter = op == OPCodeEnum.OP_define_getter.id)
-                    stack.push(obj)
+                    val npc = opDefineAccessor(code, pc, stack, keepStart,
+                                               op == OPCodeEnum.OP_define_getter.id)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_set_proto.id -> {
-                    val proto = stack.pop()
-                    val obj = stack.pop()
-                    if (JS_IsPtr(obj)) {
-                        val objPtr = JS_VALUE_TO_PTR(obj)
-                        if (ctx.memory.getMTag(objPtr) == JSMTags.JS_MTAG_OBJECT) {
-                            val newProto = if (JS_IsPtr(proto) &&
-                                ctx.memory.getMTag(JS_VALUE_TO_PTR(proto)) == JSMTags.JS_MTAG_OBJECT) {
-                                proto
-                            } else if (JS_IsNull(proto)) {
-                                JS_NULL
-                            } else {
-                                ctx.memory.getJSValue(objPtr + 8)
-                            }
-                            ctx.memory.putJSValue(objPtr + 8, newProto)
-                        }
-                    }
-                    stack.push(obj)
+                    val npc = opSetProto(pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_for_in_start.id -> {
-                    /* obj -> 迭代器（VALUE_ARRAY [keysArray, pos]） */
-                    val obj = stack.pop()
-                    val keys = jsObjectKeys(obj)
-                    if (JS_IsException(keys)) {
-                        val target = unwindToCatch(stack)
-                        if (target < 0) return JS_EXCEPTION
-                        pc = target
-                    } else {
-                        ctx.gcKeepAlive.add(keys)
-                        try {
-                            val iter = allocValueArray(2)
-                            if (JS_IsNull(iter) || JS_IsException(iter)) return JS_EXCEPTION
-                            val iterPtr = JS_VALUE_TO_PTR(iter)
-                            ctx.memory.putJSValue(iterPtr + 8, ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
-                            ctx.memory.putJSValue(iterPtr + 16, JS_NewShortInt(0))
-                            stack.push(iter)
-                        } finally {
-                            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
-                        }
-                    }
+                    val npc = opForInStart(pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_for_of_start.id -> {
-                    /* for-of：迭代数组元素。迭代器结构同 for-in（[数组对象, pos]） */
-                    val obj = stack.pop()
-                    var ok = false
-                    var iterSource = obj
-                    if (JS_IsPtr(obj)) {
-                        val p = JS_VALUE_TO_PTR(obj)
-                        if (ctx.memory.getMTag(p) == JSMTags.JS_MTAG_OBJECT) {
-                            val cid = ctx.memory.getU8(p + 2)
-                            if (cid == JSObjectClassEnum.JS_CLASS_ARRAY.value) {
-                                ok = true
-                            } else if (cid == JSObjectClassEnum.JS_CLASS_SET.value) {
-                                /* for-of Set：迭代其内部数组快照 */
-                                val inner = ctx.memory.getJSValue(p + 24)
-                                if (JS_IsPtr(inner)) {
-                                    ok = true
-                                    iterSource = inner
-                                }
-                            }
-                        }
-                    }
-                    if (!ok) {
-                        val r = JS_ThrowTypeError(ctx, "unsupported type in for...of")
-                        if (JS_IsException(r)) {
-                            val target = unwindToCatch(stack)
-                            if (target < 0) return JS_EXCEPTION
-                            pc = target
-                        }
-                    } else {
-                        ctx.gcKeepAlive.add(iterSource)
-                        try {
-                            val iter = allocValueArray(2)
-                            if (JS_IsNull(iter) || JS_IsException(iter)) return JS_EXCEPTION
-                            val iterPtr = JS_VALUE_TO_PTR(iter)
-                            ctx.memory.putJSValue(iterPtr + 8, ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
-                            ctx.memory.putJSValue(iterPtr + 16, JS_NewShortInt(0))
-                            stack.push(iter)
-                        } finally {
-                            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
-                        }
-                    }
+                    val npc = opForOfStart(pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_for_of_next.id -> {
-                    /* iter -> iter value done（done 在栈顶，供 if_false 消费） */
-                    val iter = stack.top()
-                    val iterPtr = JS_VALUE_TO_PTR(iter)
-                    val keys = ctx.memory.getJSValue(iterPtr + 8)
-                    val pos = JS_VALUE_GET_INT(ctx.memory.getJSValue(iterPtr + 16))
-                    val keyArrPtr = if (JS_IsPtr(keys)) JS_VALUE_TO_PTR(keys) else -1
-                    if (keyArrPtr < ctx.heapBase || keyArrPtr >= ctx.heapFree) return JS_EXCEPTION
-                    val len = ctx.memory.getI32(keyArrPtr + 32)
-                    if (pos >= len) {
-                        stack.push(JS_UNDEFINED)
-                        stack.push(JS_TRUE)
-                    } else {
-                        val tab = ctx.memory.getJSValue(keyArrPtr + 24)
-                        val elem = if (tab == JS_NULL) JS_UNDEFINED
-                                   else ctx.memory.getJSValue(JS_VALUE_TO_PTR(tab) + 8 + pos * 8)
-                        stack.push(elem)
-                        stack.push(JS_FALSE)
-                        ctx.memory.putJSValue(iterPtr + 16, JS_NewShortInt(pos + 1))
-                    }
+                    val npc = opForOfNext(pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_get_loc.id -> {
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    val v = vars[idx]
-                    if (ctx.throwTraceEnabled && JS_IsPtr(v)) {
-                        val vp = JS_VALUE_TO_PTR(v)
-                        if (vp in ctx.heapBase until ctx.heapFree &&
-                            ctx.memory.getMTag(vp) == JSMTags.JS_MTAG_FREE) {
-                            var nm = "?"
-                            val vt = ctx.memory.getJSValue(funcPtrNow() + 32)
-                            if (vt != JS_NULL) {
-                                val vtp = JS_VALUE_TO_PTR(vt)
-                                val nv = ctx.memory.getJSValue(vtp + 8 + idx * 8)
-                                if (JS_IsString(ctx, nv)) nm = jsGetString(ctx, nv)
-                            }
-                            System.err.println("STALE_LOC idx=$idx name=$nm val=$v heapFree=${ctx.heapFree}")
-                        }
-                    }
-                    stack.push(v)
+                    val npc = opGetLoc(code, pc, stack, vars, keepStart)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_put_loc.id -> {
-                    val idx = readU16(code, pc)
-                    pc += 2
-                    val val1 = stack.pop()
-                    if (ctx.throwTraceEnabled && JS_IsPtr(val1)) {
-                        val vp = JS_VALUE_TO_PTR(val1)
-                        if (vp >= ctx.heapFree || (vp >= ctx.heapBase && ctx.memory.getMTag(vp) == JSMTags.JS_MTAG_FREE)) {
-                            var nm = "?"
-                            val vt = ctx.memory.getJSValue(funcPtrNow() + 32)
-                            if (vt != JS_NULL) {
-                                val vtp = JS_VALUE_TO_PTR(vt)
-                                val nv = ctx.memory.getJSValue(vtp + 8 + idx * 8)
-                                if (JS_IsString(ctx, nv)) nm = jsGetString(ctx, nv)
-                            }
-                            System.err.println("STALE_PUT idx=$idx name=$nm val=$val1 heapFree=${ctx.heapFree}")
-                        }
-                    }
-                    vars[idx] = val1
+                    val npc = opPutLoc(code, pc, stack, vars, keepStart)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_get_loc0.id, OPCodeEnum.OP_get_loc1.id, OPCodeEnum.OP_get_loc2.id, OPCodeEnum.OP_get_loc3.id -> {
@@ -946,172 +569,88 @@ class JSRuntime(private val ctx: JSContext) {
                 
                 /* 超级指令（peephole 融合，字节长度与原序列一致，执行后直接跳过 NOP 填充） */
                 OPCodeEnum.OP_inc_loc.id -> {
-                    val start = pc - 1
-                    val idx = readU16(code, pc)
-                    stack.pop()   /* 丢弃前一条 get_loc 压入的旧值 */
-                    vars[idx] = doAdd(vars[idx], JS_NewShortInt(1))
-                    pc = start + 16
+                    val npc = opIncLoc(code, pc, stack, vars)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 OPCodeEnum.OP_dec_loc.id -> {
-                    val start = pc - 1
-                    val idx = readU16(code, pc)
-                    stack.pop()
-                    vars[idx] = doSub(vars[idx], JS_NewShortInt(1))
-                    pc = start + 16
+                    val npc = opDecLoc(code, pc, stack, vars)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 OPCodeEnum.OP_add_loc_loc.id -> {
-                    val start = pc - 1
-                    val a = readU16(code, pc)
-                    val b = readU16(code, pc + 2)
-                    vars[a] = doAdd(vars[a], vars[b])
-                    pc = start + 18
+                    val npc = opAddLocLoc(code, pc, vars)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 OPCodeEnum.OP_add_loc_imm.id -> {
-                    val start = pc - 1
-                    val a = readU16(code, pc)
-                    val imm = code[pc + 2].toByte().toInt()
-                    vars[a] = doAdd(vars[a], JS_NewShortInt(imm))
-                    pc = start + 16
+                    val npc = opAddLocImm(code, pc, vars)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 OPCodeEnum.OP_bin_loc_imm.id -> {
-                    val start = pc - 1
-                    val kb = code[pc].toInt() and 0xFF
-                    val kind = kb and 0x7F
-                    val idx = readU16(code, pc + 1)
-                    val imm = code[pc + 3].toByte().toInt()
-                    stack.push(doBinOp(kind, vars[idx], JS_NewShortInt(imm)))
-                    pc = start + if ((kb and 0x80) != 0) 6 else 5
+                    val npc = opBinLocImm(code, pc, stack, vars)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 OPCodeEnum.OP_bin_loc_loc.id -> {
-                    val start = pc - 1
-                    val kind = code[pc].toInt() and 0xFF
-                    val a = readU16(code, pc + 1)
-                    val b = readU16(code, pc + 3)
-                    stack.push(doBinOp(kind, vars[a], vars[b]))
-                    pc = start + 7
+                    val npc = opBinLocLoc(code, pc, stack, vars)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 OPCodeEnum.OP_cmp_loc_loc_jump.id -> {
-                    val start = pc - 1
-                    val cmp = code[pc].toInt() and 0xFF
-                    val a = readU16(code, pc + 1)
-                    val b = readU16(code, pc + 3)
-                    val off = readI32(code, pc + 5)
-                    val va = vars[a]
-                    val vb = vars[b]
-                    val res: Boolean = when (cmp) {
-                        OPCodeEnum.OP_lt.id -> toBoolean(doLt(va, vb))
-                        OPCodeEnum.OP_lte.id -> toBoolean(doLte(va, vb))
-                        OPCodeEnum.OP_gt.id -> toBoolean(doLt(vb, va))
-                        OPCodeEnum.OP_gte.id -> toBoolean(doLte(vb, va))
-                        OPCodeEnum.OP_eq.id -> toBoolean(doEq(va, vb))
-                        OPCodeEnum.OP_neq.id -> !toBoolean(doEq(va, vb))
-                        OPCodeEnum.OP_strict_eq.id -> strictEquals(va, vb)
-                        OPCodeEnum.OP_strict_neq.id -> !strictEquals(va, vb)
-                        else -> false
-                    }
-                    pc = if (res) start + 12 else start + 12 + off
+                    val npc = opCmpLocLocJump(code, pc, vars)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_call.id -> {
-                    val argc = readU16(code, pc)
-                    pc += 2
-                    val args = ArrayList<JSValue>(argc)
-                    val base = stack.size - argc
-                    for (i in 0 until argc) args.add(stack[base + i])
-                    repeat(argc) { stack.pop() }
-                    val funcVal = stack.pop()
-                    /* 普通调用的 this 为 undefined（对照 C generic_function_call 压入 JS_UNDEFINED） */
-                    val r = callFunction(funcVal, args, JS_UNDEFINED)
-                    if (JS_IsException(r) && JS_HasException(ctx)) {
-                        /* 调用产生异常：本帧展开，命中 catch 则继续执行（对照 C call_exception） */
-                        val target = unwindToCatch(stack)
-                        if (target < 0) return JS_EXCEPTION
-                        pc = target
-                    } else {
-                        stack.push(r)
-                    }
+                    val npc = opCall(code, pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_call_method.id -> {
-                    val argc = readU16(code, pc)
-                    pc += 2
-                    val args = ArrayList<JSValue>(argc)
-                    val base = stack.size - argc
-                    for (i in 0 until argc) args.add(stack[base + i])
-                    repeat(argc) { stack.pop() }
-                    val funcVal = stack.pop()
-                    val thisObj = stack.pop()
-                    val r = callMethod(funcVal, thisObj, args)
-                    if (JS_IsException(r) && JS_HasException(ctx)) {
-                        val target = unwindToCatch(stack)
-                        if (target < 0) return JS_EXCEPTION
-                        pc = target
-                    } else {
-                        stack.push(r)
-                    }
+                    val npc = opCallMethod(code, pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_call_constructor.id -> {
-                    val argc = readU16(code, pc)
-                    pc += 2
-                    val args = ArrayList<JSValue>(argc)
-                    val base = stack.size - argc
-                    for (i in 0 until argc) args.add(stack[base + i])
-                    repeat(argc) { stack.pop() }
-                    val funcVal = stack.pop()
-                    val r = callConstructor(funcVal, args)
-                    if (JS_IsException(r) && JS_HasException(ctx)) {
-                        val target = unwindToCatch(stack)
-                        if (target < 0) return JS_EXCEPTION
-                        pc = target
-                    } else {
-                        stack.push(r)
-                    }
+                    val npc = opCallConstructor(code, pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_catch.id -> {
-                    /* 压入 catch 目标偏移（对照 C：JS_VALUE_MAKE_SPECIAL(JS_TAG_CATCH_OFFSET, 目标)），
-                     * 异常展开时该值被替换为异常本身 */
-                    val diff = readI32(code, pc)
-                    pc += 4
-                    stack.push(JS_VALUE_MAKE_SPECIAL(JSTags.JS_TAG_CATCH_OFFSET, pc + diff))
+                    val npc = opCatch(code, pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_throw.id -> {
-                    /* 弹出异常值并抛出，转入本帧异常处理（对照 C OP_throw → goto exception） */
-                    val ex = stack.pop()
-                    JS_Throw(ctx, ex)
-                    val target = unwindToCatch(stack)
-                    if (target < 0) return JS_EXCEPTION
-                    pc = target
+                    val npc = opThrow(pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_gosub.id -> {
-                    /* 压入返回地址后跳转（finally 机制，对照 C OP_gosub） */
-                    val diff = readI32(code, pc)
-                    pc += 4
-                    stack.push(JS_NewShortInt(pc))
-                    if (ctx.traceEnabled) {
-                        println("TRACE gosub pushed addr=$pc raw=${JS_NewShortInt(pc)}")
-                    }
-                    pc += diff
+                    val npc = opGosub(code, pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
                 
                 OPCodeEnum.OP_ret.id -> {
-                    /* 从 finally 返回（对照 C OP_ret：栈顶为 ShortInt 返回地址） */
-                    val ret = stack.pop()
-                    if (ctx.traceEnabled) {
-                        println("TRACE ret popped raw=$ret isInt=${JS_IsInt(ret)} addr=${if (JS_IsInt(ret)) JS_VALUE_GET_INT(ret) else -1}")
-                    }
-                    if (!JS_IsInt(ret)) return JS_EXCEPTION
-                    pc = JS_VALUE_GET_INT(ret)
+                    val npc = opRet(pc, stack)
+                    if (npc < 0) { exitKind = 1; break }
+                    pc = npc
                 }
             }
             /* 通用异常检查：运算/取值等处理器内部调用（valueOf/toString/getter）
              * 可能设置异常但未展开，这里统一按 catch 目标展开 */
             if (JS_HasException(ctx)) {
                 val target = unwindToCatch(stack)
-                if (target < 0) return JS_EXCEPTION
+                if (target < 0) { exitKind = 1; break }
                 pc = target
             }
         }
@@ -1124,7 +663,743 @@ class JSRuntime(private val ctx: JSContext) {
             releaseVars(vars)
         }
         
-        return if (stack.isEmpty()) JS_UNDEFINED else stack.top()
+        return when (exitKind) {
+            1 -> JS_EXCEPTION
+            2 -> retVal
+            else -> if (stack.isEmpty()) JS_UNDEFINED else stack.top()
+        }
+    }
+    
+    /* ================= 冷门指令处理器 =================
+     * runBody 的单方法超过 HotSpot HugeMethodLimit(8000 字节) 会完全失去 JIT，
+     * 因此把体积大且非热点的指令拆分到独立方法：主循环保持紧凑可被 C1/C2 编译，
+     * 处理器自身也可被编译/内联。
+     * 契约：返回 >= 0 为新的 pc；返回 OP_EXCEPTION 表示本帧需立即以异常结束。 */
+    
+    private fun funcPtrOf(keepStart: Int): Int =
+        JS_VALUE_TO_PTR(ctx.gcKeepAlive[keepStart])
+    
+    private fun opGetVarRef(code: ByteArray, pcIn: Int, stack: ValueStack): Int {
+        var pc = pcIn
+        val idx = readU16(code, pc)
+        pc += 2
+        if (idx < 0 || idx >= ctx.varrefPool.size) {
+            JS_ThrowReferenceError(ctx, "variable is not defined")
+            return OP_EXCEPTION
+        }
+        val v = ctx.varrefPool[idx]
+        if (JS_IsUninitialized(v)) {
+            JS_ThrowReferenceError(ctx, "variable is not defined")
+            return OP_EXCEPTION
+        }
+        stack.push(v)
+        return pc
+    }
+    
+    private fun opGetGlobal(code: ByteArray, pcIn: Int, stack: ValueStack, keepStart: Int): Int {
+        var pc = pcIn
+        val idx = readU16(code, pc)
+        pc += 2
+        val cpool = ctx.memory.getJSValue(funcPtrOf(keepStart) + 24)
+        val name = if (cpool != JS_NULL) {
+            ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
+        } else JS_UNDEFINED
+        val v = getProperty(ctx.globalObj, name)
+        if (JS_IsUndefined(v) && !hasProperty(ctx.globalObj, name)) {
+            JS_ThrowReferenceError(ctx, "'" + jsGetString(ctx, name) + "' is not defined")
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        stack.push(v)
+        return pc
+    }
+    
+    private fun opGetGlobalUndef(code: ByteArray, pcIn: Int, stack: ValueStack, keepStart: Int): Int {
+        var pc = pcIn
+        val idx = readU16(code, pc)
+        pc += 2
+        val cpool = ctx.memory.getJSValue(funcPtrOf(keepStart) + 24)
+        val name = if (cpool != JS_NULL) {
+            ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
+        } else JS_UNDEFINED
+        stack.push(getProperty(ctx.globalObj, name))
+        return pc
+    }
+    
+    private fun opPutGlobal(code: ByteArray, pcIn: Int, stack: ValueStack, keepStart: Int): Int {
+        var pc = pcIn
+        val idx = readU16(code, pc)
+        pc += 2
+        val v = stack.pop()
+        val cpool = ctx.memory.getJSValue(funcPtrOf(keepStart) + 24)
+        val name = if (cpool != JS_NULL) {
+            ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
+        } else JS_UNDEFINED
+        /* 严格模式：给未声明的全局标识符赋值抛 ReferenceError */
+        if (!hasProperty(ctx.globalObj, name)) {
+            JS_ThrowReferenceError(ctx, "\"" + jsGetString(ctx, name) + "\" is not defined")
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        setProperty(ctx.globalObj, name, v)
+        return pc
+    }
+    
+    private fun opDefineGlobal(code: ByteArray, pcIn: Int, stack: ValueStack, keepStart: Int): Int {
+        var pc = pcIn
+        val idx = readU16(code, pc)
+        pc += 2
+        val v = stack.pop()
+        val cpool = ctx.memory.getJSValue(funcPtrOf(keepStart) + 24)
+        val name = if (cpool != JS_NULL) {
+            ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
+        } else JS_UNDEFINED
+        setProperty(ctx.globalObj, name, v)
+        return pc
+    }
+    
+    private fun opFclosure(code: ByteArray, pcIn: Int, stack: ValueStack,
+                           vars: ValueArray, keepStart: Int): Int {
+        var pc = pcIn
+        /* 从 cpool 的函数字节码创建 JS_CLASS_CLOSURE 对象（extra 槽 0 = funcBytecode） */
+        val idx = readU16(code, pc)
+        pc += 2
+        val cpool = ctx.memory.getJSValue(funcPtrOf(keepStart) + 24)
+        val funcBytecode = if (cpool != JS_NULL) {
+            ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
+        } else JS_NULL
+        
+        /* 分配会触发 GC：函数字节码入保活槽，之后从槽位读取 */
+        ctx.gcKeepAlive.add(funcBytecode)
+        try {
+            /* 槽位：+24 函数字节码，+32 prototype（惰性创建），+40 name */
+            val closure = JS_NewObjectProtoClass(ctx, ctx.classProto[JSObjectClassEnum.JS_CLASS_CLOSURE.value],
+                                                 JSObjectClassEnum.JS_CLASS_CLOSURE.value, 3)
+            if (JS_IsException(closure)) return OP_EXCEPTION
+            val closurePtr = JS_VALUE_TO_PTR(closure)
+            val fb0 = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
+            ctx.memory.putJSValue(closurePtr + 24, fb0)
+            ctx.memory.putJSValue(closurePtr + 32, JS_NULL)
+            val nm = if (JS_IsPtr(fb0)) ctx.memory.getJSValue(JS_VALUE_TO_PTR(fb0) + 8) else JS_NULL
+            ctx.memory.putJSValue(closurePtr + 40,
+                if (JS_IsString(ctx, nm)) nm else JS_NULL)
+            stack.push(closure)
+            
+            /* 捕获变量初始化：把当前帧同名实参/局部的当前值写入 varref 池槽 */
+            val fb = ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1]
+            if (JS_IsPtr(fb)) {
+                val capArr = ctx.memory.getJSValue(JS_VALUE_TO_PTR(fb) + 64)
+                if (capArr != JS_NULL && !JS_IsException(capArr)) {
+                    val capPtr = JS_VALUE_TO_PTR(capArr)
+                    val capCount = ctx.memory.getI32(capPtr + 4) / 2
+                    val curVarsTab = ctx.memory.getJSValue(funcPtrOf(keepStart) + 32)
+                    if (curVarsTab != JS_NULL) {
+                        val tabPtr = JS_VALUE_TO_PTR(curVarsTab)
+                        val tabLen = ctx.memory.getI32(tabPtr + 4)
+                        for (ci in 0 until capCount) {
+                            val name = ctx.memory.getJSValue(capPtr + 8 + 2 * ci * 8)
+                            val slot = JS_VALUE_GET_INT(ctx.memory.getJSValue(capPtr + 16 + 2 * ci * 8))
+                            for (j in 0 until minOf(tabLen, vars.size)) {
+                                val vn = ctx.memory.getJSValue(tabPtr + 8 + j * 8)
+                                if (vn == name || jsValueEquals(vn, name)) {
+                                    while (ctx.varrefPool.size <= slot) {
+                                        ctx.varrefPool.add(JS_UNDEFINED)
+                                    }
+                                    ctx.varrefPool[slot] = vars[j]
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
+        return pc
+    }
+    
+    private fun opRegexp(pcIn: Int, stack: ValueStack): Int {
+        /* [pattern, flags] -> RegExp 对象 */
+        val flags = jsGetString(ctx, stack.pop())
+        val pattern = jsGetString(ctx, stack.pop())
+        val re = JSStdlib.newRegExp(ctx, pattern, flags)
+        if (JS_IsException(re)) {
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        stack.push(re)
+        return pcIn
+    }
+    
+    private fun opArrayFrom(code: ByteArray, pcIn: Int, stack: ValueStack): Int {
+        var pc = pcIn
+        val argc = readU16(code, pc)
+        pc += 2
+        /* JS_NewArray 的分配可能触发 GC 搬移：此刻元素仍在解释器栈上
+         * （栈是 GC 根，随搬移自动更新），先建数组再取元素 */
+        val arr = JS_NewArray(ctx, argc)
+        val keepBase = ctx.gcKeepAlive.size
+        /* 元素先出栈入保活列表：随后补分配元素存储（见下）可能触发
+         * GC 搬移，Kotlin 局部值会过期，保活列表中的值随搬移更新 */
+        ctx.gcKeepAlive.add(arr)
+        val elems = ArrayList<JSValue>(argc)
+        for (i in 0 until argc) elems.add(stack.pop())
+        for (e in elems) ctx.gcKeepAlive.add(e)
+        
+        /* JS_NewArray 不分配元素存储（arrData 为 JS_NULL）：补分配并
+         * 写入元素（对照 C OP_array_from 的数组构造语义） */
+        val arrKept = ctx.gcKeepAlive[keepBase]
+        val arrPtr = JS_VALUE_TO_PTR(arrKept)
+        var arrData = ctx.memory.getJSValue(arrPtr + 24)
+        if (arrData == JS_NULL) {
+            arrData = allocValueArray(argc)
+            if (arrData != JS_NULL) {
+                ctx.memory.putJSValue(arrPtr + 24, arrData)
+            }
+        }
+        if (arrData != JS_NULL) {
+            val dataPtr = JS_VALUE_TO_PTR(arrData)
+            /* elems[i] 为第 argc-1-i 个元素（出栈序与写入序相反） */
+            for (j in 0 until argc) {
+                ctx.memory.putJSValue(
+                    dataPtr + 8 + j * 8,
+                    ctx.gcKeepAlive[keepBase + 1 + (argc - 1 - j)]
+                )
+            }
+        }
+        while (ctx.gcKeepAlive.size > keepBase) ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        stack.push(arrKept)
+        return pc
+    }
+    
+    private fun opInstanceof(pcIn: Int, stack: ValueStack): Int {
+        val ctor = stack.pop()
+        val obj = stack.pop()
+        val r = jsInstanceof(obj, ctor)
+        if (JS_IsException(r)) {
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        stack.push(r)
+        return pcIn
+    }
+    
+    private fun opArguments(pcIn: Int, stack: ValueStack, keepStart: Int, argc: Int): Int {
+        /* arguments：把本帧实参复制成数组对象（length/索引均可用）。
+         * 实参已由 runBody 放入 gcKeepAlive（keepStart+3 起） */
+        val arr = JS_NewArray(ctx, argc)
+        if (JS_IsException(arr)) return OP_EXCEPTION
+        ctx.gcKeepAlive.add(arr)
+        try {
+            val tab = allocValueArray(argc)
+            if (!JS_IsNull(tab) && !JS_IsException(tab)) {
+                val tabPtr = JS_VALUE_TO_PTR(tab)
+                for (i in 0 until argc) {
+                    ctx.memory.putJSValue(tabPtr + 8 + i * 8,
+                                          ctx.gcKeepAlive[keepStart + 3 + i])
+                }
+                val arrPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+                ctx.memory.putJSValue(arrPtr + 24, tab)
+                ctx.memory.putI32(arrPtr + 32, argc)
+            }
+            stack.push(ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
+        return pcIn
+    }
+    
+    private fun opSetProto(pcIn: Int, stack: ValueStack): Int {
+        val proto = stack.pop()
+        val obj = stack.pop()
+        if (JS_IsPtr(obj)) {
+            val objPtr = JS_VALUE_TO_PTR(obj)
+            if (ctx.memory.getMTag(objPtr) == JSMTags.JS_MTAG_OBJECT) {
+                val newProto = if (JS_IsPtr(proto) &&
+                    ctx.memory.getMTag(JS_VALUE_TO_PTR(proto)) == JSMTags.JS_MTAG_OBJECT) {
+                    proto
+                } else if (JS_IsNull(proto)) {
+                    JS_NULL
+                } else {
+                    ctx.memory.getJSValue(objPtr + 8)
+                }
+                ctx.memory.putJSValue(objPtr + 8, newProto)
+            }
+        }
+        stack.push(obj)
+        return pcIn
+    }
+    
+    private fun opForInStart(pcIn: Int, stack: ValueStack): Int {
+        /* obj -> 迭代器（VALUE_ARRAY [keysArray, pos]） */
+        val obj = stack.pop()
+        val keys = jsObjectKeys(obj)
+        if (JS_IsException(keys)) {
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        ctx.gcKeepAlive.add(keys)
+        try {
+            val iter = allocValueArray(2)
+            if (JS_IsNull(iter) || JS_IsException(iter)) return OP_EXCEPTION
+            val iterPtr = JS_VALUE_TO_PTR(iter)
+            ctx.memory.putJSValue(iterPtr + 8, ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            ctx.memory.putJSValue(iterPtr + 16, JS_NewShortInt(0))
+            stack.push(iter)
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
+        return pcIn
+    }
+    
+    private fun opForOfStart(pcIn: Int, stack: ValueStack): Int {
+        /* for-of：迭代数组元素。迭代器结构同 for-in（[数组对象, pos]） */
+        val obj = stack.pop()
+        var ok = false
+        var iterSource = obj
+        if (JS_IsPtr(obj)) {
+            val p = JS_VALUE_TO_PTR(obj)
+            if (ctx.memory.getMTag(p) == JSMTags.JS_MTAG_OBJECT) {
+                val cid = ctx.memory.getU8(p + 2)
+                if (cid == JSObjectClassEnum.JS_CLASS_ARRAY.value) {
+                    ok = true
+                } else if (cid == JSObjectClassEnum.JS_CLASS_SET.value) {
+                    /* for-of Set：迭代其内部数组快照 */
+                    val inner = ctx.memory.getJSValue(p + 24)
+                    if (JS_IsPtr(inner)) {
+                        ok = true
+                        iterSource = inner
+                    }
+                }
+            }
+        }
+        if (!ok) {
+            JS_ThrowTypeError(ctx, "unsupported type in for...of")
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        ctx.gcKeepAlive.add(iterSource)
+        try {
+            val iter = allocValueArray(2)
+            if (JS_IsNull(iter) || JS_IsException(iter)) return OP_EXCEPTION
+            val iterPtr = JS_VALUE_TO_PTR(iter)
+            ctx.memory.putJSValue(iterPtr + 8, ctx.gcKeepAlive[ctx.gcKeepAlive.size - 1])
+            ctx.memory.putJSValue(iterPtr + 16, JS_NewShortInt(0))
+            stack.push(iter)
+        } finally {
+            ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+        }
+        return pcIn
+    }
+    
+    private fun opForOfNext(pcIn: Int, stack: ValueStack): Int {
+        /* iter -> iter value done（done 在栈顶，供 if_false 消费） */
+        val iter = stack.top()
+        val iterPtr = JS_VALUE_TO_PTR(iter)
+        val keys = ctx.memory.getJSValue(iterPtr + 8)
+        val pos = JS_VALUE_GET_INT(ctx.memory.getJSValue(iterPtr + 16))
+        val keyArrPtr = if (JS_IsPtr(keys)) JS_VALUE_TO_PTR(keys) else -1
+        if (keyArrPtr < ctx.heapBase || keyArrPtr >= ctx.heapFree) return OP_EXCEPTION
+        val len = ctx.memory.getI32(keyArrPtr + 32)
+        if (pos >= len) {
+            stack.push(JS_UNDEFINED)
+            stack.push(JS_TRUE)
+        } else {
+            val tab = ctx.memory.getJSValue(keyArrPtr + 24)
+            val elem = if (tab == JS_NULL) JS_UNDEFINED
+                       else ctx.memory.getJSValue(JS_VALUE_TO_PTR(tab) + 8 + pos * 8)
+            stack.push(elem)
+            stack.push(JS_FALSE)
+            ctx.memory.putJSValue(iterPtr + 16, JS_NewShortInt(pos + 1))
+        }
+        return pcIn
+    }
+    
+    private fun opCallConstructor(code: ByteArray, pcIn: Int, stack: ValueStack): Int {
+        var pc = pcIn
+        val argc = readU16(code, pc)
+        pc += 2
+        val args = ArrayList<JSValue>(argc)
+        val base = stack.size - argc
+        for (i in 0 until argc) args.add(stack[base + i])
+        repeat(argc) { stack.pop() }
+        val funcVal = stack.pop()
+        val r = callConstructor(funcVal, args)
+        if (JS_IsException(r) && JS_HasException(ctx)) {
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        stack.push(r)
+        return pc
+    }
+    
+    private fun opRet(pcIn: Int, stack: ValueStack): Int {
+        /* 从 finally 返回（对照 C OP_ret：栈顶为 ShortInt 返回地址） */
+        val ret = stack.pop()
+        if (ctx.traceEnabled) {
+            println("TRACE ret popped raw=$ret isInt=${JS_IsInt(ret)} addr=${if (JS_IsInt(ret)) JS_VALUE_GET_INT(ret) else -1}")
+        }
+        if (!JS_IsInt(ret)) return OP_EXCEPTION
+        return JS_VALUE_GET_INT(ret)
+    }
+    
+    private fun cpoolKey(keepStart: Int, idx: Int): JSValue {
+        val cpool = ctx.memory.getJSValue(funcPtrOf(keepStart) + 24)
+        return if (cpool != JS_NULL) {
+            ctx.memory.getJSValue(JS_VALUE_TO_PTR(cpool) + 8 + idx * 8)
+        } else JS_UNDEFINED
+    }
+    
+    private fun opGetField(code: ByteArray, pcIn: Int, stack: ValueStack, keepStart: Int): Int {
+        var pc = pcIn
+        val idx = readU16(code, pc)
+        pc += 2
+        val obj = stack.pop()
+        val v = getProperty(obj, cpoolKey(keepStart, idx))
+        if (JS_HasException(ctx)) {
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        stack.push(v)
+        return pc
+    }
+    
+    private fun opGetField2(code: ByteArray, pcIn: Int, stack: ValueStack, keepStart: Int): Int {
+        /* 对照 C：sp-- 后 sp[0] = get_field(sp[0], atom)
+         * —— 栈顶对象被保留，属性值压入其上（[obj] → [obj, value]），
+         * 供方法调用把 obj 作为 this 使用 */
+        var pc = pcIn
+        val idx = readU16(code, pc)
+        pc += 2
+        if (stack.isEmpty()) return OP_EXCEPTION
+        val obj = stack.top()
+        val fv = getProperty(obj, cpoolKey(keepStart, idx))
+        if (JS_HasException(ctx)) {
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        stack.push(fv)
+        return pc
+    }
+    
+    private fun opPutField(code: ByteArray, pcIn: Int, stack: ValueStack, keepStart: Int): Int {
+        var pc = pcIn
+        val idx = readU16(code, pc)
+        pc += 2
+        val val1 = stack.pop()
+        val obj = stack.pop()
+        val key = cpoolKey(keepStart, idx)
+        /* 数组只接受 length 与规范索引属性；其他键按 C 版语义抛 TypeError */
+        var badKey = false
+        if (JS_IsPtr(obj)) {
+            val op = JS_VALUE_TO_PTR(obj)
+            if (ctx.memory.getMTag(op) == JSMTags.JS_MTAG_OBJECT &&
+                ctx.memory.getU8(op + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value &&
+                JS_IsString(ctx, key)) {
+                val ks = jsGetString(ctx, key)
+                if (ks != "length" && arrayIndexFromString(ks) < 0) {
+                    JS_ThrowTypeError(ctx, "invalid array index")
+                    badKey = true
+                }
+            }
+        }
+        if (badKey) {
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        setProperty(obj, key, val1)
+        if (ctx.traceEnabled) {
+            println("TRACE put_field obj=${if (JS_IsPtr(obj)) JS_VALUE_TO_PTR(obj) else obj} key='${jsGetString(ctx, key)}' val=${if (JS_IsInt(val1)) JS_VALUE_GET_INT(val1) else -1}")
+        }
+        return pc
+    }
+    
+    private fun opDefineField(code: ByteArray, pcIn: Int, stack: ValueStack, keepStart: Int): Int {
+        var pc = pcIn
+        val idx = readU16(code, pc)
+        pc += 2
+        val val1 = stack.pop()
+        val obj = stack.pop()
+        defineProperty(obj, cpoolKey(keepStart, idx), val1)
+        stack.push(obj)
+        return pc
+    }
+    
+    private fun opPutArrayEl(pcIn: Int, stack: ValueStack): Int {
+        val val1 = stack.pop()
+        val idx = stack.pop()
+        val obj = stack.pop()
+        var badIndex = false
+        if (JS_IsPtr(obj)) {
+            val op = JS_VALUE_TO_PTR(obj)
+            if (ctx.memory.getMTag(op) == JSMTags.JS_MTAG_OBJECT &&
+                ctx.memory.getU8(op + 2) == JSObjectClassEnum.JS_CLASS_ARRAY.value &&
+                !isArrayIndexValue(idx)) {
+                JS_ThrowTypeError(ctx, "invalid array index")
+                badIndex = true
+            }
+        }
+        if (badIndex) {
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        setElement(obj, idx, val1)
+        if (JS_HasException(ctx)) {
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        return pcIn
+    }
+    
+    private fun opPutVarRef(code: ByteArray, pcIn: Int, stack: ValueStack): Int {
+        var pc = pcIn
+        val idx = readU16(code, pc)
+        pc += 2
+        val v = stack.pop()
+        while (ctx.varrefPool.size <= idx) {
+            ctx.varrefPool.add(JS_UNDEFINED)
+        }
+        ctx.varrefPool[idx] = v
+        return pc
+    }
+    
+    private fun opGoto(code: ByteArray, pcIn: Int): Int {
+        var pc = pcIn
+        val offset = readI32(code, pc)
+        pc += 4
+        return pc + offset
+    }
+    
+    private fun opGetArrayEl(pcIn: Int, stack: ValueStack): Int {
+        val idx = stack.pop()
+        val obj = stack.pop()
+        val ev = getElement(obj, idx)
+        if (JS_HasException(ctx)) {
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        stack.push(ev)
+        return pcIn
+    }
+    
+    private fun opGetArrayEl2(pcIn: Int, stack: ValueStack): Int {
+        /* 对照 C：与 get_field2 同构——弹出 key 但保留 obj（[obj, key] → [obj, val]） */
+        if (stack.size < 2) return OP_EXCEPTION
+        val idx = stack.pop()
+        val obj = stack.top()
+        val val1 = getElement(obj, idx)
+        stack.push(val1)
+        return pcIn
+    }
+    
+    private fun opDefineAccessor(code: ByteArray, pcIn: Int, stack: ValueStack,
+                                keepStart: Int, isGetter: Boolean): Int {
+        var pc = pcIn
+        val idx = readU16(code, pc)
+        pc += 2
+        val func = stack.pop()
+        val obj = stack.pop()
+        defineAccessor(obj, cpoolKey(keepStart, idx), func, isGetter)
+        stack.push(obj)
+        return pc
+    }
+    
+    private fun opCall(code: ByteArray, pcIn: Int, stack: ValueStack): Int {
+        var pc = pcIn
+        val argc = readU16(code, pc)
+        pc += 2
+        val args = ArrayList<JSValue>(argc)
+        val base = stack.size - argc
+        for (i in 0 until argc) args.add(stack[base + i])
+        repeat(argc) { stack.pop() }
+        val funcVal = stack.pop()
+        /* 普通调用的 this 为 undefined（对照 C generic_function_call 压入 JS_UNDEFINED） */
+        val r = callFunction(funcVal, args, JS_UNDEFINED)
+        if (JS_IsException(r) && JS_HasException(ctx)) {
+            /* 调用产生异常：本帧展开，命中 catch 则继续执行（对照 C call_exception） */
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        stack.push(r)
+        return pc
+    }
+    
+    private fun opCallMethod(code: ByteArray, pcIn: Int, stack: ValueStack): Int {
+        var pc = pcIn
+        val argc = readU16(code, pc)
+        pc += 2
+        val args = ArrayList<JSValue>(argc)
+        val base = stack.size - argc
+        for (i in 0 until argc) args.add(stack[base + i])
+        repeat(argc) { stack.pop() }
+        val funcVal = stack.pop()
+        val thisObj = stack.pop()
+        val r = callMethod(funcVal, thisObj, args)
+        if (JS_IsException(r) && JS_HasException(ctx)) {
+            val target = unwindToCatch(stack)
+            return if (target < 0) OP_EXCEPTION else target
+        }
+        stack.push(r)
+        return pc
+    }
+    
+    private fun opCmpLocLocJump(code: ByteArray, pcIn: Int, vars: ValueArray): Int {
+        val start = pcIn - 1
+        val cmp = code[pcIn].toInt() and 0xFF
+        val a = readU16(code, pcIn + 1)
+        val b = readU16(code, pcIn + 3)
+        val off = readI32(code, pcIn + 5)
+        val va = vars[a]
+        val vb = vars[b]
+        val res: Boolean = when (cmp) {
+            OPCodeEnum.OP_lt.id -> toBoolean(doLt(va, vb))
+            OPCodeEnum.OP_lte.id -> toBoolean(doLte(va, vb))
+            OPCodeEnum.OP_gt.id -> toBoolean(doLt(vb, va))
+            OPCodeEnum.OP_gte.id -> toBoolean(doLte(vb, va))
+            OPCodeEnum.OP_eq.id -> toBoolean(doEq(va, vb))
+            OPCodeEnum.OP_neq.id -> !toBoolean(doEq(va, vb))
+            OPCodeEnum.OP_strict_eq.id -> strictEquals(va, vb)
+            OPCodeEnum.OP_strict_neq.id -> !strictEquals(va, vb)
+            else -> false
+        }
+        return if (res) start + 12 else start + 12 + off
+    }
+    
+    private fun opPushConst(code: ByteArray, pcIn: Int, stack: ValueStack, keepStart: Int): Int {
+        var pc = pcIn
+        val idx = (code[pc].toInt() and 0xFF) or ((code[pc + 1].toInt() and 0xFF) shl 8)
+        pc += 2
+        stack.push(cpoolKey(keepStart, idx))
+        return pc
+    }
+    
+    private fun opGetLoc(code: ByteArray, pcIn: Int, stack: ValueStack,
+                         vars: ValueArray, keepStart: Int): Int {
+        var pc = pcIn
+        val idx = readU16(code, pc)
+        pc += 2
+        val v = vars[idx]
+        if (ctx.throwTraceEnabled && JS_IsPtr(v)) {
+            val vp = JS_VALUE_TO_PTR(v)
+            if (vp in ctx.heapBase until ctx.heapFree &&
+                ctx.memory.getMTag(vp) == JSMTags.JS_MTAG_FREE) {
+                var nm = "?"
+                val vt = ctx.memory.getJSValue(funcPtrOf(keepStart) + 32)
+                if (vt != JS_NULL) {
+                    val vtp = JS_VALUE_TO_PTR(vt)
+                    val nv = ctx.memory.getJSValue(vtp + 8 + idx * 8)
+                    if (JS_IsString(ctx, nv)) nm = jsGetString(ctx, nv)
+                }
+                System.err.println("STALE_LOC idx=$idx name=$nm val=$v heapFree=${ctx.heapFree}")
+            }
+        }
+        stack.push(v)
+        return pc
+    }
+    
+    private fun opPutLoc(code: ByteArray, pcIn: Int, stack: ValueStack,
+                         vars: ValueArray, keepStart: Int): Int {
+        var pc = pcIn
+        val idx = readU16(code, pc)
+        pc += 2
+        val val1 = stack.pop()
+        if (ctx.throwTraceEnabled && JS_IsPtr(val1)) {
+            val vp = JS_VALUE_TO_PTR(val1)
+            if (vp >= ctx.heapFree || (vp >= ctx.heapBase && ctx.memory.getMTag(vp) == JSMTags.JS_MTAG_FREE)) {
+                var nm = "?"
+                val vt = ctx.memory.getJSValue(funcPtrOf(keepStart) + 32)
+                if (vt != JS_NULL) {
+                    val vtp = JS_VALUE_TO_PTR(vt)
+                    val nv = ctx.memory.getJSValue(vtp + 8 + idx * 8)
+                    if (JS_IsString(ctx, nv)) nm = jsGetString(ctx, nv)
+                }
+                System.err.println("STALE_PUT idx=$idx name=$nm val=$val1 heapFree=${ctx.heapFree}")
+            }
+        }
+        vars[idx] = val1
+        return pc
+    }
+    
+    private fun opIncLoc(code: ByteArray, pcIn: Int, stack: ValueStack, vars: ValueArray): Int {
+        val start = pcIn - 1
+        val idx = readU16(code, pcIn)
+        stack.pop()   /* 丢弃前一条 get_loc 压入的旧值 */
+        vars[idx] = doAdd(vars[idx], JS_NewShortInt(1))
+        return start + 16
+    }
+    
+    private fun opDecLoc(code: ByteArray, pcIn: Int, stack: ValueStack, vars: ValueArray): Int {
+        val start = pcIn - 1
+        val idx = readU16(code, pcIn)
+        stack.pop()
+        vars[idx] = doSub(vars[idx], JS_NewShortInt(1))
+        return start + 16
+    }
+    
+    private fun opAddLocLoc(code: ByteArray, pcIn: Int, vars: ValueArray): Int {
+        val start = pcIn - 1
+        val a = readU16(code, pcIn)
+        val b = readU16(code, pcIn + 2)
+        vars[a] = doAdd(vars[a], vars[b])
+        return start + 18
+    }
+    
+    private fun opAddLocImm(code: ByteArray, pcIn: Int, vars: ValueArray): Int {
+        val start = pcIn - 1
+        val a = readU16(code, pcIn)
+        val imm = code[pcIn + 2].toByte().toInt()
+        vars[a] = doAdd(vars[a], JS_NewShortInt(imm))
+        return start + 16
+    }
+    
+    private fun opBinLocImm(code: ByteArray, pcIn: Int, stack: ValueStack, vars: ValueArray): Int {
+        val start = pcIn - 1
+        val kb = code[pcIn].toInt() and 0xFF
+        val kind = kb and 0x7F
+        val idx = readU16(code, pcIn + 1)
+        val imm = code[pcIn + 3].toByte().toInt()
+        stack.push(doBinOp(kind, vars[idx], JS_NewShortInt(imm)))
+        return start + if ((kb and 0x80) != 0) 6 else 5
+    }
+    
+    private fun opBinLocLoc(code: ByteArray, pcIn: Int, stack: ValueStack, vars: ValueArray): Int {
+        val start = pcIn - 1
+        val kind = code[pcIn].toInt() and 0xFF
+        val a = readU16(code, pcIn + 1)
+        val b = readU16(code, pcIn + 3)
+        stack.push(doBinOp(kind, vars[a], vars[b]))
+        return start + 7
+    }
+    
+    private fun opCatch(code: ByteArray, pcIn: Int, stack: ValueStack): Int {
+        /* 压入 catch 目标偏移（对照 C：JS_VALUE_MAKE_SPECIAL(JS_TAG_CATCH_OFFSET, 目标)），
+         * 异常展开时该值被替换为异常本身 */
+        var pc = pcIn
+        val diff = readI32(code, pc)
+        pc += 4
+        stack.push(JS_VALUE_MAKE_SPECIAL(JSTags.JS_TAG_CATCH_OFFSET, pc + diff))
+        return pc
+    }
+    
+    private fun opThrow(pcIn: Int, stack: ValueStack): Int {
+        /* 弹出异常值并抛出，转入本帧异常处理（对照 C OP_throw → goto exception） */
+        val ex = stack.pop()
+        JS_Throw(ctx, ex)
+        val target = unwindToCatch(stack)
+        return if (target < 0) OP_EXCEPTION else target
+    }
+    
+    private fun opGosub(code: ByteArray, pcIn: Int, stack: ValueStack): Int {
+        /* 压入返回地址后跳转（finally 机制，对照 C OP_gosub） */
+        var pc = pcIn
+        val diff = readI32(code, pc)
+        pc += 4
+        stack.push(JS_NewShortInt(pc))
+        if (ctx.traceEnabled) {
+            println("TRACE gosub pushed addr=$pc raw=${JS_NewShortInt(pc)}")
+        }
+        return pc + diff
     }
     
     private fun readU16(code: ByteArray, pc: Int): Int {
@@ -2049,10 +2324,94 @@ class JSRuntime(private val ctx: JSContext) {
                 ctx.memory.putJSValue(propPtr + 8, JS_UNDEFINED)
                 val cnt = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 8)) - 1
                 ctx.memory.putJSValue(propsPtr + 8, JS_NewShortInt(cnt))
+                if (cnt == 0) {
+                    /* 全部删除：直接丢弃属性表，避免反复创建/删除时槽位持续膨胀
+                     * （旧实现删除只留下 UNINITIALIZED 槽，表只增不减，churn 场景会退化为 O(n²)） */
+                    ctx.memory.putJSValue(objPtr + 16, ctx.emptyProps)
+                } else {
+                    val size = ctx.memory.getI32(propsPtr + 4)
+                    val hashMaskD = JS_VALUE_GET_INT(ctx.memory.getJSValue(propsPtr + 16))
+                    val slotCount = (size - (2 + hashMaskD + 1)) / 3
+                    /* 空洞超过 3/4 时压缩属性表，保证删除-重插循环的均摊成本 */
+                    if (slotCount >= 64 && cnt * 4 < slotCount) compactProps(objPtr)
+                }
                 return
             }
             prevIdx = idx
             idx = JS_VALUE_GET_INT(ctx.memory.getJSValue(propPtr + 16)) shr 1
+        }
+    }
+    
+    /* 压缩属性表：只复制存活属性，按约 1.25 倍容量重建。
+     * 删除只把槽位标记为 UNINITIALIZED，旧实现从不回收，反复“创建-删除”会让表无限膨胀；
+     * 这里在空洞占比过高时重建，使增删 churn 保持均摊线性。 */
+    private fun compactProps(objPtr0: Int) {
+        val keepBase = ctx.gcKeepAlive.size
+        ctx.gcKeepAlive.add(JS_VALUE_FROM_PTR(objPtr0))
+        try {
+            val objPtr = JS_VALUE_TO_PTR(ctx.gcKeepAlive[keepBase])
+            val props = ctx.memory.getJSValue(objPtr + 16)
+            if (props == JS_NULL || props == ctx.emptyProps) return
+            ctx.gcKeepAlive.add(props)
+            val pPtr = JS_VALUE_TO_PTR(props)
+            val size = ctx.memory.getI32(pPtr + 4)
+            val hashMask = JS_VALUE_GET_INT(ctx.memory.getJSValue(pPtr + 16))
+            val firstUnit = 2 + hashMask + 1
+            val slotCount = (size - firstUnit) / 3
+
+            /* 第一遍：收集存活键值（先入保活列表，后续哈希/分配可能触发 GC 搬移） */
+            var n = 0
+            for (i in 0 until slotCount) {
+                val unit = firstUnit + 3 * i
+                val key = ctx.memory.getJSValue(pPtr + 8 + unit * 8)
+                if (key == JS_UNINITIALIZED) continue
+                ctx.gcKeepAlive.add(key)
+                ctx.gcKeepAlive.add(ctx.memory.getJSValue(pPtr + 8 + (unit + 1) * 8))
+                n++
+            }
+            if (n == 0) {
+                ctx.memory.putJSValue(JS_VALUE_TO_PTR(ctx.gcKeepAlive[keepBase]) + 16, ctx.emptyProps)
+                return
+            }
+
+            val newN = maxOf(4, n + (n ushr 2) + 1)
+            val newLog = if (newN <= 1) 0 else (32 - Integer.numberOfLeadingZeros(newN - 1)) - 1
+            val newMask = (1 shl newLog) - 1
+            val newFirstUnit = 2 + newMask + 1
+
+            /* 第二遍：用新桶掩码预计算哈希（hashProp 对数值键可能分配，键已保活） */
+            val hashes = IntArray(n)
+            for (i in 0 until n) {
+                hashes[i] = hashProp(ctx.gcKeepAlive[keepBase + 2 + 2 * i], newMask)
+            }
+
+            val newProps = allocProps(newN)
+            if (newProps == JS_NULL) return
+            val newPtr = JS_VALUE_TO_PTR(newProps)
+            ctx.memory.putJSValue(newPtr + 8, JS_NewShortInt(n))
+            val buckets = newPtr + 24
+            for (i in 0 until n) {
+                val key = ctx.gcKeepAlive[keepBase + 2 + 2 * i]
+                val value = ctx.gcKeepAlive[keepBase + 3 + 2 * i]
+                val unit = newFirstUnit + 3 * i
+                val pp = newPtr + 8 + unit * 8
+                ctx.memory.putJSValue(pp, key)
+                ctx.memory.putJSValue(pp + 8, value)
+                val h = hashes[i]
+                ctx.memory.putJSValue(pp + 16, ctx.memory.getJSValue(buckets + h * 8))
+                ctx.memory.putJSValue(buckets + h * 8, JS_NewShortInt(unit shl 1))
+            }
+            val newSize = ctx.memory.getI32(newPtr + 4)
+            val nextFree = newFirstUnit + 3 * n
+            if (nextFree < newSize) {
+                val tail = newPtr + 8 + (newSize - 3) * 8
+                ctx.memory.putJSValue(tail + 16, JS_NewShortInt(nextFree shl 1))
+            }
+            ctx.memory.putJSValue(JS_VALUE_TO_PTR(ctx.gcKeepAlive[keepBase]) + 16, newProps)
+        } finally {
+            while (ctx.gcKeepAlive.size > keepBase) {
+                ctx.gcKeepAlive.removeAt(ctx.gcKeepAlive.size - 1)
+            }
         }
     }
     
@@ -2281,7 +2640,14 @@ class JSRuntime(private val ctx: JSContext) {
         var lastKey = ctx.memory.getJSValue(lastPropPtr)
         
         if (lastKey != JS_UNINITIALIZED) {
-            val newSize = size + 3
+            val oldSize = size
+            /* 几何扩容：旧的 +3 线性增长会让连续插入退化为 O(n²)（每次复制整张表）。
+             * 新尺寸必须保持 “槽位 = 首个槽位 + 3*i” 的对齐，否则尾槽哨兵会落到
+             * 某个槽的 value/next 单元上并写坏属性表。 */
+            val firstFreeUnits = 2 + hashMask + 1
+            val slotCount = (size - firstFreeUnits) / 3
+            val newSlotCount = maxOf(slotCount * 2, slotCount + 1)
+            val newSize = firstFreeUnits + 3 * newSlotCount
             val newProps = ctx.malloc(8 + newSize * 8, JSMTags.JS_MTAG_VALUE_ARRAY)
             if (newProps == 0) return
             
@@ -2297,8 +2663,13 @@ class JSRuntime(private val ctx: JSContext) {
             for (i in 0 until size) {
                 ctx.memory.putJSValue(newProps + 8 + i * 8, ctx.memory.getJSValue(propsPtr + 8 + i * 8))
             }
-            for (i in size until newSize) {
-                ctx.memory.putJSValue(newProps + 8 + i * 8, JS_NewShortInt(0))
+            /* 新槽必须写成“空槽”三元组（key=UNINITIALIZED）。全部写 0 会让空槽的
+             * key 变成合法整数 0，导致读取 o[0] 命中空槽并返回哨兵值。 */
+            for (si in slotCount until newSlotCount) {
+                val base = newProps + 8 + (firstFreeUnits + 3 * si) * 8
+                ctx.memory.putJSValue(base, JS_UNINITIALIZED)
+                ctx.memory.putJSValue(base + 8, JS_UNDEFINED)
+                ctx.memory.putJSValue(base + 16, JS_NewShortInt(0))
             }
             
             ctx.memory.putJSValue(objPtr + 16, JS_VALUE_FROM_PTR(newProps))
@@ -2311,7 +2682,8 @@ class JSRuntime(private val ctx: JSContext) {
             
             lastPropPtr = propsPtr + 8 + (size - 3) * 8
             ctx.memory.putJSValue(lastPropPtr, JS_UNINITIALIZED)
-            ctx.memory.putJSValue(lastPropPtr + 16, JS_NewShortInt((size - 3) shl 1))
+            /* 新表尾槽记录“下一个空闲槽”= 旧表末尾（新追加区域的起点） */
+            ctx.memory.putJSValue(lastPropPtr + 16, JS_NewShortInt(oldSize shl 1))
             lastKey = JS_UNINITIALIZED
         }
         
@@ -2339,8 +2711,11 @@ class JSRuntime(private val ctx: JSContext) {
         /* 属性键按字符串语义处理：数值键也要与等价的字符串键同桶。
          * 字符串直接按 UTF-8 字节哈希，避免每次属性访问都解码成 Kotlin String */
         if (JS_IsString(ctx, prop)) return hashStringBytes(prop, hashMask)
+        /* 整数键走无分配的十进制哈希（原先每次调用 jsNumberToString 都会新建
+         * Kotlin 字符串，数值键密集的建表/删除场景因此产生大量垃圾） */
+        if (JS_IsInt(prop)) return hashIntKey(JS_VALUE_GET_INT(prop), hashMask)
         val keyStr: String? = when {
-            JS_IsInt(prop) || JS_IsShortFloat(prop) -> jsNumberToString(toNumber(prop))
+            JS_IsShortFloat(prop) -> jsNumberToString(toNumber(prop))
             JS_IsPtr(prop) && ctx.memory.getMTag(JS_VALUE_TO_PTR(prop)) == JSMTags.JS_MTAG_FLOAT64 ->
                 jsNumberToString(toNumber(prop))
             else -> null
@@ -2353,6 +2728,23 @@ class JSRuntime(private val ctx: JSContext) {
             return h
         }
         return ((prop / JSW) xor (prop % JSW)).toInt() and hashMask
+    }
+    
+    /* 整数键的十进制字符串哈希（与 "123" 的逐字符 *31 哈希一致，但不分配 String） */
+    private fun hashIntKey(value: Int, hashMask: Int): Int {
+        var h = 0
+        var x = value.toLong()
+        if (x < 0) {
+            h = '-'.code and hashMask
+            x = -x
+        }
+        var div = 1L
+        while (x / div >= 10) div *= 10
+        while (div > 0) {
+            h = (h * 31 + ('0'.code + ((x / div) % 10).toInt())) and hashMask
+            div /= 10
+        }
+        return h
     }
     
     private fun hashStringBytes(s: JSValue, hashMask: Int): Int {

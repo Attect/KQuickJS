@@ -41,3 +41,7 @@ nul
 # Gradle 工作区缓存（沙箱构建用）
 .gradle-home/
 .upstream-ref/
+
+# 性能评估产物
+perf-results/
+*.jfr

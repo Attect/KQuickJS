@@ -2581,19 +2581,24 @@ class JSParser(private val s: JSParseState) {
     
     /* 源码字节偏移 → (line<<16 | col)（列按 UTF-8 码点计，对照 C 的 get_line_col） */
     private fun lineColOf(pos: Int): Int {
-        var line = 1
+        val bufLen = s.sourceBuf.size
+        val p = if (pos < 0) 0 else if (pos > bufLen) bufLen else pos
+        val starts = s.lineStarts
+        /* 二分找到 p 所在行（starts[0] == 0） */
+        var lo = 0
+        var hi = starts.size - 1
+        while (lo < hi) {
+            val mid = (lo + hi + 1) ushr 1
+            if (starts[mid] <= p) lo = mid else hi = mid - 1
+        }
         var col = 1
-        var i = 0
-        while (i < pos && i < s.sourceBuf.size) {
+        var i = starts[lo]
+        while (i < p) {
             val c = s.sourceBuf[i].toInt() and 0xFF
-            if (c == '\n'.code) {
-                line++; col = 1
-            } else if (c < 0x80 || c >= 0xC0) {
-                col++
-            }
+            if (c < 0x80 || c >= 0xC0) col++
             i++
         }
-        return (line shl 16) or (col and 0xFFFF)
+        return ((lo + 1) shl 16) or (col and 0xFFFF)
     }
     
     /* 把当前函数的 pc→源码偏移 表转换为 pc→行列 稀疏表（Kotlin 侧，GC 搬移键） */

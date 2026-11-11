@@ -10,6 +10,8 @@ object JSGC {
         gcMarkAll(ctx, keepAtoms)
         gcFreeUnmarked(ctx)
         gcCompactHeap(ctx)
+        /* 字节码缓存以块地址为 key：压缩后地址已变化，必须整体失效 */
+        ctx.bytecodeCache.clear()
     }
     
     private fun gcMarkAll(ctx: JSContext, keepAtoms: Boolean) {

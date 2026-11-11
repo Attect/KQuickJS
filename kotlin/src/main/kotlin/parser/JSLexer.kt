@@ -102,6 +102,19 @@ data class JSToken(
     var value: JSValue = JS_NULL
 )
 
+/* 构建每行起始字节偏移：lineStarts[0]=0，每个 '\n' 之后为下一行起点。
+ * 解析期只建一次，供 pc→行列换算二分定位，避免逐标记从头扫描的 O(n²)。 */
+private fun buildLineStarts(buf: ByteArray): IntArray {
+    val starts = IntArray(buf.size + 1)
+    var n = 1
+    for (i in buf.indices) {
+        if (buf[i] == '\n'.code.toByte()) {
+            starts[n++] = i + 1
+        }
+    }
+    return if (n == starts.size) starts else starts.copyOf(n)
+}
+
 class JSParseState(
     val ctx: JSContext,
     val sourceBuf: ByteArray,
@@ -118,6 +131,10 @@ class JSParseState(
     
     var bufPos = 0
     val bufLen = sourceBuf.size
+    
+    /* 每行起始字节偏移（构建一次，供 pc→行列换算二分定位）。
+     * 之前的实现每次从源码起点线性扫描，4000 个函数时退化为 O(n²)。 */
+    val lineStarts: IntArray = buildLineStarts(sourceBuf)
     
     var curFunc: JSValue = JS_NULL
     var byteCode: JSValue = JS_NULL
