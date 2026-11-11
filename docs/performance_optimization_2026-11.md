@@ -82,8 +82,8 @@ JIT 生效后执行速度提升，使 `microbench` 的 `prop_delete` 用例迭�
 - **字节码内容缓存**：恢复“块地址 → ByteArray”缓存，附长度校验；`JSGC` 每次压缩后
   整体清空，避免陈旧副本（`ByteCodeCacheRegressionTest` 覆盖重定义/GC 场景）。
 - **整数键哈希**：`hashProp` 对 Int 键直接计算十进制字符串哈希，不再
-  `jsNumberToString` 分配；`prop_read` 625→250 ns、`prop_write` 350→162 ns、
-  `prop_create` 750→475 ns。
+  `jsNumberToString` 分配；分项口径下 `prop_read` 625→250 ns、`prop_write`
+  350→162 ns、`prop_create` 750→475 ns。
 
 ---
 
@@ -117,17 +117,17 @@ JIT 生效后执行速度提升，使 `microbench` 的 `prop_delete` 用例迭�
 > 汇总值均取自同一批次输出。JVM 汇总值降至修复前的 **1/9.5**，并已优于原生镜像
 > （JIT 对解释器循环的优化强于 AOT）。
 
-### 2.3 关键单操作（ns/op，取自完整套件）
+### 2.3 关键单操作（ns/op，取自同批次完整套件）
 
 | 用例 | 修复前 jvm | 修复后 jvm | C |
 |---|---:|---:|---:|
-| empty_loop | 5000 | **85** | 6 |
-| prop_read | 10500 | **250** | 4.5 |
-| prop_write | 8500 | **162** | 5 |
-| array_read | 9500 | **550** | 6.5 |
-| func_call | — | **850** | 12.5 |
-| int_arith | 12500 | **750** | 10 |
-| string_build1 | 15000 | **10200** | 480 |
+| empty_loop | 5000 | **85** | 6.0 |
+| prop_read | 10500 | **600** | 6.5 |
+| prop_write | 8500 | **250** | 5.1 |
+| array_read | 9500 | **480** | 5.8 |
+| func_call | 12500 | **850** | 14.5 |
+| int_arith | 15700 | **950** | 13.0 |
+| string_build1 | 15000 | **6500** | 520 |
 | regexp_ascii | 21000 | **2800** | 100 |
 
 ### 2.4 部署体积
