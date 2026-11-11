@@ -172,7 +172,7 @@ bridge.eval("platform.http.get('https://example.test', 100).status")  // 200
 
 ### 测试覆盖
 
-Kotlin实现包含170个测试用例，覆盖：
+Kotlin实现包含176个测试用例，覆盖：
 
 - 基础语言特性 (变量、运算符、表达式)
 - 控制流 (if/else、循环、switch)
@@ -180,9 +180,19 @@ Kotlin实现包含170个测试用例，覆盖：
 - 对象和数组操作
 - 内置函数 (Math、String、Array)
 - 异常处理
+- **GC 回归** (`GCRegressionTest`)：小堆下 split / 全局 match / JSON.parse 大输入的
+  GC 搬移正确性
 - **宿主桥接层** (`JSBridgeTest`)：类型转换、命名空间与函数/构造器注册、
   属性绑定近似、异常双向桥接、宿主对象生命周期（含 GC 搬移与 finalizer）、
   platform 命名空间示例全链路
+
+### 性能
+
+完整性能评估与修复记录见：
+
+- [docs/performance_evaluation.md](docs/performance_evaluation.md)（修复前基线）
+- [docs/performance_optimization_2026-11.md](docs/performance_optimization_2026-11.md)
+  （P0 修复、复测数据与优化说明）
 
 ---
 

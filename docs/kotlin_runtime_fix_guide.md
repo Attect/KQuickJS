@@ -695,14 +695,37 @@ var r = outer();
   读取返回 BigInt（无符号高位用 BigInteger 表示），支持构造器数组拷贝、
   `set()`、`subarray()`；`a[0]=1` 这类 Number 写入会抛 TypeError 并走异常展开。
 
+### 2026-11 第八期：GC 保活与 JIT 修复（P0）
+
+- **GC 保活**：`split` 非正则路径、`regexpMatch`、`JSON.parse` 对象/数组分支把结果容器
+  加入 `gcKeepAlive`（`jsonParse` 用 `try/finally` 弹出）。此前循环内分配触发 GC 压缩后
+  容器悬垂，小堆下静默返回 `NaN` / 空对象且退出码为 0。
+  新增 `GCRegressionTest`（5 例，16 MB 堆下 1 万元素 split、全局 match、5000 键
+  JSON 对象/数组）。
+- **JIT**：`runBody` 原 13,182 字节超过 `HugeMethodLimit(8000)`，默认 JVM 从不编译。
+  把约 30 个冷门/中频 opcode 分支拆为独立处理器（返回新 pc 或 `OP_EXCEPTION`），
+  并把循环内 40+ 个 `return` 收敛为 `exitKind + break` 的统一出口，避免每个返回点
+  复制 `finally` 清理代码；`runBody` 降至 **4,935 字节**，`-XX:+PrintCompilation`
+  可见 C1/C2 与 OSR 编译。fib(27) 6.15 s → 0.63 s，mandelbrot 3.02 s → 0.46 s。
+- **属性表**：插入扩容从 `size + 3` 线性增长改为按槽数翻倍，并保持
+  “槽位 = 首槽 + 3*i” 对齐；新槽写 `UNINITIALIZED/UNDEFINED/0` 三元组
+  （全 0 会让空槽 key 变成整数 0，`o[0]` 会命中空槽）；删空时直接丢弃属性表，
+  空洞超过 3/4 时 `compactProps` 重建。修复反复增删导致的 O(n²)/OOM/挂起。
+- **解析**：pc→源码行列换算改为预建 `lineStarts` + 二分 + 行内扫描，
+  替代每个标记从源码起点扫描的 O(n²) 实现；4000 函数解析 6.68 s → 0.95 s。
+- **其它**：整数属性键哈希不再分配 Kotlin String；恢复字节码内容缓存
+  （块地址 + 长度校验，`JSGC` 每次压缩后清空）；原生镜像 `resource-config.json`
+  移除 `.*` 全量资源后体积 227 MB → 31 MB。
+
 ### 已知限制
 
 1. 小堆回归场景改为 **512KB 堆 + 1000 个全局函数**（通过）；更大规模（1500+）
    仍会 OOM；
 2. 默认 `Array.prototype.sort` 的快速路径仅覆盖原始值元素；含对象元素或自定义
    比较函数时走通用路径（正确但较慢）；
-3. 解释器仍是逐指令分发的 Kotlin 循环，虽经超级指令优化，单条指令成本仍显著高于
-   C 版；如需进一步接近 C 性能，需要更彻底的分发/代码生成改造；
+3. 主循环已可被 JIT 编译，但每条 opcode 仍经过方法调用与 `ByteBuffer` 内存抽象，
+   单操作成本约为 C 版的 6–20 倍（字符串/正则另计）；如需进一步接近 C，
+   可考虑内联高频处理器、减少边界检查或生成式分发表；
 4. BigInt 移位/指数计数需落在 Int 范围内（超大计数报 RangeError）；
 5. Set 的对象/函数元素使用常量哈希，对象很多时退化为同桶线性链；
 6. 解析期大栈重试仅覆盖 `JS_Eval` 解析阶段；JS 运行时深递归由
@@ -739,3 +762,4 @@ var r = outer();
 - **2026-11-08**：实现 Set 与 BigInt；小堆回归扩大到 512KB/1000 函数；microbench bigint 基准可运行
 - **2026-11-08**：可配置 `--stack-size`/`--max-call-depth`；完善 Set（for-of/构造器/类型标签）与 BigInt（JSON/Number/>>>/asIntN 等边界）
 - **2026-11-09**：Set 改为哈希索引（开放寻址）；BigInt 增加 64 位 Long 快路径；实现 BigInt64Array/BigUint64Array
+- **2026-11-11**：P0 修复——GC 保活（split/match/JSON.parse）与 runBody 拆分恢复 JIT（4935 字节，microbench 汇总值 568,975.8 → 59,915.5）；解析 lineStarts 线性化、属性表几何扩容/删空回收、整数键哈希与字节码缓存；原生镜像 227MB → 31MB；全量测试 176 例通过
