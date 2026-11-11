@@ -4,8 +4,18 @@ import app.muka.project.kquickjs.JSW
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-class Memory(val size: Int) {
-    val buffer: ByteBuffer = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN)
+/* 紧凑堆内存。两种构造方式：
+ * - Memory(size)：自建 ByteArray（单元测试用）；
+ * - Memory(buffer)：直接包装调用方提供的 ByteArray，避免 JS_NewContext 再复制/清零
+ *   一整块同尺寸内存（大堆下这是 Context 创建的主要成本）。 */
+class Memory private constructor(val size: Int, val buffer: ByteBuffer) {
+    constructor(size: Int) : this(
+        size, ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN)
+    )
+    
+    constructor(buffer: ByteArray) : this(
+        buffer.size, ByteBuffer.wrap(buffer).order(ByteOrder.LITTLE_ENDIAN)
+    )
     
     var heapBase: Int = 0
     var heapFree: Int = 0

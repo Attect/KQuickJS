@@ -266,6 +266,26 @@ fun JS_NewStringLen(ctx: JSContext, buf: ByteArray, bufLen: Int): JSValue {
 }
 
 fun JS_NewString(ctx: JSContext, str: String): JSValue {
+    /* ASCII 快路径：直接写入紧凑堆，省去 UTF-8 编码用的 ByteArrayOutputStream/ByteArray
+     * （标准库引导与解析器每次建字符串都会走这里，短 ASCII 名占绝大多数） */
+    val n = str.length
+    var ascii = true
+    var i = 0
+    while (i < n) {
+        if (str[i].code >= 0x80) { ascii = false; break }
+        i++
+    }
+    if (ascii) {
+        val ptr = ctx.malloc(16 + ((n + JSW) and (JSW - 1).inv()), JS_MTAG_STRING)
+        if (ptr == 0) return JS_EXCEPTION
+        ctx.memory.putU8(ptr, (JS_MTAG_STRING shl 1))
+        ctx.memory.putU8(ptr + 1, 0)
+        ctx.memory.putU8(ptr + 2, 0)
+        ctx.memory.putU8(ptr + 3, 0)
+        ctx.memory.putI32(ptr + 4, n)
+        for (k in 0 until n) ctx.memory.putU8(ptr + 8 + k, str[k].code)
+        return JS_VALUE_FROM_PTR(ptr)
+    }
     val bytes = jsEncodeString(str)
     return JS_NewStringLen(ctx, bytes, bytes.size)
 }

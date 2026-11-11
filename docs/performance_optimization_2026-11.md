@@ -158,7 +158,7 @@ split/JSON 回归在裁剪后的镜像上均通过。
 
 ## 3. 正确性验证
 
-- Kotlin 全量测试 **176 例全部通过**（含新增 5 例 GC 回归）；
+- Kotlin 全量测试 **188 例全部通过**（含新增 5 例 GC 回归）；
 - `tests/test_language.js`、`test_loop.js`、`test_closure.js`、`test_builtin.js`
   经 CLI 与 JUnit 双路径通过；
 - 完整 `microbench.js` 在 JVM / native / C 上均正常完成；
@@ -171,4 +171,43 @@ split/JSON 回归在裁剪后的镜像上均通过。
 1. `prop_delete` 仍约 6.5 µs/op（数值键建表/删除的固有成本），可继续优化属性表；
 2. 字符串/正则仍为 20–30x C，可做 WTF-8 换算与 `Pattern` 缓存专项；
 3. JVM 冷启动约 155 ms，若面向 CLI 场景可考虑 AppCDS / 原生镜像；
-4. 标准库引导仍占 80 KB（C 版 6.4 KB），可做惰性注册/共享常量瘦身。
+4. 标准库引导仍占约 28 KB（C 版 6.4 KB），可继续做共享原型/预编译标准库。
+
+---
+
+## 5. Context 创建成本优化（2026-11-11 追加）
+
+### 5.1 基线
+
+- 标准库引导后引擎堆占用 **40,536 B**（197 个对象 / 281 个字符串 / 80 个值数组）；
+- 最小可用堆 **160 KB**；
+- 创建耗时（JVM 内，200 次中位数）：160 KB 堆 0.141 ms、1 MB 0.160 ms、16 MB 0.583 ms。
+- 16 MB 堆的主要成本是 `JS_NewContext` 内 **重复分配并清零一整块同尺寸内存**：
+  调用方传入的 `ByteArray` 被丢弃，`Memory(memSize)` 又 `ByteBuffer.allocate` 一次。
+
+### 5.2 改动
+
+| 改动 | 说明 |
+|---|---|
+| 零拷贝包装调用方缓冲区 | 新增 `Memory(ByteArray)`，`JS_NewContext` 直接 `ByteBuffer.wrap` 调用方内存；16 MB 堆省掉一次 16 MB 分配/清零 |
+| 惰性命名空间 | `Set` / `TypedArray` 系列（含 ArrayBuffer）/ `Math` / `JSON` 改为全局访问器：首次 get/set 时初始化，随后替换为数据属性。`RegExp`、`BigInt` 保持 eager（字面量对象/原始值需要其 prototype 方法，不能依赖全局名访问） |
+| ASCII 字符串直写 | `JS_NewString` 对纯 ASCII 直接写紧凑堆，去掉 `ByteArrayOutputStream`/`ByteArray` 中转 |
+| 最小堆阈值 | `MIN_MEM_SIZE` 160 KB → **128 KB**（JVM 与原生镜像均验证可运行） |
+
+语义验证：`typeof`、`in`、`Object.keys(globalThis)`、先赋值后访问、`delete` 后访问等行为
+与 eager 定义一致；四个 JS 测试套件与全量 188 例 Kotlin 测试通过。
+
+### 5.3 结果
+
+| 指标 | 优化前 | 优化后 |
+|---|---:|---:|
+| 引导后堆占用 | 40,536 B | **28,648 B（-29%）** |
+| 对象 / 字符串 / 值数组数量 | 197 / 281 / 80 | **158 / 184 / 47** |
+| 最小可用堆 | 160 KB | **128 KB（-20%）** |
+| 创建耗时（160 KB 堆） | 0.141 ms | **0.128 ms** |
+| 创建耗时（1 MB 堆） | 0.160 ms | 0.15–0.19 ms（JVM GC 波动） |
+| 创建耗时（16 MB 堆） | 0.583 ms | **0.340 ms（-42%）** |
+
+> 说明：16 MB 的收益来自消除重复内存分配；1 MB 档位主要受 JVM 侧 `ByteArray` 分配与
+> GC 波动影响，长期均值基本持平；标准库引导本身的耗时约 60–70 µs，
+> 剩余开销主要是核心原型（Object/Function/Array/String/Number/Error）的构建。

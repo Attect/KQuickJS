@@ -18,7 +18,9 @@ data class JSSTDLibraryDef(
 )
 
 fun JS_NewContext(mem: ByteArray, memSize: Int, stdlib: JSSTDLibraryDef): JSContext {
-    val memory = Memory(memSize)
+    /* 直接包装调用方缓冲区：旧实现 Memory(memSize) 会再分配一块同尺寸 ByteBuffer，
+     * mem 参数被丢弃，16MB 堆下相当于多清零一次、创建成本翻倍。 */
+    val memory = if (mem.size == memSize) Memory(mem) else Memory(memSize)
     val atomTable = LongArray(1024)
     
     val ctx = JSContext(

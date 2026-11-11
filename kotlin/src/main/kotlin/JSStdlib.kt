@@ -18,7 +18,15 @@ import app.muka.project.kquickjs.runtime.JSRuntime
  */
 object JSStdlib {
 
-    const val MIN_MEM_SIZE = 160 * 1024
+    const val MIN_MEM_SIZE = 128 * 1024
+
+    /* initTypedArrays 定义的全局名（ArrayBuffer + 各类型化数组构造器） */
+    private val TYPED_ARRAY_GLOBALS = listOf(
+        "ArrayBuffer",
+        "Uint8Array", "Int8Array", "Uint16Array", "Int16Array",
+        "Uint32Array", "Int32Array", "Float32Array", "Float64Array",
+        "Uint8ClampedArray", "BigInt64Array", "BigUint64Array"
+    )
 
     private fun native(ctx: JSContext, length: Int,
                        fn: (JSContext, JSValue, List<JSValue>) -> JSValue): JSValue {
@@ -46,7 +54,46 @@ object JSStdlib {
     }
 
     private fun defGlobal(ctx: JSContext, rt: JSRuntime, name: String, value: JSValue) {
-        rt.setProperty(ctx.globalObj, JS_NewString(ctx, name), value)
+        val key = JS_NewString(ctx, name)
+        /* 惰性命名空间的访问器会被真实数据属性替换：先删除同名访问器再写入。
+         * 普通引导时该属性通常不存在，删除为空操作。 */
+        rt.deleteProperty(ctx.globalObj, key)
+        rt.setProperty(ctx.globalObj, key, value)
+    }
+    
+    /* 惰性命名空间状态：首次读取/赋值时才执行 init，之后全局属性被替换为数据属性 */
+    private class LazySlot(val init: (JSContext, JSRuntime) -> Unit) {
+        var done = false
+    }
+    
+    /* 把一组全局名注册为惰性访问器：首次 get/set 时执行 init（init 内部通过
+     * defGlobal 定义真实属性，同时删除这些访问器）。用于 TypedArray/Set/BigInt/
+     * RegExp/JSON 等可选命名空间，避免每个 Context 都为其分配对象与属性表。 */
+    private fun defLazyGlobals(ctx: JSContext, rt: JSRuntime, names: List<String>,
+                               init: (JSContext, JSRuntime) -> Unit) {
+        val slot = LazySlot(init)
+        for (name in names) {
+            val key = JS_NewString(ctx, name)
+            val getter = native(ctx, 0) { c, _, _ ->
+                if (!slot.done) {
+                    slot.done = true
+                    val r = JSRuntime(c)
+                    slot.init(c, r)
+                }
+                JSRuntime(c).getProperty(c.globalObj, JS_NewString(c, name))
+            }
+            val setter = native(ctx, 1) { c, _, args ->
+                if (!slot.done) {
+                    slot.done = true
+                    val r = JSRuntime(c)
+                    slot.init(c, r)
+                }
+                JSRuntime(c).setProperty(c.globalObj, JS_NewString(c, name), arg(args, 0))
+                JS_UNDEFINED
+            }
+            rt.defineAccessor(ctx.globalObj, key, getter, isGetter = true)
+            rt.defineAccessor(ctx.globalObj, key, setter, isGetter = false)
+        }
     }
 
     private fun defMethod(ctx: JSContext, rt: JSRuntime, obj: JSValue, name: String, length: Int,
@@ -99,12 +146,15 @@ object JSStdlib {
             initArray(ctx, rt)
             initString(ctx, rt)
             initNumber(ctx, rt)
+            /* RegExp/BigInt 必须 eager：正则与 BigInt 字面量创建的对象/原始值
+             * 不经过全局名访问，但需要其 prototype 上的方法（如 /x/.exec、1n.toString） */
             initBigInt(ctx, rt)
             initRegExp(ctx, rt)
-            initSet(ctx, rt)
-            initTypedArrays(ctx, rt)
-            initMath(ctx, rt)
-            initJson(ctx, rt)
+            /* 可选命名空间惰性初始化：必须经全局构造器使用，未用时不占堆 */
+            defLazyGlobals(ctx, rt, listOf("Set")) { c, r -> initSet(c, r) }
+            defLazyGlobals(ctx, rt, TYPED_ARRAY_GLOBALS) { c, r -> initTypedArrays(c, r) }
+            defLazyGlobals(ctx, rt, listOf("Math")) { c, r -> initMath(c, r) }
+            defLazyGlobals(ctx, rt, listOf("JSON")) { c, r -> initJson(c, r) }
         } catch (e: Exception) {
             /* 初始化失败不阻塞引擎创建（记录到 stderr 便于诊断） */
             System.err.println("JSStdlib init failed: ${e::class.simpleName}: ${e.message}")

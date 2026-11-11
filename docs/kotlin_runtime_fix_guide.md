@@ -716,6 +716,11 @@ var r = outer();
 - **其它**：整数属性键哈希不再分配 Kotlin String；恢复字节码内容缓存
   （块地址 + 长度校验，`JSGC` 每次压缩后清空）；原生镜像 `resource-config.json`
   移除 `.*` 全量资源后体积 227 MB → 31 MB。
+- **Context 创建成本**：`JS_NewContext` 改为零拷贝包装调用方 ByteArray（原本会再分配
+  一块同尺寸 ByteBuffer，16 MB 堆下创建成本减半）；`Set`/TypedArray/`Math`/`JSON`
+  改为惰性全局访问器（首次 get/set 初始化后替换为数据属性），`RegExp`/`BigInt`
+  保持 eager（字面量依赖其 prototype）；ASCII 字符串直写紧凑堆；
+  引导堆占用 40.5 KB → **28.6 KB**，`MIN_MEM_SIZE` 160 KB → **128 KB**。
 
 ### 已知限制
 
@@ -731,7 +736,10 @@ var r = outer();
 6. 解析期大栈重试仅覆盖 `JS_Eval` 解析阶段；JS 运行时深递归由
    `--max-call-depth` 限制，不再依赖 JVM 栈溢出；
 7. BigInt TypedArray 尚未提供 `BigInt64Array.prototype` 专有方法
-   （如 `sort`/`fill` 的 BigInt 语义），DataView 的 BigInt 读写也未实现。
+   （如 `sort`/`fill` 的 BigInt 语义），DataView 的 BigInt 读写也未实现；
+8. 标准库引导占用约 28.6 KB（C 版 6.4 KB），最小可用堆 128 KB（C 64 KB），
+   仍是内存对齐的主要差距；剩余占用主要是 Object/Function/Array/String/Number/Error
+   等核心原型，可考虑共享原型或预编译标准库进一步压缩。
 
 ## 相关文件
 
@@ -762,4 +770,4 @@ var r = outer();
 - **2026-11-08**：实现 Set 与 BigInt；小堆回归扩大到 512KB/1000 函数；microbench bigint 基准可运行
 - **2026-11-08**：可配置 `--stack-size`/`--max-call-depth`；完善 Set（for-of/构造器/类型标签）与 BigInt（JSON/Number/>>>/asIntN 等边界）
 - **2026-11-09**：Set 改为哈希索引（开放寻址）；BigInt 增加 64 位 Long 快路径；实现 BigInt64Array/BigUint64Array
-- **2026-11-11**：P0 修复——GC 保活（split/match/JSON.parse）与 runBody 拆分恢复 JIT（4935 字节，microbench 汇总值 568,975.8 → 59,915.5）；解析 lineStarts 线性化、属性表几何扩容/删空回收、整数键哈希与字节码缓存；原生镜像 227MB → 31MB；全量测试 176 例通过
+- **2026-11-11**：P0 修复——GC 保活（split/match/JSON.parse）与 runBody 拆分恢复 JIT（4935 字节，microbench 汇总值 568,975.8 → 59,915.5）；解析 lineStarts 线性化、属性表几何扩容/删空回收、整数键哈希与字节码缓存；原生镜像 227MB → 31MB；全量测试 188 例通过；Context 创建优化（引导堆 40.5→28.6KB、最小堆 160→128KB、16MB 堆创建耗时减半）

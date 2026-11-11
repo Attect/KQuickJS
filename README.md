@@ -172,7 +172,7 @@ bridge.eval("platform.http.get('https://example.test', 100).status")  // 200
 
 ### 测试覆盖
 
-Kotlin实现包含176个测试用例，覆盖：
+Kotlin实现包含188个测试用例，覆盖：
 
 - 基础语言特性 (变量、运算符、表达式)
 - 控制流 (if/else、循环、switch)
